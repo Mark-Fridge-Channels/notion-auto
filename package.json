@@ -1,0 +1,20 @@
+{
+  "name": "notion-auto",
+  "version": "1.0.0",
+  "description": "Playwright automation for Notion AI: open browser, login wait, open Notion AI, type and send prompts on a schedule.",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "run": "tsx src/index.ts",
+    "start": "npm run run"
+  },
+  "keywords": ["notion", "playwright", "automation"],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2"
+  },
+  "dependencies": {
+    "playwright": "^1.49.0"
+  }
+}
