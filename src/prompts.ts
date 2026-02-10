@@ -19,8 +19,8 @@ export function getPromptForRun(
   task2: string,
   task3: string,
 ): string {
-  if (runIndex <= 1) return task1;
-  if (runIndex <= 5) return task2;
+  if (runIndex <= 5) return task1;
+  if (runIndex <= 10) return task2;
   const pool = [task1, task2, task3];
   const i = Math.floor(Math.random() * pool.length);
   return pool[i];

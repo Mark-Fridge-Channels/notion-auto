@@ -9,6 +9,8 @@ import { logger } from "./logger.js";
 
 const MODEL_PICKER_RETRIES = 3;
 const DIALOG_WAIT_MS = 500;
+/** 等待「可发送」状态（Submit 按钮可见）后再定位其左侧元素，避免与 Stop 状态 DOM 混淆 */
+const WAIT_SEND_BUTTON_MS = 8000;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
@@ -35,11 +37,15 @@ function getModelPickerButton(page: Page): Promise<ReturnType<Page["locator"]> |
 
 /**
  * 执行一次「打开弹窗 → 识别当前选中 → 点击下一项」；失败则 throw，由调用方重试。
+ * 先等待 SEND_BUTTON 可见（可发送状态），再定位其左侧元素，不依赖「左侧元素与 Stop 一起出现」的假设。
  */
 async function doSwitchToNextModel(page: Page): Promise<void> {
+  const sendBtn = page.locator(SEND_BUTTON).first();
+  await sendBtn.waitFor({ state: "visible", timeout: WAIT_SEND_BUTTON_MS });
+
   const buttonToOpenPicker = await getModelPickerButton(page);
   if (!buttonToOpenPicker) {
-    throw new Error("无法定位发送按钮左侧元素");
+    throw new Error("无法定位发送按钮左侧元素（当前已为可发送状态）");
   }
 
   await buttonToOpenPicker.click();

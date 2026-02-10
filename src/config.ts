@@ -19,6 +19,8 @@ export interface Config {
   promptTask2: string;
   /** 第 11 轮起随机使用的文案之一（Task 3） */
   promptTask3: string;
+  /** 若设置，则每轮均使用此文案（Prompt 网关），忽略 promptTask1/2/3 与轮数规则；null 表示未使用 */
+  promptGateway: string | null;
   /** 登录态保存路径，存在则加载、运行结束可保存 */
   storagePath: string;
   /** 单步失败时最大重试次数 */
@@ -33,6 +35,7 @@ const DEFAULT_CONFIG: Config = {
   promptTask1: TASK_1,
   promptTask2: TASK_2,
   promptTask3: TASK_3,
+  promptGateway: null,
   storagePath: ".notion-auth.json",
   maxRetries: 3,
 };
@@ -71,6 +74,11 @@ export function parseArgs(): Config {
       config.promptTask2 = next();
     } else if (arg === "--task3") {
       config.promptTask3 = next();
+    } else if (arg === "--prompt-gateway") {
+      const val = next();
+      if (val.trim() === "")
+        throw new Error("--prompt-gateway 为必填项，不能为空");
+      config.promptGateway = val;
     } else if (arg === "--storage") {
       const path = args[++i] ?? config.storagePath;
       if (path.includes("..") || path.startsWith("/"))
@@ -101,6 +109,7 @@ notion-auto — Notion AI 定时输入与发送
   --task1 <text>         第 1～5 轮文案（默认 "@Task 1 — Add new DTC companies"）
   --task2 <text>         第 6～10 轮文案（默认 "@Task 2 — Find high-priority contacts"）
   --task3 <text>         第 11 轮起随机文案之一（默认 "@Task 3 — Find people contact ..."）
+  --prompt-gateway <text> 使用 Prompt 网关内容，每轮均使用该文案，忽略 --task1/2/3（必填，不能为空）
   --storage <path>       登录态保存路径（默认 .notion-auth.json，仅支持当前目录下相对路径）
   --help, -h             显示此帮助
 `);
