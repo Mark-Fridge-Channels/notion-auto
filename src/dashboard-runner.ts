@@ -66,13 +66,14 @@ function spawnChild(params: DashboardParams, isAutoResume: boolean): void {
   const env = { ...process.env };
   if (isAutoResume) env.NOTION_AUTO_RESUME = "1";
 
-  // Windows 上 npm 安装的是 npx.cmd，直接 spawn("npx") 会 ENOENT，需显式指定 npx.cmd
-  const npxCmd = process.platform === "win32" ? "npx.cmd" : "npx";
-  const child = spawn(npxCmd, ["tsx", "src/index.ts", ...args], {
+  // Windows：必须用 shell，否则 spawn("npx"/"npx.cmd") 会 ENOENT 或 EINVAL（.cmd 由 cmd 解释）
+  const opts: Parameters<typeof spawn>[2] = {
     cwd: process.cwd(),
     stdio: ["ignore", "pipe", "pipe"],
     env,
-  });
+  };
+  if (process.platform === "win32") opts.shell = true;
+  const child = spawn("npx", ["tsx", "src/index.ts", ...args], opts);
   currentProcess = child;
   currentRunLog = {
     id: ++runIdCounter,
