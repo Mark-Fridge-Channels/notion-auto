@@ -61,19 +61,33 @@ export function start(params: DashboardParams): void {
   spawnChild(params, false);
 }
 
+/** Windows cmd.exe：含空格/引号等时用双引号包裹，内部 " 转为 \\" */
+function escapeArgForWindowsCmd(arg: string): string {
+  if (!/[\s"&|<>^]/.test(arg)) return arg;
+  return '"' + arg.replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
+}
+
 function spawnChild(params: DashboardParams, isAutoResume: boolean): void {
   const args = paramsToArgv(params);
   const env = { ...process.env };
   if (isAutoResume) env.NOTION_AUTO_RESUME = "1";
 
-  // Windows：必须用 shell，否则 spawn("npx"/"npx.cmd") 会 ENOENT 或 EINVAL（.cmd 由 cmd 解释）
   const opts: Parameters<typeof spawn>[2] = {
     cwd: process.cwd(),
     stdio: ["ignore", "pipe", "pipe"],
     env,
   };
-  if (process.platform === "win32") opts.shell = true;
-  const child = spawn("npx", ["tsx", "src/index.ts", ...args], opts);
+
+  let child: ChildProcess;
+  if (process.platform === "win32") {
+    // Windows：必须用 shell，否则 npx 会 ENOENT/EINVAL；shell 会把参数按空格拆开，导致 "--prompt-gateway" "@Author DB Build" 被截断，故用整条命令串并对含空格的参数加双引号
+    opts.shell = true;
+    const escaped = args.map(escapeArgForWindowsCmd).join(" ");
+    const fullCmd = "npx tsx src/index.ts " + escaped;
+    child = spawn(fullCmd, opts);
+  } else {
+    child = spawn("npx", ["tsx", "src/index.ts", ...args], opts);
+  }
   currentProcess = child;
   currentRunLog = {
     id: ++runIdCounter,
