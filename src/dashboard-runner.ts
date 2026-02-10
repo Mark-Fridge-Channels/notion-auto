@@ -66,7 +66,9 @@ function spawnChild(params: DashboardParams, isAutoResume: boolean): void {
   const env = { ...process.env };
   if (isAutoResume) env.NOTION_AUTO_RESUME = "1";
 
-  const child = spawn("npx", ["tsx", "src/index.ts", ...args], {
+  // Windows 上 npm 安装的是 npx.cmd，直接 spawn("npx") 会 ENOENT，需显式指定 npx.cmd
+  const npxCmd = process.platform === "win32" ? "npx.cmd" : "npx";
+  const child = spawn(npxCmd, ["tsx", "src/index.ts", ...args], {
     cwd: process.cwd(),
     stdio: ["ignore", "pipe", "pipe"],
     env,
