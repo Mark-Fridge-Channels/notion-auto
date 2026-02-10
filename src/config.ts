@@ -1,8 +1,9 @@
 /**
- * 运行配置：总轮数、间隔、登录等待、模型切换间隔、三条 Task 文案等
+ * 运行配置：总轮数、间隔、登录等待、模型切换间隔、起始 URL、每 N 轮新建对话、三条 Task 文案等
  */
 
 import { TASK_1, TASK_2, TASK_3 } from "./prompts.js";
+import { NOTION_URL } from "./selectors.js";
 
 export interface Config {
   /** 总执行轮数（所有对话的 输入+发送 次数总和），跑满后退出 */
@@ -11,6 +12,10 @@ export interface Config {
   intervalMs: number;
   /** 每次运行时的登录等待时间（毫秒），默认 1 分钟 */
   loginWaitMs: number;
+  /** 脚本打开后访问的地址 */
+  notionUrl: string;
+  /** 每 N 轮点击 New AI chat 新建对话，最小 1，默认 10 */
+  newChatEveryRuns: number;
   /** 每 N 轮切换一次模型，0 表示不切换，默认 50 */
   modelSwitchInterval: number;
   /** 第 1～5 轮使用的文案（Task 1） */
@@ -31,6 +36,8 @@ const DEFAULT_CONFIG: Config = {
   totalRuns: 25,
   intervalMs: 2 * 60 * 1000,
   loginWaitMs: 60 * 1000,
+  notionUrl: NOTION_URL,
+  newChatEveryRuns: 10,
   modelSwitchInterval: 50,
   promptTask1: TASK_1,
   promptTask2: TASK_2,
@@ -65,6 +72,10 @@ export function parseArgs(): Config {
       config.intervalMs = nextNum(1, "--interval 必须为正整数（秒）") * 1000;
     } else if (arg === "--login-wait") {
       config.loginWaitMs = nextNum(0, "--login-wait 必须为非负整数（秒）") * 1000;
+    } else if (arg === "--notion-url") {
+      config.notionUrl = next();
+    } else if (arg === "--new-chat-every") {
+      config.newChatEveryRuns = nextNum(1, "--new-chat-every 必须为正整数（最小 1）");
     } else if (arg === "--model-switch-interval") {
       const v = nextNum(0, "--model-switch-interval 必须为非负整数（0=不切换）");
       config.modelSwitchInterval = v;
@@ -105,6 +116,8 @@ notion-auto — Notion AI 定时输入与发送
   --total, -n <number>    总轮数（默认 25）
   --interval <seconds>   每轮间隔秒数（默认 120）
   --login-wait <seconds> 登录等待秒数（默认 60）
+  --notion-url <url>     脚本打开后访问的地址（默认见 selectors）
+  --new-chat-every <n>   每 n 轮点击 New AI chat 新建对话，最小 1（默认 10）
   --model-switch-interval <n>  每 n 轮切换一次模型，0=不切换（默认 50）
   --task1 <text>         第 1～5 轮文案（默认 "@Task 1 — Add new DTC companies"）
   --task2 <text>         第 6～10 轮文案（默认 "@Task 2 — Find high-priority contacts"）

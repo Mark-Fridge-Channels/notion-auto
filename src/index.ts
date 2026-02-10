@@ -9,7 +9,6 @@ import { chromium } from "playwright";
 import { existsSync } from "node:fs";
 import { parseArgs, type Config } from "./config.js";
 import {
-  NOTION_URL,
   AI_FACE_IMG,
   AI_INPUT,
   SEND_BUTTON,
@@ -38,9 +37,9 @@ async function main(): Promise<void> {
   const page = await context.newPage();
   page.setDefaultTimeout(30_000);
 
-  // 打开后默认访问 Notion，等待期间用户可直接在当前页登录
+  // 打开后访问配置的 URL，等待期间用户可直接在当前页登录
   logger.info("正在打开 Notion…");
-  await page.goto(NOTION_URL, { waitUntil: "domcontentloaded" });
+  await page.goto(config.notionUrl, { waitUntil: "domcontentloaded" });
 
   const hasSavedAuth = Boolean(contextOptions.storageState);
 
@@ -61,12 +60,12 @@ async function main(): Promise<void> {
     await clickNewAIChat(page, config);
 
     let totalDone = 0;
-    let conversationRuns = 0; // 当前对话内已执行轮数，到 10 则点 New AI chat 并置 0
+    let conversationRuns = 0; // 当前对话内已执行轮数，到 newChatEveryRuns 则点 New AI chat 并置 0
 
     // Step 6: 主循环
     while (totalDone < config.totalRuns) {
-      // 每 10 轮：点击 New AI chat，重置对话计数
-      if (conversationRuns >= 10) {
+      // 每 newChatEveryRuns 轮：点击 New AI chat，重置对话计数
+      if (conversationRuns >= config.newChatEveryRuns) {
         await clickNewAIChat(page, config);
         conversationRuns = 0;
       }
@@ -121,7 +120,7 @@ async function main(): Promise<void> {
       totalDone++;
       conversationRuns++;
       logger.info(
-        `已执行 ${totalDone}/${config.totalRuns} 轮（本对话 ${conversationRuns}/10）`,
+        `已执行 ${totalDone}/${config.totalRuns} 轮（本对话 ${conversationRuns}/${config.newChatEveryRuns}）`,
       );
 
       if (totalDone >= config.totalRuns) break;
@@ -164,7 +163,7 @@ async function dismissPersonalizeDialogIfPresent(page: import("playwright").Page
 /** 导航到 Notion 并点击 Notion AI 头像的父 div，打开弹窗；弹窗出现后等 1s；若有「Personalize」弹窗则点 Done */
 async function openNotionAI(page: import("playwright").Page, config: Config): Promise<void> {
   await runWithRetry(config.maxRetries, async () => {
-    await page.goto(NOTION_URL, { waitUntil: "domcontentloaded" });
+    await page.goto(config.notionUrl, { waitUntil: "domcontentloaded" });
     const img = page.locator(AI_FACE_IMG).first();
     await img.waitFor({ state: "visible" });
     const parent = img.locator("xpath=..");
