@@ -6,7 +6,8 @@
   "main": "dist/index.js",
   "scripts": {
     "run": "tsx src/index.ts",
-    "start": "npm run run"
+    "start": "npm run run",
+    "dashboard": "tsx src/server.ts"
   },
   "keywords": ["notion", "playwright", "automation"],
   "license": "MIT",
@@ -15,6 +16,7 @@
     "tsx": "^4.19.2"
   },
   "dependencies": {
+    "nodemailer": "^6.9.16",
     "playwright": "^1.49.0"
   }
 }

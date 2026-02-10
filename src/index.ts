@@ -21,6 +21,7 @@ import {
 import { getPromptForRun } from "./prompts.js";
 import { switchToNextModel } from "./model-picker.js";
 import { logger } from "./logger.js";
+import { loadProgress, saveProgress } from "./progress.js";
 
 async function main(): Promise<void> {
   const config = parseArgs();
@@ -60,7 +61,15 @@ async function main(): Promise<void> {
     await clickNewAIChat(page, config);
 
     let totalDone = 0;
-    let conversationRuns = 0; // 当前对话内已执行轮数，到 newChatEveryRuns 则点 New AI chat 并置 0
+    let conversationRuns = 0;
+    if (config.resume) {
+      const progress = await loadProgress();
+      if (progress != null && !progress.completed && progress.totalDone < config.totalRuns) {
+        totalDone = progress.totalDone;
+        conversationRuns = progress.conversationRuns;
+        logger.info(`从 progress 恢复：totalDone=${totalDone}，conversationRuns=${conversationRuns}`);
+      }
+    }
 
     // Step 6: 主循环
     while (totalDone < config.totalRuns) {
@@ -119,6 +128,7 @@ async function main(): Promise<void> {
 
       totalDone++;
       conversationRuns++;
+      await saveProgress({ totalDone, conversationRuns, completed: false });
       logger.info(
         `已执行 ${totalDone}/${config.totalRuns} 轮（本对话 ${conversationRuns}/${config.newChatEveryRuns}）`,
       );
@@ -128,6 +138,7 @@ async function main(): Promise<void> {
       await sleep(config.intervalMs);
     }
 
+    await saveProgress({ totalDone, conversationRuns, completed: true });
     logger.info("已完成全部轮数，退出。");
   } finally {
     // Step 7: 保存登录态并关闭；收尾失败只打日志，不掩盖主错误

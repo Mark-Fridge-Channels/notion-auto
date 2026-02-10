@@ -44,6 +44,7 @@ npm run run -- --prompt-gateway "https://your-prompt-gateway.example/prompt"   #
 | `--task3` | 第 11 轮起随机文案之一 | @Task 3 — Find people contact (LinkedIn / Email / X) |
 | `--prompt-gateway` | 使用 Prompt 网关内容，每轮均使用该文案，忽略 --task1/2/3（必填，不能为空） | - |
 | `--storage` | 登录态保存路径 | .notion-auth.json |
+| `--resume` | 从 progress.json 恢复进度（totalDone/conversationRuns）继续运行 | - |
 | `--help`, `-h` | 显示帮助 | - |
 
 ## 行为简述
@@ -53,6 +54,21 @@ npm run run -- --prompt-gateway "https://your-prompt-gateway.example/prompt"   #
 - **单轮失败恢复**：单轮「输入+发送」重试 3 次仍失败时**不退出**：先点 New AI chat 再试 3 次；仍失败则**刷新页面 → 点 AI 头像 → 点 New AI chat** 再试 3 次，可重复「重新打开 Notion」最多 3 次；仍失败则跳过本轮继续下一轮。
 - **错误**：**模型切换**失败仅打日志并继续运行；**单轮输入+发送**失败按上述恢复流程处理，不因单轮失败退出进程。
 - **收尾**：退出前保存登录态到 `--storage` 并关闭浏览器。
+
+## Web 控制台（Dashboard）
+
+运行 `npm run dashboard` 启动本地 Web 服务（**http://127.0.0.1:9000**，仅本机访问）。在浏览器打开后可：
+
+- 查看运行状态（运行中 / 已停止）
+- 编辑参数（保存到项目目录下的 `params.json`）
+- 点击「启动」或「停止」控制脚本子进程（不重启 Web 服务）
+- 查看最近 10 次运行的日志（仅内存，不落盘）
+
+首次打开页面时脚本处于未运行状态，需点击「启动」才会执行。端口固定 9000，仅监听 localhost。
+
+**自动恢复**：在「运行中」若脚本因异常退出，Dashboard 会自动重启并从项目目录下的 **progress.json** 恢复进度（不影响 totalDone 计数）；正常跑满总轮数则不会自动重启。连续自动重启超过 5 次时会发一封告警邮件（需配置 SMTP 环境变量，见下）。
+
+**告警邮件（可选）**：需在环境中配置以下变量后，连续自动重启 >5 次时才会发信（只发一封）：`NOTION_SMTP_HOST`、`NOTION_SMTP_PORT`（可选，默认 465）、`NOTION_SMTP_USER`、`NOTION_SMTP_PASS`、`NOTION_ALERT_TO`（收件人）。未配置则仅打日志不发信。
 
 ## 仅本地使用
 

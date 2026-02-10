@@ -20,5 +20,6 @@ export const logger = {
   info: (msg: string) => log("INFO", msg),
   warn: (msg: string, err?: unknown) =>
     err !== undefined ? log("WARN", msg, formatErr(err)) : log("WARN", msg),
-  error: (err: unknown) => log("ERROR", formatErr(err)),
+  error: (err: unknown) =>
+    log("ERROR", err instanceof Error && err.stack ? err.stack : formatErr(err)),
 };

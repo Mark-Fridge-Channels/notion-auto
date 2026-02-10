@@ -30,6 +30,8 @@ export interface Config {
   storagePath: string;
   /** 单步失败时最大重试次数 */
   maxRetries: number;
+  /** 是否从 progress.json 恢复 totalDone/conversationRuns（--resume 或 NOTION_AUTO_RESUME=1） */
+  resume: boolean;
 }
 
 const DEFAULT_CONFIG: Config = {
@@ -45,6 +47,7 @@ const DEFAULT_CONFIG: Config = {
   promptGateway: null,
   storagePath: ".notion-auth.json",
   maxRetries: 3,
+  resume: false,
 };
 
 /** 解析命令行参数，覆盖默认配置 */
@@ -95,12 +98,15 @@ export function parseArgs(): Config {
       if (path.includes("..") || path.startsWith("/"))
         throw new Error("--storage 仅支持当前目录下的相对路径");
       config.storagePath = path;
+    } else if (arg === "--resume") {
+      config.resume = true;
     } else if (arg === "--help" || arg === "-h") {
       printHelp();
       process.exit(0);
     }
   }
 
+  if (process.env.NOTION_AUTO_RESUME === "1") config.resume = true;
   return config;
 }
 
@@ -124,6 +130,7 @@ notion-auto — Notion AI 定时输入与发送
   --task3 <text>         第 11 轮起随机文案之一（默认 "@Task 3 — Find people contact ..."）
   --prompt-gateway <text> 使用 Prompt 网关内容，每轮均使用该文案，忽略 --task1/2/3（必填，不能为空）
   --storage <path>       登录态保存路径（默认 .notion-auth.json，仅支持当前目录下相对路径）
+  --resume               从 progress.json 恢复进度（totalDone/conversationRuns）继续运行
   --help, -h             显示此帮助
 `);
 }
