@@ -2,7 +2,7 @@
  * Notion AI 自动化主流程：
  * 打开浏览器 → 等 1 分钟登录 → 打开 Notion → 点击 AI 入口打开弹窗 → 点击 New AI chat 开启新会话 → 定时输入+发送，每 10 轮新建对话，跑满总轮数退出。
  *
- * 输入前使用鼠标坐标点击输入框中心；单轮失败不退出：先重试 3 次 → New AI chat 再试 3 次 → 重复「刷新页面 + 点 AI 头像 + New AI chat」再试（单轮最多 MAX_REOPEN_PER_ROUND 次），仍失败则跳过本轮继续。
+ * 输入前使用鼠标坐标点击输入框中心；单轮失败不退出：先重试 3 次 → New AI chat 再试 3 次 → 重复「刷新页面 + 点 AI 头像 + New AI chat」再试（单轮最多 MAX_REOPEN_PER_ROUND 次），仍失败则请求恢复重启（exit EXIT_RECOVERY_RESTART），由 Dashboard 重启脚本、不计入连续重启计数。
  */
 
 import { chromium } from "playwright";
@@ -22,6 +22,7 @@ import { getPromptForRun } from "./prompts.js";
 import { switchToNextModel } from "./model-picker.js";
 import { logger } from "./logger.js";
 import { loadProgress, saveProgress } from "./progress.js";
+import { EXIT_RECOVERY_RESTART } from "./exit-codes.js";
 
 async function main(): Promise<void> {
   const config = parseArgs();
@@ -123,7 +124,9 @@ async function main(): Promise<void> {
         }
       }
       if (!ok) {
-        logger.warn("本轮流试与恢复后仍失败，跳过本轮，继续下一轮");
+        logger.warn("本轮流试与恢复后仍失败，浏览器可能已卡住，请求恢复重启（由 Dashboard 重启后从当前进度继续）");
+        await saveProgress({ totalDone, conversationRuns, completed: false });
+        process.exit(EXIT_RECOVERY_RESTART);
       }
 
       totalDone++;
@@ -195,6 +198,9 @@ async function typeAndSend(
   page: import("playwright").Page,
   text: string,
 ): Promise<void> {
+  if (process.env.NOTION_AUTO_SIMULATE_STUCK === "1") {
+    throw new Error("模拟卡住（NOTION_AUTO_SIMULATE_STUCK=1）");
+  }
   const input = page.locator(AI_INPUT).first();
   await input.waitFor({ state: "visible" });
   const box = await input.boundingBox();
@@ -235,11 +241,15 @@ async function clickNewAIChat(
 /**
  * 重新打开 Notion：刷新页面 → 点击 AI 头像打开面板 → 点击 New AI chat 开新会话。
  * 供单轮失败恢复使用，失败时抛错供上层重试。
+ * 测试用：NOTION_AUTO_SIMULATE_STUCK=1 时本函数直接抛错，用于验证「3 次 reopen 失败 → 恢复重启」流程。
  */
 async function reopenNotionAndNewChat(
   page: import("playwright").Page,
   config: Config,
 ): Promise<void> {
+  if (process.env.NOTION_AUTO_SIMULATE_STUCK === "1") {
+    throw new Error("模拟浏览器卡住（NOTION_AUTO_SIMULATE_STUCK=1）");
+  }
   await page.reload({ waitUntil: "domcontentloaded" });
   await sleep(500);
   const img = page.locator(AI_FACE_IMG).first();

@@ -9,6 +9,7 @@ import { paramsToArgv } from "./dashboard-params.js";
 import { loadProgress } from "./progress.js";
 import { sendRestartAlertEmail } from "./alert-email.js";
 import { logger } from "./logger.js";
+import { EXIT_RECOVERY_RESTART } from "./exit-codes.js";
 
 const MAX_RUN_LOGS = 10;
 const MAX_LINES_PER_RUN = 2000;
@@ -91,7 +92,7 @@ function spawnChild(params: DashboardParams, isAutoResume: boolean): void {
     });
   });
 
-  function finishRun(): void {
+  function finishRun(exitCode?: number): void {
     if (currentProcess == null) return;
     currentProcess = null;
     if (currentRunLog) currentRunLog.endTime = Date.now();
@@ -100,28 +101,33 @@ function spawnChild(params: DashboardParams, isAutoResume: boolean): void {
       if (runLogs.length > MAX_RUN_LOGS) runLogs = runLogs.slice(0, MAX_RUN_LOGS);
       currentRunLog = null;
     }
-    setImmediate(() => maybeAutoRestart());
+    setImmediate(() => maybeAutoRestart(exitCode));
   }
 
-  child.on("exit", finishRun);
+  child.on("exit", (code) => finishRun(code ?? undefined));
   child.on("error", (err) => {
     logger.warn("子进程 error 事件", err);
     finishRun();
   });
 }
 
-/** exit 后若 userWantsRunning 且 progress 未 completed 则自动重启；连续 >5 次发告警邮件（只发一封）。 */
-async function maybeAutoRestart(): Promise<void> {
+/** exit 后若 userWantsRunning 且 progress 未 completed 则自动重启；恢复重启（exitCode=2）不计入连续重启次数，不触发告警。 */
+async function maybeAutoRestart(exitCode?: number): Promise<void> {
   if (!userWantsRunning || lastParams == null) return;
   const progress = await loadProgress();
   if (progress?.completed === true) return;
 
-  consecutiveRestartCount++;
-  if (consecutiveRestartCount > RESTART_ALERT_THRESHOLD && !emailSent) {
-    await sendRestartAlertEmail();
-    emailSent = true;
+  const isRecoveryRestart = exitCode === EXIT_RECOVERY_RESTART;
+  if (!isRecoveryRestart) {
+    consecutiveRestartCount++;
+    if (consecutiveRestartCount > RESTART_ALERT_THRESHOLD && !emailSent) {
+      await sendRestartAlertEmail();
+      emailSent = true;
+    }
+    logger.warn(`脚本异常退出，自动重启（第 ${consecutiveRestartCount} 次）`);
+  } else {
+    logger.info("脚本请求恢复重启（浏览器卡住等），立即重启并继续，不计入连续重启次数");
   }
-  logger.warn(`脚本异常退出，自动重启（第 ${consecutiveRestartCount} 次）`);
   spawnChild(lastParams, true);
 }
 
