@@ -201,7 +201,11 @@ async function typeAndSend(
   await send.click();
 
   // 发送后同一位置会变为 Stop，等 AI 回复完成、发送按钮再次出现后才可进行下一次发送（用 SEND_BUTTON 与 model-picker 的「可发送」判定一致）
-  await page.locator(SEND_BUTTON).first().waitFor({ state: "visible", timeout: WAIT_SUBMIT_READY_MS });
+  try {
+    await page.locator(SEND_BUTTON).first().waitFor({ state: "visible", timeout: WAIT_SUBMIT_READY_MS });
+  } catch (e) {
+    throw new WaitAfterSendTimeoutError(e);
+  }
 }
 
 /** 点击 New AI chat */
@@ -260,8 +264,17 @@ async function runWithRetry<T>(
 /** 单轮最多「重新打开 Notion」次数，避免死循环 */
 const MAX_REOPEN_PER_ROUND = 3;
 
+/** 发送后等待「发送按钮再次出现」超时：表示 AI 仍在输出，不应再发一条，重试时只再等一次 */
+class WaitAfterSendTimeoutError extends Error {
+  constructor(public readonly cause: unknown) {
+    super("发送后等待可发送状态超时（AI 可能仍在输出）");
+    this.name = "WaitAfterSendTimeoutError";
+  }
+}
+
 /**
  * 尝试执行 typeAndSend 最多 max 次，成功返回 true，全部失败返回 false（不抛错）。
+ * 若失败原因是「发送后等待发送按钮再现」超时，则不再重试发送（避免输出未结束又发一条），只再等一次发送按钮。
  */
 async function tryTypeAndSend(
   page: import("playwright").Page,
@@ -273,6 +286,15 @@ async function tryTypeAndSend(
       await typeAndSend(page, prompt);
       return true;
     } catch (e) {
+      if (e instanceof WaitAfterSendTimeoutError) {
+        logger.warn("发送后等待超时，仅再等一次发送按钮出现，不再重发");
+        try {
+          await page.locator(SEND_BUTTON).first().waitFor({ state: "visible", timeout: WAIT_SUBMIT_READY_MS });
+          return true;
+        } catch {
+          return false;
+        }
+      }
       if (i < max - 1) logger.warn(`输入+发送 重试 ${i + 1}/${max}…`, e);
     }
   }
