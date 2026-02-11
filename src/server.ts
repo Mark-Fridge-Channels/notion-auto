@@ -342,8 +342,8 @@ function getDashboardHtml(): string {
     <div class="card">
       <h2>全局设置</h2>
       <div class="row">
-        <label>每隔多少秒check一次是否对话结束<span class="hint">默认 120</span></label>
-        <input id="intervalSeconds" type="number" min="1" placeholder="120">
+        <label>每隔多少秒 check 一次是否对话结束（区间，每次发送后随机）<span class="hint">最小～最大，默认 120～120</span></label>
+        <span><input id="intervalSecondsMin" type="number" min="1" placeholder="120" style="width:5rem"> ～ <input id="intervalSecondsMax" type="number" min="1" placeholder="120" style="width:5rem"> 秒</span>
       </div>
       <div class="row">
         <label>如果没有登录账号，首次等待多少秒进行手动登录操作 <span class="hint">默认 60</span></label>
@@ -369,8 +369,8 @@ function getDashboardHtml(): string {
         <h3 id="industryModalTitle">编辑行业</h3>
         <div class="row"><label>行业 id（名称）</label><input type="text" id="modalIndustryId" placeholder="id"></div>
         <div class="row"><label>Notion Portal URL</label><input type="url" id="modalNotionUrl" placeholder="https://..."></div>
-        <div class="row"><label>每 N 次新会话</label><input type="number" id="modalNewChatEveryRuns" min="0" value="1"></div>
-        <div class="row"><label>每 M 次换模型 (0=不换)</label><input type="number" id="modalModelSwitchInterval" min="0" value="0"></div>
+        <div class="row"><label>每 N 次新会话（区间，开新会话时随机）</label><span><input type="number" id="modalNewChatEveryRunsMin" min="0" value="1" style="width:4rem"> ～ <input type="number" id="modalNewChatEveryRunsMax" min="0" value="1" style="width:4rem"></span></div>
+        <div class="row"><label>每 M 次换模型（区间，0=不换）</label><span><input type="number" id="modalModelSwitchIntervalMin" min="0" value="0" style="width:4rem"> ～ <input type="number" id="modalModelSwitchIntervalMax" min="0" value="0" style="width:4rem"></span></div>
         <div class="row"><label>任务链</label><div id="modalTasksContainer"></div><button type="button" id="modalAddTask">添加任务</button></div>
         <div class="form-actions">
           <button type="button" id="modalSave" class="primary">保存</button>
@@ -456,7 +456,7 @@ function getDashboardHtml(): string {
         selectEl.onchange = function() {
           if (selectEl.value !== NEW_INDUSTRY_VALUE) return;
           const newId = 'new_' + Date.now();
-          const newInd = { id: newId, notionUrl: '', newChatEveryRuns: 1, modelSwitchInterval: 0, tasks: [{ content: '', runCount: 1 }] };
+          const newInd = { id: newId, notionUrl: '', newChatEveryRunsMin: 1, newChatEveryRunsMax: 1, modelSwitchIntervalMin: 0, modelSwitchIntervalMax: 0, tasks: [{ content: '', runCount: 1 }] };
           schedule.industries.push(newInd);
           slot.industryId = newId;
           syncScheduleUI();
@@ -486,7 +486,7 @@ function getDashboardHtml(): string {
         industriesContainer.appendChild(row);
       });
       document.getElementById('btnAddIndustry').onclick = () => {
-        industries.push({ id: 'new_' + Date.now(), notionUrl: '', newChatEveryRuns: 1, modelSwitchInterval: 0, tasks: [{ content: '', runCount: 1 }] });
+        industries.push({ id: 'new_' + Date.now(), notionUrl: '', newChatEveryRunsMin: 1, newChatEveryRunsMax: 1, modelSwitchIntervalMin: 0, modelSwitchIntervalMax: 0, tasks: [{ content: '', runCount: 1 }] });
         syncScheduleUI();
         openEditModal(industries.length - 1);
       };
@@ -516,8 +516,10 @@ function getDashboardHtml(): string {
       document.getElementById('industryModalTitle').textContent = ind.id ? ('编辑行业: ' + ind.id) : '新建行业';
       document.getElementById('modalIndustryId').value = ind.id || '';
       document.getElementById('modalNotionUrl').value = ind.notionUrl || '';
-      document.getElementById('modalNewChatEveryRuns').value = ind.newChatEveryRuns ?? 1;
-      document.getElementById('modalModelSwitchInterval').value = ind.modelSwitchInterval ?? 0;
+      document.getElementById('modalNewChatEveryRunsMin').value = ind.newChatEveryRunsMin ?? 1;
+      document.getElementById('modalNewChatEveryRunsMax').value = ind.newChatEveryRunsMax ?? 1;
+      document.getElementById('modalModelSwitchIntervalMin').value = ind.modelSwitchIntervalMin ?? 0;
+      document.getElementById('modalModelSwitchIntervalMax').value = ind.modelSwitchIntervalMax ?? 0;
       const tasksContainer = document.getElementById('modalTasksContainer');
       tasksContainer.innerHTML = '';
       /** 删除任务：只移除该行并 splice，不重填表单，避免清空用户已填未保存内容 */
@@ -556,8 +558,10 @@ function getDashboardHtml(): string {
       const oldId = (ind && ind.id) || '';
       const newId = document.getElementById('modalIndustryId').value.trim() || 'unnamed';
       const notionUrl = document.getElementById('modalNotionUrl').value.trim() || '';
-      const newChatEveryRuns = Number(document.getElementById('modalNewChatEveryRuns').value) || 1;
-      const modelSwitchInterval = Number(document.getElementById('modalModelSwitchInterval').value) || 0;
+      const newChatEveryRunsMin = Number(document.getElementById('modalNewChatEveryRunsMin').value);
+      const newChatEveryRunsMax = Number(document.getElementById('modalNewChatEveryRunsMax').value);
+      const modelSwitchIntervalMin = Number(document.getElementById('modalModelSwitchIntervalMin').value);
+      const modelSwitchIntervalMax = Number(document.getElementById('modalModelSwitchIntervalMax').value);
       const tasks = [];
       document.querySelectorAll('#modalTasksContainer .task-row').forEach(tr => {
         const content = (tr.querySelector('[data-key="content"]') && tr.querySelector('[data-key="content"]').value) || '';
@@ -566,8 +570,14 @@ function getDashboardHtml(): string {
       });
       ind.id = newId;
       ind.notionUrl = notionUrl;
-      ind.newChatEveryRuns = newChatEveryRuns;
-      ind.modelSwitchInterval = modelSwitchInterval;
+      const nMin = Number.isInteger(newChatEveryRunsMin) && newChatEveryRunsMin >= 0 ? newChatEveryRunsMin : 1;
+      const nMax = Number.isInteger(newChatEveryRunsMax) && newChatEveryRunsMax >= 0 ? newChatEveryRunsMax : 1;
+      ind.newChatEveryRunsMin = Math.min(nMin, nMax);
+      ind.newChatEveryRunsMax = Math.max(nMin, nMax);
+      const mMin = Number.isInteger(modelSwitchIntervalMin) && modelSwitchIntervalMin >= 0 ? modelSwitchIntervalMin : 0;
+      const mMax = Number.isInteger(modelSwitchIntervalMax) && modelSwitchIntervalMax >= 0 ? modelSwitchIntervalMax : 0;
+      ind.modelSwitchIntervalMin = Math.min(mMin, mMax);
+      ind.modelSwitchIntervalMax = Math.max(mMin, mMax);
       ind.tasks = tasks;
       if (oldId !== newId) {
         (currentSchedule.timeSlots || []).forEach(slot => {
@@ -583,14 +593,18 @@ function getDashboardHtml(): string {
     /* 弹窗仅通过「保存」或「取消」关闭，点击遮罩不关闭 */
 
     function fillGlobal(schedule) {
-      document.getElementById('intervalSeconds').value = schedule.intervalMs != null ? Math.round(schedule.intervalMs / 1000) : 120;
+      document.getElementById('intervalSecondsMin').value = schedule.intervalMinMs != null ? Math.round(schedule.intervalMinMs / 1000) : 120;
+      document.getElementById('intervalSecondsMax').value = schedule.intervalMaxMs != null ? Math.round(schedule.intervalMaxMs / 1000) : 120;
       document.getElementById('loginWaitSeconds').value = schedule.loginWaitMs != null ? Math.round(schedule.loginWaitMs / 1000) : 60;
       document.getElementById('maxRetries').value = schedule.maxRetries ?? 3;
     }
 
     /** 从 DOM 收集时间区间，行业数据以内存 currentSchedule.industries 为准 */
     function collectSchedule() {
-      const intervalMs = (Number(document.getElementById('intervalSeconds').value) || 120) * 1000;
+      const secMin = Number(document.getElementById('intervalSecondsMin').value) || 120;
+      const secMax = Number(document.getElementById('intervalSecondsMax').value) || 120;
+      const intervalMinMs = Math.min(secMin, secMax) * 1000;
+      const intervalMaxMs = Math.max(secMin, secMax) * 1000;
       const loginWaitMs = (Number(document.getElementById('loginWaitSeconds').value) || 60) * 1000;
       const maxRetries = Number(document.getElementById('maxRetries').value) || 3;
       const slots = [];
@@ -603,7 +617,7 @@ function getDashboardHtml(): string {
         slots.push({ startHour, endHour: endHourVal, industryId });
       });
       const industries = (currentSchedule && currentSchedule.industries) ? currentSchedule.industries : [];
-      return { intervalMs, loginWaitMs, maxRetries, storagePath: '.notion-auth.json', timeSlots: slots, industries };
+      return { intervalMinMs, intervalMaxMs, loginWaitMs, maxRetries, storagePath: '.notion-auth.json', timeSlots: slots, industries };
     }
 
     async function loadSchedule() {

@@ -14,16 +14,18 @@ export interface ScheduleTask {
   runCount: number;
 }
 
-/** 行业：Notion Portal URL + 任务链 + 行业级每 N 次新会话、每 M 次换模型 */
+/** 行业：Notion Portal URL + 任务链 + 行业级每 N 次新会话、每 M 次换模型（区间，开新会话时随机） */
 export interface ScheduleIndustry {
   /** 行业唯一标识，时间区间通过此 id 引用行业 */
   id: string;
   /** 该行业对应的 Notion 页面 URL */
   notionUrl: string;
-  /** 每跑 N 次后点击 New AI chat 新建会话；0 表示不新建会话 */
-  newChatEveryRuns: number;
-  /** 每跑 M 次后切换模型；0 表示不切换 */
-  modelSwitchInterval: number;
+  /** 每跑 N 次后新建会话：区间 [min, max]，开新会话时随机取 N；0 表示本会话不主动新建 */
+  newChatEveryRunsMin: number;
+  newChatEveryRunsMax: number;
+  /** 每跑 M 次后换模型：区间 [min, max]，开新会话时随机取 M；0 表示本会话不换 */
+  modelSwitchIntervalMin: number;
+  modelSwitchIntervalMax: number;
   /** 任务链，按顺序执行 */
   tasks: ScheduleTask[];
 }
@@ -39,8 +41,9 @@ export interface TimeSlot {
 }
 
 export interface Schedule {
-  /** 每轮间隔（毫秒） */
-  intervalMs: number;
+  /** 每轮间隔（毫秒）：区间 [min, max]，每次发送完成后随机取再 sleep */
+  intervalMinMs: number;
+  intervalMaxMs: number;
   /** 首次打开页面时的登录等待（毫秒） */
   loginWaitMs: number;
   /** 单步最大重试次数 */
@@ -58,7 +61,8 @@ const DEFAULT_STORAGE_PATH = ".notion-auth.json";
 /** 默认/示例配置：一个区间 + 一个行业 + 一个任务 */
 export function getDefaultSchedule(): Schedule {
   return {
-    intervalMs: 2 * 60 * 1000,
+    intervalMinMs: 2 * 60 * 1000,
+    intervalMaxMs: 2 * 60 * 1000,
     loginWaitMs: 60 * 1000,
     maxRetries: 3,
     storagePath: DEFAULT_STORAGE_PATH,
@@ -69,8 +73,10 @@ export function getDefaultSchedule(): Schedule {
       {
         id: "default",
         notionUrl: "https://www.notion.so/",
-        newChatEveryRuns: 1,
-        modelSwitchInterval: 1,
+        newChatEveryRunsMin: 1,
+        newChatEveryRunsMax: 1,
+        modelSwitchIntervalMin: 1,
+        modelSwitchIntervalMax: 1,
         tasks: [
           { content: "@Task — Add new companies", runCount: 1 },
         ],
@@ -92,10 +98,16 @@ function validateIndustry(ind: unknown, index: number): asserts ind is ScheduleI
   const o = ind as Record<string, unknown>;
   if (typeof o.id !== "string" || !o.id.trim()) throw new Error(`行业[${index}].id 必须为非空字符串`);
   if (typeof o.notionUrl !== "string") throw new Error(`行业[${index}].notionUrl 必须为字符串`);
-  const n = Number(o.newChatEveryRuns);
-  if (!Number.isInteger(n) || n < 0) throw new Error(`行业[${index}].newChatEveryRuns 必须为非负整数`);
-  const m = Number(o.modelSwitchInterval);
-  if (!Number.isInteger(m) || m < 0) throw new Error(`行业[${index}].modelSwitchInterval 必须为非负整数`);
+  const nMin = Number(o.newChatEveryRunsMin);
+  const nMax = Number(o.newChatEveryRunsMax);
+  if (!Number.isInteger(nMin) || nMin < 0) throw new Error(`行业[${index}].newChatEveryRunsMin 必须为非负整数`);
+  if (!Number.isInteger(nMax) || nMax < 0) throw new Error(`行业[${index}].newChatEveryRunsMax 必须为非负整数`);
+  if (nMin > nMax) throw new Error(`行业[${index}] newChatEveryRunsMin 不能大于 newChatEveryRunsMax`);
+  const mMin = Number(o.modelSwitchIntervalMin);
+  const mMax = Number(o.modelSwitchIntervalMax);
+  if (!Number.isInteger(mMin) || mMin < 0) throw new Error(`行业[${index}].modelSwitchIntervalMin 必须为非负整数`);
+  if (!Number.isInteger(mMax) || mMax < 0) throw new Error(`行业[${index}].modelSwitchIntervalMax 必须为非负整数`);
+  if (mMin > mMax) throw new Error(`行业[${index}] modelSwitchIntervalMin 不能大于 modelSwitchIntervalMax`);
   if (!Array.isArray(o.tasks)) throw new Error(`行业[${index}].tasks 必须为数组`);
   if (o.tasks.length === 0) throw new Error(`行业[${index}].tasks 不能为空`);
   o.tasks.forEach((t, i) => validateTask(t, i));
@@ -122,7 +134,9 @@ export function validateSchedule(s: Schedule): void {
       throw new Error(`时间区间[${i}] 引用的行业 "${slot.industryId}" 不存在`);
   });
   (s.industries ?? []).forEach((ind, i) => validateIndustry(ind, i));
-  if (!Number.isFinite(s.intervalMs) || s.intervalMs < 1) throw new Error("intervalMs 必须为正数");
+  if (!Number.isFinite(s.intervalMinMs) || s.intervalMinMs < 1) throw new Error("intervalMinMs 必须为正数");
+  if (!Number.isFinite(s.intervalMaxMs) || s.intervalMaxMs < 1) throw new Error("intervalMaxMs 必须为正数");
+  if (s.intervalMinMs > s.intervalMaxMs) throw new Error("intervalMinMs 不能大于 intervalMaxMs");
   if (!Number.isFinite(s.loginWaitMs) || s.loginWaitMs < 0) throw new Error("loginWaitMs 必须为非负数");
   if (!Number.isFinite(s.maxRetries) || s.maxRetries < 1) throw new Error("maxRetries 必须为正整数");
   if (typeof s.storagePath !== "string" || s.storagePath.includes("..") || s.storagePath.startsWith("/"))
@@ -157,18 +171,53 @@ export async function loadSchedule(filePath: string): Promise<Schedule> {
   }
 }
 
-/** 从对象合并默认值（不写盘），用于 API 传入的 partial */
+/**
+ * 从区间 [min, max] 规范化行业：若仅有旧单数字段则设 min=max=原值。
+ */
+function normalizeIndustry(ind: unknown): ScheduleIndustry {
+  const def = getDefaultSchedule().industries[0]!;
+  if (ind == null || typeof ind !== "object") return def;
+  const o = ind as Record<string, unknown>;
+  const nMin = o.newChatEveryRunsMin !== undefined ? Number(o.newChatEveryRunsMin) : Number(o.newChatEveryRuns);
+  const nMax = o.newChatEveryRunsMax !== undefined ? Number(o.newChatEveryRunsMax) : Number(o.newChatEveryRuns);
+  const mMin = o.modelSwitchIntervalMin !== undefined ? Number(o.modelSwitchIntervalMin) : Number(o.modelSwitchInterval);
+  const mMax = o.modelSwitchIntervalMax !== undefined ? Number(o.modelSwitchIntervalMax) : Number(o.modelSwitchInterval);
+  return {
+    id: typeof o.id === "string" ? o.id : def.id,
+    notionUrl: typeof o.notionUrl === "string" ? o.notionUrl : def.notionUrl,
+    newChatEveryRunsMin: Number.isInteger(nMin) && nMin >= 0 ? nMin : def.newChatEveryRunsMin,
+    newChatEveryRunsMax: Number.isInteger(nMax) && nMax >= 0 ? nMax : def.newChatEveryRunsMax,
+    modelSwitchIntervalMin: Number.isInteger(mMin) && mMin >= 0 ? mMin : def.modelSwitchIntervalMin,
+    modelSwitchIntervalMax: Number.isInteger(mMax) && mMax >= 0 ? mMax : def.modelSwitchIntervalMax,
+    tasks: Array.isArray(o.tasks) ? (o.tasks as ScheduleTask[]) : def.tasks,
+  };
+}
+
+/** 从对象合并默认值（不写盘），用于 API 传入的 partial；兼容旧单数字段 → min=max */
 export function mergeSchedule(partial: unknown): Schedule {
   const def = getDefaultSchedule();
   if (partial == null || typeof partial !== "object") return def;
   const o = partial as Record<string, unknown>;
+  const intervalMsLegacy = Number(o.intervalMs);
+  const hasIntervalRange = o.intervalMinMs !== undefined || o.intervalMaxMs !== undefined;
+  const intervalMin = hasIntervalRange ? Number(o.intervalMinMs) : intervalMsLegacy;
+  const intervalMax = hasIntervalRange ? Number(o.intervalMaxMs) : intervalMsLegacy;
   const out: Schedule = {
-    intervalMs: Number(o.intervalMs) || def.intervalMs,
+    intervalMinMs: (() => {
+      const a = Number.isFinite(intervalMin) && intervalMin >= 1 ? intervalMin : def.intervalMinMs;
+      const b = Number.isFinite(intervalMax) && intervalMax >= 1 ? intervalMax : def.intervalMaxMs;
+      return Math.min(a, b);
+    })(),
+    intervalMaxMs: (() => {
+      const a = Number.isFinite(intervalMin) && intervalMin >= 1 ? intervalMin : def.intervalMinMs;
+      const b = Number.isFinite(intervalMax) && intervalMax >= 1 ? intervalMax : def.intervalMaxMs;
+      return Math.max(a, b);
+    })(),
     loginWaitMs: Number(o.loginWaitMs) ?? def.loginWaitMs,
     maxRetries: Number(o.maxRetries) || def.maxRetries,
     storagePath: typeof o.storagePath === "string" ? o.storagePath : def.storagePath,
     timeSlots: Array.isArray(o.timeSlots) ? (o.timeSlots as TimeSlot[]) : def.timeSlots,
-    industries: Array.isArray(o.industries) ? (o.industries as ScheduleIndustry[]) : def.industries,
+    industries: Array.isArray(o.industries) ? (o.industries as unknown[]).map(normalizeIndustry) : def.industries,
   };
   return out;
 }

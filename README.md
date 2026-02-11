@@ -24,9 +24,9 @@ npx playwright install chromium
 运行前需在项目目录下准备 **schedule.json**（或通过 `--config <path>` 指定）。结构示例见 **schedule.example.json**：
 
 - **timeSlots**：时间区间列表，左闭右开、本地时区；每项含 `startHour`、`endHour`（0–23）、`industryId`（绑定行业）。
-- **industries**：行业列表，每项含 `id`、`notionUrl`、`newChatEveryRuns`（每 N 次新会话，0=不新会话）、`modelSwitchInterval`（每 M 次换模型，0=不换）、`tasks`（任务链）。
+- **industries**：行业列表，每项含 `id`、`notionUrl`、`newChatEveryRunsMin`/`newChatEveryRunsMax`（每 N 次新会话的区间，开新会话时随机取 N；0=本会话不主动新建）、`modelSwitchIntervalMin`/`modelSwitchIntervalMax`（每 M 次换模型的区间，0=不换）、`tasks`（任务链）。
 - **tasks**：每任务 `content`（输入文案）、`runCount`（本轮执行次数）。
-- 顶层：`intervalMs`、`loginWaitMs`、`maxRetries`、`storagePath`。
+- 顶层：`intervalMinMs`/`intervalMaxMs`（每次发送完成后等待的毫秒数区间，每次随机取）、`loginWaitMs`、`maxRetries`、`storagePath`。
 
 未配置的时间段不跑（脚本会等待直至落入某区间）。时间区间列表为空会报错退出。
 

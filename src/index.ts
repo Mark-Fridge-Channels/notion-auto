@@ -28,6 +28,22 @@ import { switchToNextModel } from "./model-picker.js";
 import { logger } from "./logger.js";
 import { saveProgress } from "./progress.js";
 import { EXIT_RECOVERY_RESTART } from "./exit-codes.js";
+import type { ScheduleIndustry } from "./schedule.js";
+
+/** 闭区间 [min, max] 内随机整数（含两端），用于间隔与 N/M 区间 */
+function randomIntInclusive(min: number, max: number): number {
+  const lo = Math.min(min, max);
+  const hi = Math.max(min, max);
+  return lo + Math.floor((hi - lo + 1) * Math.random());
+}
+
+/** 从行业区间随机得到本会话的 N、M */
+function drawSessionN(industry: ScheduleIndustry): number {
+  return randomIntInclusive(industry.newChatEveryRunsMin, industry.newChatEveryRunsMax);
+}
+function drawSessionM(industry: ScheduleIndustry): number {
+  return randomIntInclusive(industry.modelSwitchIntervalMin, industry.modelSwitchIntervalMax);
+}
 
 /** 运行入口：解析 --config、--storage，加载 schedule、等待落入区间后启动浏览器并进入主循环 */
 async function main(): Promise<void> {
@@ -80,8 +96,13 @@ async function main(): Promise<void> {
     }
     await clickNewAIChat(page, schedule.maxRetries);
 
-    /** 本行业累计执行次数（用于新会话/换模型判断） */
+    /** 本行业累计执行次数（日志与 saveProgress） */
     let runCount = 0;
+    /** 当前会话内执行次数（仅「开新会话」时重置：进入/切换行业、按 currentN 主动 new chat；失败重试的 new chat 不重置） */
+    let sessionRuns = 0;
+    /** 本会话的 N、M（开新会话时从行业区间随机） */
+    let currentN = drawSessionN(currentIndustry);
+    let currentM = drawSessionM(currentIndustry);
 
     for (;;) {
       // 每轮任务链开始前：检查是否跨时间区间需切换行业
@@ -106,15 +127,21 @@ async function main(): Promise<void> {
         await sleep(MODAL_WAIT_MS);
         await dismissPersonalizeDialogIfPresent(page);
         await clickNewAIChat(page, schedule.maxRetries);
+        sessionRuns = 0;
+        currentN = drawSessionN(currentIndustry);
+        currentM = drawSessionM(currentIndustry);
       }
 
       // 执行一轮任务链
       for (const task of currentIndustry.tasks) {
         for (let k = 0; k < task.runCount; k++) {
-          if (runCount > 0 && currentIndustry.newChatEveryRuns > 0 && runCount % currentIndustry.newChatEveryRuns === 0) {
+          if (currentN > 0 && sessionRuns > 0 && sessionRuns % currentN === 0) {
             await clickNewAIChat(page, schedule.maxRetries);
+            sessionRuns = 0;
+            currentN = drawSessionN(currentIndustry);
+            currentM = drawSessionM(currentIndustry);
           }
-          if (runCount > 0 && currentIndustry.modelSwitchInterval > 0 && runCount % currentIndustry.modelSwitchInterval === 0) {
+          if (currentM > 0 && sessionRuns > 0 && sessionRuns % currentM === 0) {
             await switchToNextModel(page);
           }
 
@@ -146,10 +173,13 @@ async function main(): Promise<void> {
           }
 
           runCount++;
+          sessionRuns++;
           await saveProgress({ totalDone: runCount, conversationRuns: 0, completed: false });
           logger.info(`行业 ${currentIndustry.id} 已执行 ${runCount} 次（任务 "${task.content.slice(0, 30)}…"）`);
 
-          await sleep(schedule.intervalMs);
+          const intervalMs = randomIntInclusive(schedule.intervalMinMs, schedule.intervalMaxMs);
+          logger.info(`等待 ${intervalMs / 1000} 秒后继续...`);
+          await sleep(intervalMs);
         }
       }
       // 任务链跑完，立刻从头再跑（不 break）

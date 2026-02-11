@@ -1,5 +1,6 @@
 {
-  "intervalMs": 120000,
+  "intervalMinMs": 120000,
+  "intervalMaxMs": 120000,
   "loginWaitMs": 60000,
   "maxRetries": 3,
   "storagePath": ".notion-auth.json",
@@ -12,8 +13,10 @@
     {
       "id": "industryA",
       "notionUrl": "https://www.notion.so/your-page-A",
-      "newChatEveryRuns": 2,
-      "modelSwitchInterval": 1,
+      "newChatEveryRunsMin": 2,
+      "newChatEveryRunsMax": 5,
+      "modelSwitchIntervalMin": 1,
+      "modelSwitchIntervalMax": 1,
       "tasks": [
         { "content": "@Task A1 — 输入内容示例", "runCount": 1 },
         { "content": "@Task A2 — 另一条", "runCount": 2 }
@@ -22,20 +25,20 @@
     {
       "id": "industryB",
       "notionUrl": "https://www.notion.so/your-page-B",
-      "newChatEveryRuns": 1,
-      "modelSwitchInterval": 1,
-      "tasks": [
-        { "content": "@Task B — 行业 B 文案", "runCount": 1 }
-      ]
+      "newChatEveryRunsMin": 1,
+      "newChatEveryRunsMax": 1,
+      "modelSwitchIntervalMin": 1,
+      "modelSwitchIntervalMax": 1,
+      "tasks": [{ "content": "@Task B — 行业 B 文案", "runCount": 1 }]
     },
     {
       "id": "industryC",
       "notionUrl": "https://www.notion.so/your-page-C",
-      "newChatEveryRuns": 10,
-      "modelSwitchInterval": 0,
-      "tasks": [
-        { "content": "@Task C — 行业 C 文案", "runCount": 5 }
-      ]
+      "newChatEveryRunsMin": 10,
+      "newChatEveryRunsMax": 10,
+      "modelSwitchIntervalMin": 0,
+      "modelSwitchIntervalMax": 0,
+      "tasks": [{ "content": "@Task C — 行业 C 文案", "runCount": 5 }]
     }
   ]
 }
