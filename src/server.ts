@@ -181,28 +181,43 @@ async function handleRequest(
   }
 }
 
+/** 从环境变量 NOTION_AUTO_NAME 读取名称，生成标题「notion-auto （Name）控制台」；未设置则「notion-auto 控制台」。已做 HTML 转义防 XSS。 */
+function getDashboardTitle(): string {
+  const name = (process.env.NOTION_AUTO_NAME ?? "").trim();
+  if (!name) return "notion-auto 控制台";
+  const safe = name
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+  return `notion-auto （${safe}）控制台`;
+}
+
 function getIndexHtml(): string {
   return getDashboardHtml();
 }
 
 /** 生成 Dashboard 单页 HTML：全局设置 + 时间区间 + 行业任务链 + 日志 */
 function getDashboardHtml(): string {
+  const pageTitle = getDashboardTitle();
   return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>notion-auto 控制台</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>${pageTitle}</title>
   <style>
-    * { box-sizing: border-box; }
-    body { font-family: system-ui, -apple-system, sans-serif; max-width: 960px; margin: 0 auto; padding: 1.25rem; background: #f5f5f5; color: #333; }
-    .header { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 1rem; margin-bottom: 1.5rem; padding: 1rem; background: #fff; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html { -webkit-text-size-adjust: 100%; }
+    body { font-family: system-ui, -apple-system, sans-serif; max-width: 960px; margin: 0 auto; padding: 1.25rem; padding-left: max(1.25rem, env(safe-area-inset-left)); padding-right: max(1.25rem, env(safe-area-inset-right)); padding-bottom: max(1.25rem, env(safe-area-inset-bottom)); background: #f5f5f5; color: #333; }
+    .header { display: flex; align-items: flex-start; justify-content: space-between; flex-wrap: wrap; gap: 1rem; margin-bottom: 1.5rem; padding: 1rem; padding-left: max(1rem, env(safe-area-inset-left)); padding-right: max(1rem, env(safe-area-inset-right)); background: #fff; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
     .header h1 { margin: 0; font-size: 1.25rem; font-weight: 600; }
     .status { padding: 0.4rem 0.9rem; border-radius: 6px; font-size: 0.875rem; font-weight: 500; }
     .status.running { background: #d4edda; color: #155724; }
     .status.idle { background: #f8d7da; color: #721c24; }
-    .actions { display: flex; gap: 0.5rem; }
-    .actions button { padding: 0.45rem 1rem; border-radius: 6px; border: 1px solid #ddd; background: #fff; cursor: pointer; font-size: 0.875rem; }
+    .actions { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+    .actions button { min-height: 44px; padding: 0.5rem 1rem; border-radius: 8px; border: 1px solid #ddd; background: #fff; cursor: pointer; font-size: 0.875rem; touch-action: manipulation; }
     .actions button:hover:not(:disabled) { background: #f0f0f0; }
     .actions button:disabled { opacity: 0.6; cursor: not-allowed; }
     .actions button.primary { background: #0d6efd; color: #fff; border-color: #0d6efd; }
@@ -210,41 +225,60 @@ function getDashboardHtml(): string {
     .actions button.danger { border-color: #dc3545; color: #dc3545; }
     .actions button.danger:hover:not(:disabled) { background: #fff5f5; }
     .layout { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
-    @media (max-width: 768px) { .layout { grid-template-columns: 1fr; } }
     .card { background: #fff; border-radius: 8px; padding: 1.25rem; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
     .card h2 { margin: 0 0 1rem; font-size: 1rem; font-weight: 600; color: #555; }
     .row { margin-bottom: 1rem; }
     label { display: block; margin-bottom: 0.25rem; font-size: 0.875rem; font-weight: 500; }
     .hint { font-weight: normal; color: #888; font-size: 0.8rem; }
-    input, textarea, select { width: 100%; padding: 0.45rem 0.6rem; border: 1px solid #ddd; border-radius: 6px; font-size: 0.875rem; }
+    input, textarea, select { width: 100%; padding: 0.5rem 0.65rem; border: 1px solid #ddd; border-radius: 6px; font-size: 16px; }
+    input:focus, textarea:focus, select:focus { outline: 2px solid #0d6efd; outline-offset: 2px; }
     textarea { min-height: 48px; resize: vertical; }
-    .slot-row, .task-row { display: flex; gap: 0.5rem; align-items: center; margin-bottom: 0.5rem; }
-    .slot-row input[type="number"], .task-row input[type="number"] { width: 4rem; }
-    .slot-row select { flex: 1; max-width: 12rem; }
+    .slot-row, .task-row { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-bottom: 0.5rem; }
+    .slot-row input[type="number"], .task-row input[type="number"] { width: 4rem; min-width: 3rem; }
+    .slot-row select { flex: 1; min-width: 0; max-width: 12rem; }
     .industry-list { border: 1px solid #eee; border-radius: 6px; overflow: hidden; }
-    .industry-row { display: flex; align-items: center; gap: 0.75rem; padding: 0.6rem 1rem; border-bottom: 1px solid #eee; background: #fff; }
+    .industry-row { display: flex; align-items: center; flex-wrap: wrap; gap: 0.5rem 0.75rem; padding: 0.6rem 1rem; border-bottom: 1px solid #eee; background: #fff; }
     .industry-row:last-child { border-bottom: none; }
-    .industry-row .id { font-weight: 600; min-width: 8rem; }
+    .industry-row .id { font-weight: 600; min-width: 5rem; }
     .industry-row .url { flex: 1; min-width: 0; color: #666; font-size: 0.85rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .industry-row .actions { display: flex; gap: 0.35rem; flex-shrink: 0; }
-    .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.4); z-index: 100; align-items: center; justify-content: center; }
+    .modal-overlay { display: none; position: fixed; inset: 0; padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); background: rgba(0,0,0,.4); z-index: 100; align-items: center; justify-content: center; overflow-y: auto; }
     .modal-overlay.visible { display: flex; }
-    .modal-box { background: #fff; border-radius: 8px; padding: 1.25rem; min-width: 360px; max-width: 90vw; max-height: 90vh; overflow-y: auto; box-shadow: 0 4px 20px rgba(0,0,0,.15); }
+    .modal-box { background: #fff; border-radius: 8px; padding: 1.25rem; min-width: 280px; max-width: min(90vw, 360px); max-height: 85vh; overflow-y: auto; box-shadow: 0 4px 20px rgba(0,0,0,.15); margin: auto; }
     .modal-box h3 { margin: 0 0 1rem; font-size: 1rem; }
-    .modal-box .form-actions { margin-top: 1rem; display: flex; gap: 0.5rem; }
-    .task-row textarea { flex: 1; }
+    .modal-box .form-actions { margin-top: 1rem; display: flex; gap: 0.5rem; flex-wrap: wrap; }
+    .modal-box .form-actions button { min-height: 44px; }
+    .task-row textarea { flex: 1; min-width: 0; }
     .logs-card { grid-column: 1 / -1; }
-    .logs { background: #1e1e1e; color: #d4d4d4; padding: 1rem; border-radius: 6px; font-family: ui-monospace, monospace; font-size: 12px; white-space: pre-wrap; max-height: 380px; overflow-y: auto; }
+    .logs { background: #1e1e1e; color: #d4d4d4; padding: 1rem; border-radius: 6px; font-family: ui-monospace, monospace; font-size: 12px; white-space: pre-wrap; max-height: 380px; overflow-y: auto; -webkit-overflow-scrolling: touch; }
     .log-tabs { margin-bottom: 0.5rem; display: flex; flex-wrap: wrap; gap: 0.35rem; }
-    .log-tabs button { padding: 0.35rem 0.65rem; border-radius: 4px; border: 1px solid #ddd; background: #fff; cursor: pointer; font-size: 0.8rem; }
+    .log-tabs button { min-height: 36px; padding: 0.35rem 0.65rem; border-radius: 4px; border: 1px solid #ddd; background: #fff; cursor: pointer; font-size: 0.8rem; touch-action: manipulation; }
     .log-tabs button.active { background: #0d6efd; color: #fff; border-color: #0d6efd; }
-    #msg { margin-top: 0.5rem; font-size: 0.875rem; min-height: 1.25em; }
+    #msg { margin-top: 0.5rem; font-size: 0.875rem; min-height: 1.25em; word-break: break-word; }
+    @media (max-width: 768px) {
+      body { padding: 0.75rem; }
+      .header { padding: 0.75rem; flex-direction: column; align-items: stretch; }
+      .header .actions { width: 100%; }
+      .header .actions button { flex: 1; min-width: 0; }
+      .layout { grid-template-columns: 1fr; gap: 1rem; }
+      .card { padding: 1rem; }
+      .slot-row { flex-wrap: wrap; }
+      .slot-row select { max-width: none; }
+      .industry-row .id { min-width: 4rem; }
+      .modal-box { min-width: 0; width: 100%; max-width: calc(100vw - 1.5rem); margin: 1rem; }
+    }
+    @media (max-width: 480px) {
+      .header .actions { flex-direction: column; }
+      .header .actions button { width: 100%; }
+      .industry-row { flex-direction: column; align-items: stretch; gap: 0.5rem; }
+      .industry-row .url { white-space: normal; }
+    }
   </style>
 </head>
 <body>
   <header class="header">
     <div>
-      <h1>notion-auto 控制台</h1>
+      <h1>${pageTitle}</h1>
       <div id="statusEl" class="status" style="margin-top:0.5rem">加载中…</div>
     </div>
     <div>
