@@ -1,8 +1,10 @@
 /**
- * Dashboard Web 服务：端口 9000，仅 localhost；API（状态/schedule/停止·启动/日志）+ 单页 HTML。
+ * Dashboard Web 服务：端口 9000，仅 localhost；API（状态/schedule/停止·启动/日志/拉取并重启）+ 单页 HTML。
+ * 拉取并重启时 spawn 新进程并传 NOTION_AUTO_RESTART=1，新进程延迟 2 秒再 listen 以避免 EADDRINUSE。
  */
 
 import { createServer } from "node:http";
+import { spawn } from "node:child_process";
 import { resolve, relative } from "node:path";
 import * as runner from "./dashboard-runner.js";
 import { loadSchedule, saveSchedule, getSchedulePath, mergeSchedule, validateSchedule } from "./schedule.js";
@@ -10,6 +12,9 @@ import { logger } from "./logger.js";
 
 const PORT = 9000;
 const HOST = "127.0.0.1";
+
+/** 拉取并重启流程进行中时置为 true，防止重复点击 */
+let isPullRestartInProgress = false;
 
 /** 将 configPath 规范为项目目录下的路径，防止路径穿越；若非法则返回默认路径 */
 function resolveConfigPath(configured: string | undefined): string {
@@ -37,6 +42,59 @@ function sendJson(res: import("node:http").ServerResponse, status: number, data:
 function sendHtml(res: import("node:http").ServerResponse, html: string): void {
   res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
   res.end(html);
+}
+
+/**
+ * 在指定目录执行 git pull，跨平台不依赖 shell。
+ * @returns exitCode、stdout、stderr；exitCode 非 0 表示失败（冲突、无 git 等）。
+ */
+function runGitPull(cwd: string): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    const child = spawn("git", ["pull"], { cwd });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    function finish(exitCode: number, out: string, err: string) {
+      if (settled) return;
+      settled = true;
+      resolve({ exitCode, stdout: out, stderr: err });
+    }
+    child.stdout?.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString("utf-8");
+    });
+    child.stderr?.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString("utf-8");
+    });
+    child.on("close", (code, signal) => {
+      finish(code ?? (signal ? 1 : 0), stdout, stderr);
+    });
+    child.on("error", (err) => {
+      stderr += (err?.message ?? String(err)) + "\n";
+      finish(1, stdout, stderr);
+    });
+  });
+}
+
+/**
+ * 停止 runner 后 spawn 新 server 进程（带 NOTION_AUTO_RESTART=1，新进程会延迟 2s 再 listen），
+ * 不 await 子进程；调用方应在返回 HTTP 响应后 process.exit(0)。
+ * 跨平台：Windows 使用 shell + 单命令，与 dashboard-runner 一致。
+ */
+function spawnNewServerAndExit(): void {
+  runner.stop();
+  const env = { ...process.env, NOTION_AUTO_RESTART: "1" };
+  const cwd = process.cwd();
+  const opts = {
+    cwd,
+    env,
+    detached: true,
+    stdio: "ignore" as const,
+  };
+  if (process.platform === "win32") {
+    spawn("npx tsx src/server.ts", [], { ...opts, shell: true });
+  } else {
+    spawn("npx", ["tsx", "src/server.ts"], opts);
+  }
 }
 
 async function handleRequest(
@@ -91,6 +149,27 @@ async function handleRequest(
     if (path === "/api/logs" && method === "GET") {
       const runs = runner.getRecentRunLogs(10);
       sendJson(res, 200, { runs });
+      return;
+    }
+    if (path === "/api/pull-and-restart" && method === "POST") {
+      if (isPullRestartInProgress) {
+        sendJson(res, 409, { error: "拉取并重启正在进行中" });
+        return;
+      }
+      isPullRestartInProgress = true;
+      try {
+        const { exitCode, stdout, stderr } = await runGitPull(process.cwd());
+        if (exitCode !== 0) {
+          const error = stderr.trim() || stdout.trim() || `git pull 退出码 ${exitCode}`;
+          sendJson(res, 200, { ok: false, error, stdout, stderr });
+          return;
+        }
+        spawnNewServerAndExit();
+        sendJson(res, 200, { ok: true, message: "即将重启，请稍后刷新" });
+        setImmediate(() => process.exit(0));
+      } finally {
+        isPullRestartInProgress = false;
+      }
       return;
     }
 
@@ -173,6 +252,7 @@ function getDashboardHtml(): string {
         <button type="button" id="btnStart" class="primary">启动</button>
         <button type="button" id="btnStop" class="danger">停止</button>
         <button type="button" id="btnSave">保存配置</button>
+        <button type="button" id="btnPullRestart">拉取并重启</button>
       </div>
       <div id="msg"></div>
     </div>
@@ -482,6 +562,28 @@ function getDashboardHtml(): string {
       } catch (e) { showMsg(e instanceof Error ? e.message : String(e), true); }
     };
 
+    document.getElementById('btnPullRestart').onclick = async () => {
+      const btn = document.getElementById('btnPullRestart');
+      showMsg('');
+      btn.disabled = true;
+      try {
+        const res = await fetch('/api/pull-and-restart', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+        const data = await res.json();
+        if (data.ok === true) {
+          showMsg('即将重启，请稍后刷新', false);
+        } else {
+          const parts = [data.error || res.statusText];
+          if (data.stdout && data.stdout.trim()) parts.push('stdout: ' + data.stdout.trim());
+          if (data.stderr && data.stderr.trim()) parts.push('stderr: ' + data.stderr.trim());
+          showMsg(parts.join('\\n'), true);
+        }
+      } catch (e) {
+        showMsg(e instanceof Error ? e.message : String(e), true);
+      } finally {
+        btn.disabled = false;
+      }
+    };
+
     let runs = [];
     function renderLogTabs() {
       logTabs.innerHTML = '';
@@ -513,6 +615,14 @@ function getDashboardHtml(): string {
 }
 
 const server = createServer(handleRequest);
-server.listen(PORT, HOST, () => {
-  logger.info(`Dashboard: http://${HOST}:${PORT}`);
-});
+
+/** 方案 B：若为拉取并重启拉起的新进程，先延迟 2 秒再 listen，确保旧进程已 exit 释放端口 */
+async function startListening(): Promise<void> {
+  if (process.env.NOTION_AUTO_RESTART === "1") {
+    await new Promise<void>((r) => setTimeout(r, 2000));
+  }
+  server.listen(PORT, HOST, () => {
+    logger.info(`Dashboard: http://${HOST}:${PORT}`);
+  });
+}
+startListening();
