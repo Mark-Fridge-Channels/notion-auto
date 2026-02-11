@@ -1,8 +1,10 @@
 /**
  * Dashboard Web 服务：端口 9000，仅 localhost；API（状态/schedule/停止·启动/日志/拉取并重启）+ 单页 HTML。
  * 拉取并重启时 spawn 新进程并传 NOTION_AUTO_RESTART=1，新进程延迟 2 秒再 listen 以避免 EADDRINUSE。
+ * 启动前加载 .env（dotenv），以便 NOTION_AUTO_NAME 等环境变量生效。
  */
 
+import "dotenv/config";
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { resolve, relative } from "node:path";
@@ -51,6 +53,43 @@ function sendHtml(res: import("node:http").ServerResponse, html: string): void {
 function runGitPull(cwd: string): Promise<{ exitCode: number; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
     const child = spawn("git", ["pull"], { cwd });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    function finish(exitCode: number, out: string, err: string) {
+      if (settled) return;
+      settled = true;
+      resolve({ exitCode, stdout: out, stderr: err });
+    }
+    child.stdout?.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString("utf-8");
+    });
+    child.stderr?.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString("utf-8");
+    });
+    child.on("close", (code, signal) => {
+      finish(code ?? (signal ? 1 : 0), stdout, stderr);
+    });
+    child.on("error", (err) => {
+      stderr += (err?.message ?? String(err)) + "\n";
+      finish(1, stdout, stderr);
+    });
+  });
+}
+
+/**
+ * 在指定目录执行 npm i（安装依赖），跨平台；Windows 下使用 shell 以正确解析 npm。
+ * @returns exitCode、stdout、stderr；exitCode 非 0 表示失败。
+ */
+function runNpmInstall(cwd: string): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    const cmd = process.platform === "win32" ? "npm i" : "npm";
+    const args = process.platform === "win32" ? [] : ["i"];
+    const opts: Parameters<typeof spawn>[2] = { cwd };
+    if (process.platform === "win32") opts.shell = true;
+    const child = process.platform === "win32"
+      ? spawn(cmd, args, opts)
+      : spawn(cmd, args, opts);
     let stdout = "";
     let stderr = "";
     let settled = false;
@@ -158,10 +197,17 @@ async function handleRequest(
       }
       isPullRestartInProgress = true;
       try {
-        const { exitCode, stdout, stderr } = await runGitPull(process.cwd());
-        if (exitCode !== 0) {
-          const error = stderr.trim() || stdout.trim() || `git pull 退出码 ${exitCode}`;
-          sendJson(res, 200, { ok: false, error, stdout, stderr });
+        const cwd = process.cwd();
+        const pullResult = await runGitPull(cwd);
+        if (pullResult.exitCode !== 0) {
+          const error = pullResult.stderr.trim() || pullResult.stdout.trim() || `git pull 退出码 ${pullResult.exitCode}`;
+          sendJson(res, 200, { ok: false, error, stdout: pullResult.stdout, stderr: pullResult.stderr });
+          return;
+        }
+        const npmResult = await runNpmInstall(cwd);
+        if (npmResult.exitCode !== 0) {
+          const error = npmResult.stderr.trim() || npmResult.stdout.trim() || `npm i 退出码 ${npmResult.exitCode}`;
+          sendJson(res, 200, { ok: false, error, stdout: npmResult.stdout, stderr: npmResult.stderr });
           return;
         }
         spawnNewServerAndExit();

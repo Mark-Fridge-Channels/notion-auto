@@ -9,13 +9,18 @@
     "start": "npm run run",
     "dashboard": "tsx src/server.ts"
   },
-  "keywords": ["notion", "playwright", "automation"],
+  "keywords": [
+    "notion",
+    "playwright",
+    "automation"
+  ],
   "license": "MIT",
   "devDependencies": {
     "@types/node": "^22.10.0",
     "tsx": "^4.19.2"
   },
   "dependencies": {
+    "dotenv": "^17.2.4",
     "nodemailer": "^6.9.16",
     "playwright": "^1.49.0"
   }
