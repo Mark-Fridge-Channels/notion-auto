@@ -237,7 +237,7 @@ function getDashboardTitle(): string {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;");
-  return `${safe}）控制台`;
+  return `${safe} 控制台`;
 }
 
 function getIndexHtml(): string {

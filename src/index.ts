@@ -72,6 +72,12 @@ async function main(): Promise<void> {
     }
 
     await openNotionAI(page, currentIndustry.notionUrl, schedule.maxRetries);
+    try {
+      await context.storageState({ path: storagePath });
+      logger.info("登录成功，已保存登录态");
+    } catch (e) {
+      logger.warn("保存登录态失败", e);
+    }
     await clickNewAIChat(page, schedule.maxRetries);
 
     /** 本行业累计执行次数（用于新会话/换模型判断） */
