@@ -160,11 +160,7 @@ async function main(): Promise<void> {
     } catch (e) {
       logger.warn("保存登录态失败", e);
     }
-    try {
-      await browser.close();
-    } catch (e) {
-      logger.warn("关闭浏览器失败", e);
-    }
+    // 脚本停止后不关闭浏览器，便于用户继续查看或手动操作
   }
 }
 
