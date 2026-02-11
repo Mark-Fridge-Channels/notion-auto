@@ -14,7 +14,7 @@ export interface ScheduleTask {
   runCount: number;
 }
 
-/** 行业：Notion URL + 任务链 + 行业级每 N 次新会话、每 M 次换模型 */
+/** 行业：Notion Portal URL + 任务链 + 行业级每 N 次新会话、每 M 次换模型 */
 export interface ScheduleIndustry {
   /** 行业唯一标识，时间区间通过此 id 引用行业 */
   id: string;

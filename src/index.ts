@@ -1,6 +1,6 @@
 /**
  * Notion AI 自动化主流程（时间区间 + 行业任务链模式）：
- * 按当前时间落入的时间区间选择行业 → 打开该行业 Notion URL → 按任务链顺序执行（行业级每 N 次新会话、每 M 次换模型），
+ * 按当前时间落入的时间区间选择行业 → 打开该行业 Notion Portal URL → 按任务链顺序执行（行业级每 N 次新会话、每 M 次换模型），
  * 任务链跑完立刻循环；跨区间时切换行业。7×24 运行直到用户停止。
  *
  * 单轮失败不退出：重试 → New AI chat 再试 → 刷新+重开再试，仍失败则 EXIT_RECOVERY_RESTART 由 Dashboard 重启。
@@ -56,7 +56,7 @@ async function main(): Promise<void> {
   page.setDefaultTimeout(30_000);
 
   if (!currentIndustry.notionUrl?.trim()) {
-    throw new Error(`行业 "${currentIndustry.id}" 的 Notion URL 未配置，请在 Dashboard 中填写`);
+    throw new Error(`行业 "${currentIndustry.id}" 的 Notion Portal URL 未配置，请在 Dashboard 中填写`);
   }
   logger.info("正在打开 Notion…");
   await page.goto(currentIndustry.notionUrl, { waitUntil: "domcontentloaded" });
@@ -95,7 +95,7 @@ async function main(): Promise<void> {
         logger.info(`时间区间切换: ${currentIndustry.id} → ${industryNow.id}`);
         currentIndustry = industryNow;
         if (!currentIndustry.notionUrl?.trim()) {
-          throw new Error(`行业 "${currentIndustry.id}" 的 Notion URL 未配置，请在 Dashboard 中填写`);
+          throw new Error(`行业 "${currentIndustry.id}" 的 Notion Portal URL 未配置，请在 Dashboard 中填写`);
         }
         runCount = 0;
         await page.goto(currentIndustry.notionUrl, { waitUntil: "domcontentloaded" });
@@ -160,7 +160,11 @@ async function main(): Promise<void> {
     } catch (e) {
       logger.warn("保存登录态失败", e);
     }
-    // 脚本停止后不关闭浏览器，便于用户继续查看或手动操作
+    try {
+      await browser.close();
+    } catch (e) {
+      logger.warn("关闭浏览器失败", e);
+    }
   }
 }
 

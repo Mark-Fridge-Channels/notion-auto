@@ -342,15 +342,15 @@ function getDashboardHtml(): string {
     <div class="card">
       <h2>全局设置</h2>
       <div class="row">
-        <label>每轮间隔（秒） <span class="hint">默认 120</span></label>
+        <label>每隔多少秒check一次是否对话结束<span class="hint">默认 120</span></label>
         <input id="intervalSeconds" type="number" min="1" placeholder="120">
       </div>
       <div class="row">
-        <label>登录等待（秒） <span class="hint">默认 60</span></label>
+        <label>如果没有登录账号，首次等待多少秒进行手动登录操作 <span class="hint">默认 60</span></label>
         <input id="loginWaitSeconds" type="number" min="0" placeholder="60">
       </div>
       <div class="row">
-        <label>最大重试次数 <span class="hint">默认 3</span></label>
+        <label>最大重试次数 <span class="hint">打开 Notion AI、点击新建对话、输入发送等单步失败时最多尝试次数，默认 3</span></label>
         <input id="maxRetries" type="number" min="1" placeholder="3">
       </div>
     </div>
@@ -368,7 +368,7 @@ function getDashboardHtml(): string {
       <div class="modal-box">
         <h3 id="industryModalTitle">编辑行业</h3>
         <div class="row"><label>行业 id（名称）</label><input type="text" id="modalIndustryId" placeholder="id"></div>
-        <div class="row"><label>Notion URL</label><input type="url" id="modalNotionUrl" placeholder="https://..."></div>
+        <div class="row"><label>Notion Portal URL</label><input type="url" id="modalNotionUrl" placeholder="https://..."></div>
         <div class="row"><label>每 N 次新会话</label><input type="number" id="modalNewChatEveryRuns" min="0" value="1"></div>
         <div class="row"><label>每 M 次换模型 (0=不换)</label><input type="number" id="modalModelSwitchInterval" min="0" value="0"></div>
         <div class="row"><label>任务链</label><div id="modalTasksContainer"></div><button type="button" id="modalAddTask">添加任务</button></div>

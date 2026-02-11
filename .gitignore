@@ -8,3 +8,4 @@ progress.json
 .env
 package-lock.json
 schedule.json
+.notion-auth.json

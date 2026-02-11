@@ -1,6 +1,6 @@
 {
   "intervalMs": 30000,
-  "loginWaitMs": 60000,
+  "loginWaitMs": 120000,
   "maxRetries": 3,
   "storagePath": ".notion-auth.json",
   "timeSlots": [
