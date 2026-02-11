@@ -1,13 +1,19 @@
 /**
- * Notion AI 自动化主流程：
- * 打开浏览器 → 等 1 分钟登录 → 打开 Notion → 点击 AI 入口打开弹窗 → 点击 New AI chat 开启新会话 → 定时输入+发送，每 10 轮新建对话，跑满总轮数退出。
+ * Notion AI 自动化主流程（时间区间 + 行业任务链模式）：
+ * 按当前时间落入的时间区间选择行业 → 打开该行业 Notion URL → 按任务链顺序执行（行业级每 N 次新会话、每 M 次换模型），
+ * 任务链跑完立刻循环；跨区间时切换行业。7×24 运行直到用户停止。
  *
- * 输入前使用鼠标坐标点击输入框中心；单轮失败不退出：先重试 3 次 → New AI chat 再试 3 次 → 重复「刷新页面 + 点 AI 头像 + New AI chat」再试（单轮最多 MAX_REOPEN_PER_ROUND 次），仍失败则请求恢复重启（exit EXIT_RECOVERY_RESTART），由 Dashboard 重启脚本、不计入连续重启计数。
+ * 单轮失败不退出：重试 → New AI chat 再试 → 刷新+重开再试，仍失败则 EXIT_RECOVERY_RESTART 由 Dashboard 重启。
  */
 
 import { chromium } from "playwright";
 import { existsSync } from "node:fs";
-import { parseArgs, type Config } from "./config.js";
+import {
+  loadSchedule,
+  getSchedulePath,
+  getIndustryForNow,
+  waitUntilInSlot,
+} from "./schedule.js";
 import {
   AI_FACE_IMG,
   AI_INPUT,
@@ -18,133 +24,131 @@ import {
   PERSONALIZE_DIALOG,
   PERSONALIZE_DIALOG_CHECK_MS,
 } from "./selectors.js";
-import { getPromptForRun } from "./prompts.js";
 import { switchToNextModel } from "./model-picker.js";
 import { logger } from "./logger.js";
-import { loadProgress, saveProgress } from "./progress.js";
+import { saveProgress } from "./progress.js";
 import { EXIT_RECOVERY_RESTART } from "./exit-codes.js";
 
+/** 运行入口：解析 --config、--storage，加载 schedule、等待落入区间后启动浏览器并进入主循环 */
 async function main(): Promise<void> {
-  const config = parseArgs();
+  const { configPath, storagePath: overrideStorage } = getConfigPathFromArgs();
+  const schedule = await loadSchedule(configPath);
+  if (overrideStorage != null) schedule.storagePath = overrideStorage;
 
-  // Step 3: 启动浏览器（headed），加载或新建 context
+  if (schedule.timeSlots.length === 0) {
+    throw new Error("配置中时间区间列表为空，无法运行");
+  }
+
+  // 等待直至当前时间落入某区间（不先开浏览器）
+  logger.info("正在根据当前时间解析运行区间…");
+  let currentIndustry = getIndustryForNow(schedule);
+  if (currentIndustry == null) {
+    logger.info("当前时间未落入任何配置区间，等待中…");
+    currentIndustry = await waitUntilInSlot(schedule);
+  }
+  logger.info(`当前行业: ${currentIndustry.id}, URL: ${currentIndustry.notionUrl}`);
+
   const browser = await chromium.launch({ headless: false });
-  const storagePath = config.storagePath;
-  const contextOptions =
-    existsSync(storagePath) ?
-      { storageState: storagePath }
-    : {};
-
+  const storagePath = schedule.storagePath;
+  const contextOptions = existsSync(storagePath) ? { storageState: storagePath } : {};
   const context = await browser.newContext(contextOptions);
   const page = await context.newPage();
   page.setDefaultTimeout(30_000);
 
-  // 打开后访问配置的 URL，等待期间用户可直接在当前页登录
+  if (!currentIndustry.notionUrl?.trim()) {
+    throw new Error(`行业 "${currentIndustry.id}" 的 Notion URL 未配置，请在 Dashboard 中填写`);
+  }
   logger.info("正在打开 Notion…");
-  await page.goto(config.notionUrl, { waitUntil: "domcontentloaded" });
-
+  await page.goto(currentIndustry.notionUrl, { waitUntil: "domcontentloaded" });
   const hasSavedAuth = Boolean(contextOptions.storageState);
 
   try {
-    // 已加载登录态时只等 5 秒（便于取消或重登），否则等满 loginWaitMs 供首次登录
     if (hasSavedAuth) {
       logger.info("已加载已保存的登录态，5 秒后继续（如需重新登录请在此期间操作）");
       await sleep(5_000);
     } else {
-      logger.info(`等待 ${config.loginWaitMs / 1000} 秒，请在此时间内完成登录（登录后会保存，下次可复用）…`);
-      await sleep(config.loginWaitMs);
+      logger.info(`等待 ${schedule.loginWaitMs / 1000} 秒，请在此时间内完成登录…`);
+      await sleep(schedule.loginWaitMs);
     }
 
-    // Step 4: 导航到 Notion，点击 AI 入口打开弹窗
-    await openNotionAI(page, config);
+    await openNotionAI(page, currentIndustry.notionUrl, schedule.maxRetries);
+    await clickNewAIChat(page, schedule.maxRetries);
 
-    // 每次脚本启动后先点击 New AI chat 开启新会话，再进入主循环
-    await clickNewAIChat(page, config);
+    /** 本行业累计执行次数（用于新会话/换模型判断） */
+    let runCount = 0;
 
-    let totalDone = 0;
-    let conversationRuns = 0;
-    if (config.resume) {
-      const progress = await loadProgress();
-      if (progress != null && !progress.completed && progress.totalDone < config.totalRuns) {
-        totalDone = progress.totalDone;
-        conversationRuns = progress.conversationRuns;
-        logger.info(`从 progress 恢复：totalDone=${totalDone}，conversationRuns=${conversationRuns}`);
+    for (;;) {
+      // 每轮任务链开始前：检查是否跨时间区间需切换行业
+      const industryNow = getIndustryForNow(schedule);
+      if (industryNow == null) {
+        logger.info("当前时间未落入任何区间，等待中…");
+        await sleep(60_000);
+        continue;
       }
-    }
-
-    // Step 6: 主循环
-    while (totalDone < config.totalRuns) {
-      // 每 newChatEveryRuns 轮：点击 New AI chat，重置对话计数
-      if (conversationRuns >= config.newChatEveryRuns) {
-        await clickNewAIChat(page, config);
-        conversationRuns = 0;
-      }
-
-      // 每 N 轮切换模型（N=0 不切换）；失败不退出，由 switchToNextModel 内打日志
-      if (
-        config.modelSwitchInterval > 0 &&
-        totalDone > 0 &&
-        totalDone % config.modelSwitchInterval === 0
-      ) {
-        await switchToNextModel(page);
-      }
-
-      // 若使用 Prompt 网关则每轮均用网关文案，否则按全局轮数选 task1/2/3
-      const runIndex = totalDone + 1;
-      const prompt =
-        config.promptGateway != null
-          ? config.promptGateway
-          : getPromptForRun(
-              runIndex,
-              config.promptTask1,
-              config.promptTask2,
-              config.promptTask3,
-            );
-
-      // 单轮「输入+发送」带恢复：先试 3 次 → 失败则 New AI chat 再试 3 次 → 仍失败则重复「刷新+AI 头像+New chat」再试（最多 MAX_REOPEN_PER_ROUND 次），全程不退出
-      let ok = await tryTypeAndSend(page, prompt, config.maxRetries);
-      if (!ok) {
-        logger.warn("本轮流试 3 次失败，尝试 New AI chat 后重试…");
-        try {
-          await clickNewAIChat(page, config);
-          ok = await tryTypeAndSend(page, prompt, config.maxRetries);
-        } catch (e) {
-          logger.warn("New AI chat 失败", e);
+      if (industryNow.id !== currentIndustry.id) {
+        logger.info(`时间区间切换: ${currentIndustry.id} → ${industryNow.id}`);
+        currentIndustry = industryNow;
+        if (!currentIndustry.notionUrl?.trim()) {
+          throw new Error(`行业 "${currentIndustry.id}" 的 Notion URL 未配置，请在 Dashboard 中填写`);
         }
+        runCount = 0;
+        await page.goto(currentIndustry.notionUrl, { waitUntil: "domcontentloaded" });
+        await sleep(500);
+        const img = page.locator(AI_FACE_IMG).first();
+        await img.waitFor({ state: "visible" });
+        await img.locator("xpath=..").click();
+        await sleep(MODAL_WAIT_MS);
+        await dismissPersonalizeDialogIfPresent(page);
+        await clickNewAIChat(page, schedule.maxRetries);
       }
-      if (!ok) {
-        for (let r = 0; r < MAX_REOPEN_PER_ROUND && !ok; r++) {
-          logger.warn(`重新打开 Notion 并重试（${r + 1}/${MAX_REOPEN_PER_ROUND}）…`);
-          try {
-            await reopenNotionAndNewChat(page, config);
-            ok = await tryTypeAndSend(page, prompt, config.maxRetries);
-          } catch (e) {
-            logger.warn("reopenNotionAndNewChat 失败", e);
+
+      // 执行一轮任务链
+      for (const task of currentIndustry.tasks) {
+        for (let k = 0; k < task.runCount; k++) {
+          if (runCount > 0 && currentIndustry.newChatEveryRuns > 0 && runCount % currentIndustry.newChatEveryRuns === 0) {
+            await clickNewAIChat(page, schedule.maxRetries);
           }
+          if (runCount > 0 && currentIndustry.modelSwitchInterval > 0 && runCount % currentIndustry.modelSwitchInterval === 0) {
+            await switchToNextModel(page);
+          }
+
+          let ok = await tryTypeAndSend(page, task.content, schedule.maxRetries);
+          if (!ok) {
+            logger.warn("本轮流试失败，尝试 New AI chat 后重试…");
+            try {
+              await clickNewAIChat(page, schedule.maxRetries);
+              ok = await tryTypeAndSend(page, task.content, schedule.maxRetries);
+            } catch (e) {
+              logger.warn("New AI chat 失败", e);
+            }
+          }
+          if (!ok) {
+            for (let r = 0; r < MAX_REOPEN_PER_ROUND && !ok; r++) {
+              logger.warn(`重新打开 Notion 并重试（${r + 1}/${MAX_REOPEN_PER_ROUND}）…`);
+              try {
+                await reopenNotionAndNewChat(page, currentIndustry.notionUrl, schedule.maxRetries);
+                ok = await tryTypeAndSend(page, task.content, schedule.maxRetries);
+              } catch (e) {
+                logger.warn("reopenNotionAndNewChat 失败", e);
+              }
+            }
+          }
+          if (!ok) {
+            logger.warn("本轮流试与恢复后仍失败，请求恢复重启");
+            await saveProgress({ totalDone: 0, conversationRuns: 0, completed: false });
+            process.exit(EXIT_RECOVERY_RESTART);
+          }
+
+          runCount++;
+          await saveProgress({ totalDone: runCount, conversationRuns: 0, completed: false });
+          logger.info(`行业 ${currentIndustry.id} 已执行 ${runCount} 次（任务 "${task.content.slice(0, 30)}…"）`);
+
+          await sleep(schedule.intervalMs);
         }
       }
-      if (!ok) {
-        logger.warn("本轮流试与恢复后仍失败，浏览器可能已卡住，请求恢复重启（由 Dashboard 重启后从当前进度继续）");
-        await saveProgress({ totalDone, conversationRuns, completed: false });
-        process.exit(EXIT_RECOVERY_RESTART);
-      }
-
-      totalDone++;
-      conversationRuns++;
-      await saveProgress({ totalDone, conversationRuns, completed: false });
-      logger.info(
-        `已执行 ${totalDone}/${config.totalRuns} 轮（本对话 ${conversationRuns}/${config.newChatEveryRuns}）`,
-      );
-
-      if (totalDone >= config.totalRuns) break;
-
-      await sleep(config.intervalMs);
+      // 任务链跑完，立刻从头再跑（不 break）
     }
-
-    await saveProgress({ totalDone, conversationRuns, completed: true });
-    logger.info("已完成全部轮数，退出。");
   } finally {
-    // Step 7: 保存登录态并关闭；收尾失败只打日志，不掩盖主错误
     try {
       await context.storageState({ path: storagePath });
     } catch (e) {
@@ -158,10 +162,37 @@ async function main(): Promise<void> {
   }
 }
 
-/**
- * 若出现「Personalize your Notion AI」弹窗，则定位并点击其中的 Done，关闭后再继续。
- * 短超时检测，未出现则直接返回。
- */
+/** 从 argv 解析 --config、--storage；--config 默认 getSchedulePath() */
+function getConfigPathFromArgs(): { configPath: string; storagePath?: string } {
+  const args = process.argv.slice(2);
+  let configPath = getSchedulePath();
+  let storagePath: string | undefined;
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--config" && args[i + 1] != null) {
+      configPath = args[++i];
+    } else if (args[i] === "--storage" && args[i + 1] != null) {
+      storagePath = args[++i];
+    } else if (args[i] === "--help" || args[i] === "-h") {
+      printHelp();
+      process.exit(0);
+    }
+  }
+  return { configPath, storagePath };
+}
+
+function printHelp(): void {
+  process.stdout.write(`
+notion-auto — 时间区间 + 行业任务链（7×24 运行）
+
+用法: npm run run -- [--config <path>] [--storage <path>]
+  --config <path>  配置文件路径（默认 schedule.json）
+  --storage <path> 登录态保存路径（默认见 schedule 内 storagePath）
+
+环境变量:
+  NOTION_AUTO_RESUME=1  由 Dashboard 恢复重启时设置，从当前时间对应行业任务 1 开始
+`);
+}
+
 async function dismissPersonalizeDialogIfPresent(page: import("playwright").Page): Promise<void> {
   const dialog = page.locator(PERSONALIZE_DIALOG).first();
   try {
@@ -174,10 +205,14 @@ async function dismissPersonalizeDialogIfPresent(page: import("playwright").Page
   await sleep(300);
 }
 
-/** 导航到 Notion 并点击 Notion AI 头像的父 div，打开弹窗；弹窗出现后等 1s；若有「Personalize」弹窗则点 Done */
-async function openNotionAI(page: import("playwright").Page, config: Config): Promise<void> {
-  await runWithRetry(config.maxRetries, async () => {
-    await page.goto(config.notionUrl, { waitUntil: "domcontentloaded" });
+/** 打开 Notion 并点击 AI 入口；使用指定 notionUrl */
+async function openNotionAI(
+  page: import("playwright").Page,
+  notionUrl: string,
+  maxRetries: number,
+): Promise<void> {
+  await runWithRetry(maxRetries, async () => {
+    await page.goto(notionUrl, { waitUntil: "domcontentloaded" });
     const img = page.locator(AI_FACE_IMG).first();
     await img.waitFor({ state: "visible" });
     const parent = img.locator("xpath=..");
@@ -187,17 +222,9 @@ async function openNotionAI(page: import("playwright").Page, config: Config): Pr
   await dismissPersonalizeDialogIfPresent(page);
 }
 
-/** 输入框获得焦点后的短暂延迟（毫秒） */
 const INPUT_CLICK_DELAY_MS = 150;
 
-/**
- * 单次输入+发送：定位 contenteditable，用鼠标坐标点击输入框中心后全选并输入，点击发送。
- * 点击发送后按钮会变为「Stop AI message」，需等待再次变为「Submit AI message」后才返回，方可进行下一次输入+发送。
- */
-async function typeAndSend(
-  page: import("playwright").Page,
-  text: string,
-): Promise<void> {
+async function typeAndSend(page: import("playwright").Page, text: string): Promise<void> {
   if (process.env.NOTION_AUTO_SIMULATE_STUCK === "1") {
     throw new Error("模拟卡住（NOTION_AUTO_SIMULATE_STUCK=1）");
   }
@@ -209,15 +236,12 @@ async function typeAndSend(
   const centerY = box.y + box.height / 2;
   await page.mouse.click(centerX, centerY);
   await sleep(INPUT_CLICK_DELAY_MS);
-  // contenteditable：全选后输入以清空并替换（Mac 用 Meta，其它用 Control）
   const selectAll = process.platform === "darwin" ? "Meta+a" : "Control+a";
   await page.keyboard.press(selectAll);
   await page.keyboard.type(text, { delay: 30 });
   const send = page.locator(SEND_BUTTON).first();
   await send.waitFor({ state: "visible" });
   await send.click();
-
-  // 发送后同一位置会变为 Stop，等 AI 回复完成、发送按钮再次出现后才可进行下一次发送（用 SEND_BUTTON 与 model-picker 的「可发送」判定一致）
   try {
     await page.locator(SEND_BUTTON).first().waitFor({ state: "visible", timeout: WAIT_SUBMIT_READY_MS });
   } catch (e) {
@@ -225,12 +249,8 @@ async function typeAndSend(
   }
 }
 
-/** 点击 New AI chat */
-async function clickNewAIChat(
-  page: import("playwright").Page,
-  config: Config,
-): Promise<void> {
-  await runWithRetry(config.maxRetries, async () => {
+async function clickNewAIChat(page: import("playwright").Page, maxRetries: number): Promise<void> {
+  await runWithRetry(maxRetries, async () => {
     const btn = page.locator(NEW_CHAT_BUTTON).first();
     await btn.waitFor({ state: "visible" });
     await btn.click();
@@ -238,14 +258,10 @@ async function clickNewAIChat(
   });
 }
 
-/**
- * 重新打开 Notion：刷新页面 → 点击 AI 头像打开面板 → 点击 New AI chat 开新会话。
- * 供单轮失败恢复使用，失败时抛错供上层重试。
- * 测试用：NOTION_AUTO_SIMULATE_STUCK=1 时本函数直接抛错，用于验证「3 次 reopen 失败 → 恢复重启」流程。
- */
 async function reopenNotionAndNewChat(
   page: import("playwright").Page,
-  config: Config,
+  notionUrl: string,
+  maxRetries: number,
 ): Promise<void> {
   if (process.env.NOTION_AUTO_SIMULATE_STUCK === "1") {
     throw new Error("模拟浏览器卡住（NOTION_AUTO_SIMULATE_STUCK=1）");
@@ -263,29 +279,21 @@ async function reopenNotionAndNewChat(
   await sleep(MODAL_WAIT_MS);
 }
 
-/** 最多重试 max 次，仍失败则抛出最后一次错误 */
-async function runWithRetry<T>(
-  max: number,
-  fn: () => Promise<T>,
-): Promise<T> {
+async function runWithRetry<T>(max: number, fn: () => Promise<T>): Promise<T> {
   let lastError: unknown;
   for (let i = 0; i < max; i++) {
     try {
       return await fn();
     } catch (e) {
       lastError = e;
-      if (i < max - 1) {
-        logger.warn(`重试 ${i + 1}/${max}…`, e);
-      }
+      if (i < max - 1) logger.warn(`重试 ${i + 1}/${max}…`, e);
     }
   }
   throw lastError;
 }
 
-/** 单轮最多「重新打开 Notion」次数，避免死循环 */
 const MAX_REOPEN_PER_ROUND = 3;
 
-/** 发送后等待「发送按钮再次出现」超时：表示 AI 仍在输出，不应再发一条，重试时只再等一次 */
 class WaitAfterSendTimeoutError extends Error {
   constructor(public readonly cause: unknown) {
     super("发送后等待可发送状态超时（AI 可能仍在输出）");
@@ -293,10 +301,6 @@ class WaitAfterSendTimeoutError extends Error {
   }
 }
 
-/**
- * 尝试执行 typeAndSend 最多 max 次，成功返回 true，全部失败返回 false（不抛错）。
- * 若失败原因是「发送后等待发送按钮再现」超时，则不再重试发送（避免输出未结束又发一条），只再等一次发送按钮。
- */
 async function tryTypeAndSend(
   page: import("playwright").Page,
   prompt: string,

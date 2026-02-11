@@ -1,6 +1,6 @@
 # notion-auto
 
-Playwright 自动化：打开浏览器 → 预留 1 分钟手动登录 → 打开 Notion → 点击 Notion AI → 按**全局轮数**选文案（可配 `--task1`/`--task2`/`--task3`，或使用 `--prompt-gateway` 每轮固定文案）定时输入并发送，每 `--new-chat-every` 轮新建对话（默认 10）；可选每 N 轮切换模型（`--model-switch-interval`，0=不切换）。起始地址由 `--notion-url` 控制。支持登录态持久化与失败重试。
+Playwright 自动化：按**时间区间**（左闭右开、本地时区）选择行业，每个行业有独立 Notion URL 与**任务链**；按任务链顺序执行输入+发送，行业级「每 N 次新会话、每 M 次换模型」。7×24 运行直到用户停止；未配置时段不跑。配置由 **schedule.json**（或 `--config` 指定）提供。
 
 ## 环境要求
 
@@ -19,54 +19,53 @@ npx playwright install chromium
 1. **第一次运行**：执行 `npm run run`，浏览器打开后有 **60 秒**供你手动登录 Notion（用 Google 等）。登录完成后脚本会自动打开 Notion 并开始执行；**正常退出时会把登录态保存到 `.notion-auth.json`**。
 2. **之后运行**：若项目目录下已有 `.notion-auth.json`，脚本会**自动加载该登录态**，只再等 **5 秒**就会继续（无需重新登录）；若你想换账号，可在这 5 秒内手动登录，脚本会覆盖保存新的登录态。
 
+## 配置文件 schedule.json
+
+运行前需在项目目录下准备 **schedule.json**（或通过 `--config <path>` 指定）。结构示例见 **schedule.example.json**：
+
+- **timeSlots**：时间区间列表，左闭右开、本地时区；每项含 `startHour`、`endHour`（0–23）、`industryId`（绑定行业）。
+- **industries**：行业列表，每项含 `id`、`notionUrl`、`newChatEveryRuns`（每 N 次新会话，0=不新会话）、`modelSwitchInterval`（每 M 次换模型，0=不换）、`tasks`（任务链）。
+- **tasks**：每任务 `content`（输入文案）、`runCount`（本轮执行次数）。
+- 顶层：`intervalMs`、`loginWaitMs`、`maxRetries`、`storagePath`。
+
+未配置的时间段不跑（脚本会等待直至落入某区间）。时间区间列表为空会报错退出。
+
 ## 运行命令
 
 ```bash
 npm run run
-# 带参数时必须在 run 后面加 --，否则 npm 会吞掉 --total 等选项，参数传不到脚本
-npm run run -- --total 20 --interval 120 --login-wait 60
-npm run run -- --model-switch-interval 50 --task1 "@Task 1" --task2 "@Task 2" --task3 "@Task 3"
-npm run run -- --prompt-gateway "https://your-prompt-gateway.example/prompt"   # 每轮使用 Prompt 网关内容
+# 使用默认 schedule.json；指定配置或登录态路径：
+npm run run -- --config schedule.json --storage .notion-auth.json
+npm run run -- --help
 ```
 
-## 参数说明
+| 参数 | 说明 |
+|------|------|
+| `--config <path>` | 配置文件路径，默认项目目录下 schedule.json |
+| `--storage <path>` | 登录态保存路径，默认见 schedule 内 storagePath |
+| `--help`, `-h` | 显示帮助 |
 
-| 参数 | 说明 | 默认 |
-|------|------|------|
-| `--total`, `-n` | 总轮数（所有对话的 输入+发送 次数） | 25 |
-| `--interval` | 每轮间隔（秒） | 120 |
-| `--login-wait` | 每次运行时的登录等待（秒） | 60 |
-| `--notion-url` | 脚本打开后访问的地址 | selectors 中默认 URL |
-| `--new-chat-every` | 每 n 轮点击 New AI chat 新建对话，最小 1 | 10 |
-| `--model-switch-interval` | 每 n 轮切换一次模型，0=不切换 | 50 |
-| `--task1` | 第 1～5 轮文案 | @Task 1 — Add new DTC companies |
-| `--task2` | 第 6～10 轮文案 | @Task 2 — Find high-priority contacts |
-| `--task3` | 第 11 轮起随机文案之一 | @Task 3 — Find people contact (LinkedIn / Email / X) |
-| `--prompt-gateway` | 使用 Prompt 网关内容，每轮均使用该文案，忽略 --task1/2/3（必填，不能为空） | - |
-| `--storage` | 登录态保存路径 | .notion-auth.json |
-| `--resume` | 从 progress.json 恢复进度（totalDone/conversationRuns）继续运行 | - |
-| `--help`, `-h` | 显示帮助 | - |
+环境变量 `NOTION_AUTO_RESUME=1` 由 Dashboard 恢复重启时设置，脚本按当前时间对应行业从任务 1 开始（不恢复任务进度）。
 
 ## 行为简述
 
-- **每次运行**：先等 1 分钟 → 若有 `.notion-auth.json` 则加载登录态 → 打开 `--notion-url` 指定地址 → 点击 Notion AI 入口打开弹窗 → **点击 New AI chat 开启新会话** → 进入主循环。
-- **主循环**：每 2 分钟执行一次「输入 + 发送」；输入前用**鼠标坐标点击**输入框中心再输入；文案由 `--task1`/`--task2`/`--task3` 与全局轮数决定（若指定 `--prompt-gateway` 则每轮均使用网关内容）；若 `--model-switch-interval`>0，每 N 轮会先切换模型再发送（切换失败只打日志不退出）；本对话满 `--new-chat-every` 次后点击「New AI chat」并重置对话计数；总轮数达到 `--total` 后退出。
-- **单轮失败恢复**：单轮「输入+发送」重试 3 次仍失败时**不退出**：先点 New AI chat 再试 3 次；仍失败则**刷新页面 → 点 AI 头像 → 点 New AI chat** 再试 3 次，可重复「重新打开 Notion」最多 3 次；仍失败则跳过本轮继续下一轮。
-- **错误**：**模型切换**失败仅打日志并继续运行；**单轮输入+发送**失败按上述恢复流程处理，不因单轮失败退出进程。
-- **收尾**：退出前保存登录态到 `--storage` 并关闭浏览器。
+- **启动**：根据当前时间解析所在时间区间 → 得到当前行业；若未落入任何区间则等待（如每分钟再检查）。
+- **主循环**：打开该行业 Notion URL，登录等待一次；按该行业任务链顺序执行，每任务执行 `runCount` 次 typeAndSend；每次执行前按行业级 N/M 决定是否新会话、是否换模型；任务链跑完后立刻从头再跑；每轮任务链开始前检查时间，若落入另一区间则切换行业（换 URL 与任务链）。
+- **结束**：仅用户停止（或进程终止）时退出，无总轮数。
+- **单轮失败恢复**：与之前一致（重试 → New AI chat 再试 → 刷新+重开再试，仍失败则 EXIT_RECOVERY_RESTART 由 Dashboard 重启）。
 
 ## Web 控制台（Dashboard）
 
 运行 `npm run dashboard` 启动本地 Web 服务（**http://127.0.0.1:9000**，仅本机访问）。在浏览器打开后可：
 
 - 查看运行状态（运行中 / 已停止）
-- 编辑参数（保存到项目目录下的 `params.json`）
-- 点击「启动」或「停止」控制脚本子进程（不重启 Web 服务）
+- 编辑**全局设置**（每轮间隔、登录等待、重试）、**时间区间**（起止小时、绑定行业）、**行业与任务链**（URL、N/M、任务输入内容与执行次数），保存到 **schedule.json**
+- 点击「启动」或「停止」控制脚本子进程（启动前会先保存当前配置）
 - 查看最近 10 次运行的日志（仅内存，不落盘）
 
 首次打开页面时脚本处于未运行状态，需点击「启动」才会执行。端口固定 9000，仅监听 localhost。
 
-**自动恢复**：在「运行中」若脚本因异常退出，Dashboard 会自动重启并从项目目录下的 **progress.json** 恢复进度（不影响 totalDone 计数）；正常跑满总轮数则不会自动重启。连续自动重启超过 5 次时会发一封告警邮件（需配置 SMTP 环境变量，见下）。
+**自动恢复**：脚本异常退出时 Dashboard 会自动重启；脚本按当前时间对应行业从任务 1 开始（不恢复任务进度）。连续自动重启超过 5 次时会发一封告警邮件（需配置 SMTP 环境变量，见下）。
 
 **告警邮件（可选）**：需在环境中配置以下变量后，连续自动重启 >5 次时才会发信（只发一封）：`NOTION_SMTP_HOST`、`NOTION_SMTP_PORT`（可选，默认 465）、`NOTION_SMTP_USER`、`NOTION_SMTP_PASS`、`NOTION_ALERT_TO`（收件人）。未配置则仅打日志不发信。
 

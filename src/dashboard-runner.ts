@@ -4,9 +4,8 @@
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
-import type { DashboardParams } from "./dashboard-params.js";
-import { paramsToArgv } from "./dashboard-params.js";
 import { loadProgress } from "./progress.js";
+import { getSchedulePath } from "./schedule.js";
 import { sendRestartAlertEmail } from "./alert-email.js";
 import { logger } from "./logger.js";
 import { EXIT_RECOVERY_RESTART } from "./exit-codes.js";
@@ -34,8 +33,8 @@ let userWantsRunning = false;
 let consecutiveRestartCount = 0;
 /** 本周期是否已发过告警邮件（只发一封） */
 let emailSent = false;
-/** 最近一次 start 使用的参数，供自动重启时复用 */
-let lastParams: DashboardParams | null = null;
+/** 最近一次 start 使用的配置路径，供自动重启时复用 */
+let lastConfigPath: string | null = null;
 
 function appendLine(line: string): void {
   if (!currentRunLog) return;
@@ -50,25 +49,26 @@ function getStatus(): RunStatus {
 
 /**
  * 启动脚本子进程；若已在运行则先不处理（由调用方先 stop）。
- * 用户点击启动时：userWantsRunning=true，consecutiveRestartCount=0，emailSent=false。
+ * 使用 --config <path> 传入 schedule 配置路径；自动重启时复用 lastConfigPath。
  */
-export function start(params: DashboardParams): void {
+export function start(options: { configPath?: string }): void {
   if (currentProcess != null) return;
   userWantsRunning = true;
   consecutiveRestartCount = 0;
   emailSent = false;
-  lastParams = params;
-  spawnChild(params, false);
+  const configPath = options.configPath ?? getSchedulePath();
+  lastConfigPath = configPath;
+  spawnChild(configPath, false);
 }
 
-/** Windows cmd.exe：含空格/引号等时用双引号包裹，内部 " 转为 \\" */
+/** Windows cmd.exe：含空格/引号等时用双引号包裹 */
 function escapeArgForWindowsCmd(arg: string): string {
   if (!/[\s"&|<>^]/.test(arg)) return arg;
   return '"' + arg.replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
 }
 
-function spawnChild(params: DashboardParams, isAutoResume: boolean): void {
-  const args = paramsToArgv(params);
+function spawnChild(configPath: string, isAutoResume: boolean): void {
+  const args = ["--config", configPath, "--storage", ".notion-auth.json"];
   const env = { ...process.env };
   if (isAutoResume) env.NOTION_AUTO_RESUME = "1";
 
@@ -80,7 +80,6 @@ function spawnChild(params: DashboardParams, isAutoResume: boolean): void {
 
   let child: ChildProcess;
   if (process.platform === "win32") {
-    // Windows：必须用 shell，否则 npx 会 ENOENT/EINVAL；shell 会把参数按空格拆开，导致 "--prompt-gateway" "@Author DB Build" 被截断，故用整条命令串并对含空格的参数加双引号
     opts.shell = true;
     const escaped = args.map(escapeArgForWindowsCmd).join(" ");
     const fullCmd = "npx tsx src/index.ts " + escaped;
@@ -130,7 +129,7 @@ function spawnChild(params: DashboardParams, isAutoResume: boolean): void {
 
 /** exit 后若 userWantsRunning 且 progress 未 completed 则自动重启；恢复重启（exitCode=2）不计入连续重启次数，不触发告警。 */
 async function maybeAutoRestart(exitCode?: number): Promise<void> {
-  if (!userWantsRunning || lastParams == null) return;
+  if (!userWantsRunning || lastConfigPath == null) return;
   const progress = await loadProgress();
   if (progress?.completed === true) return;
 
@@ -145,7 +144,7 @@ async function maybeAutoRestart(exitCode?: number): Promise<void> {
   } else {
     logger.info("脚本请求恢复重启（浏览器卡住等），立即重启并继续，不计入连续重启次数");
   }
-  spawnChild(lastParams, true);
+  spawnChild(lastConfigPath, true);
 }
 
 /**

@@ -14,12 +14,13 @@ import {
   SEND_BUTTON,
   MODAL_WAIT_MS,
 } from "../src/selectors.js";
+import { logger } from "../src/logger.js";
 
 const STORAGE_PATH = ".notion-auth.json";
 const LOGIN_WAIT_MS = existsSync(STORAGE_PATH) ? 5_000 : 60_000;
 
 function log(msg: string): void {
-  console.log(`[test-model-picker] ${msg}`);
+  logger.info(`[test-model-picker] ${msg}`);
 }
 
 function sleep(ms: number): Promise<void> {
@@ -125,6 +126,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
-  console.error(err);
+  logger.error(err);
   process.exit(1);
 });
