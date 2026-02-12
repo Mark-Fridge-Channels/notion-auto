@@ -279,9 +279,12 @@ function getDashboardHtml(): string {
     input, textarea, select { width: 100%; padding: 0.5rem 0.65rem; border: 1px solid #ddd; border-radius: 6px; font-size: 16px; }
     input:focus, textarea:focus, select:focus { outline: 2px solid #0d6efd; outline-offset: 2px; }
     textarea { min-height: 48px; resize: vertical; }
-    .slot-row, .task-row { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-bottom: 0.5rem; }
-    .slot-row input[type="number"], .task-row input[type="number"] { width: 4rem; min-width: 3rem; }
-    .slot-row select { flex: 1; min-width: 0; max-width: 12rem; }
+    .slot-row, .task-row { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-bottom: 0.75rem; }
+    .slot-row { padding: 0.6rem 0.75rem; background: #f8f9fa; border-radius: 6px; border: 1px solid #eee; }
+    .slot-row .slot-time-group { display: inline-flex; align-items: center; gap: 0.35rem; margin-right: 1rem; }
+    .slot-row .slot-time-group label { margin: 0; font-size: 0.8rem; color: #666; width: 1.5rem; flex-shrink: 0; }
+    .slot-row input[type="number"], .task-row input[type="number"] { width: 3.5rem; min-width: 3rem; padding: 0.4rem 0.5rem; }
+    .slot-row select { flex: 1; min-width: 12rem; max-width: 24rem; margin-right: 0.25rem; }
     .industry-list { border: 1px solid #eee; border-radius: 6px; overflow: hidden; }
     .industry-row { display: flex; align-items: center; flex-wrap: wrap; gap: 0.5rem 0.75rem; padding: 0.6rem 1rem; border-bottom: 1px solid #eee; background: #fff; }
     .industry-row:last-child { border-bottom: none; }
@@ -446,21 +449,22 @@ function getDashboardHtml(): string {
 
     const NEW_INDUSTRY_VALUE = '__new__';
 
-    /** 将当前 DOM 中时间区间行的输入值写回 currentSchedule.timeSlots，避免重绘时丢失未保存编辑 */
+    /** 将当前 DOM 中时间区间行的输入值写回 currentSchedule.timeSlots，避免重绘时丢失未保存编辑。小时 0–23，分 0–59。 */
     function syncTimeSlotsFromDOM() {
       if (!currentSchedule || !currentSchedule.timeSlots) return;
       const rows = timeSlotsContainer.querySelectorAll('.slot-row');
       rows.forEach((row, idx) => {
         if (idx >= currentSchedule.timeSlots.length) return;
         const slot = currentSchedule.timeSlots[idx];
-        const startInput = row.querySelector('[data-key="startHour"]');
-        const endInput = row.querySelector('[data-key="endHour"]');
+        const startH = Number(row.querySelector('[data-key="startHour"]')?.value ?? 0);
+        const startM = Number(row.querySelector('[data-key="startMinute"]')?.value ?? 0);
+        const endH = Number(row.querySelector('[data-key="endHour"]')?.value ?? 23);
+        const endM = Number(row.querySelector('[data-key="endMinute"]')?.value ?? 59);
+        slot.startHour = (Number.isFinite(startH) && startH >= 0 && startH <= 23) ? startH | 0 : 0;
+        slot.startMinute = (Number.isFinite(startM) && startM >= 0 && startM <= 59) ? startM | 0 : 0;
+        slot.endHour = (Number.isFinite(endH) && endH >= 0 && endH <= 23) ? endH | 0 : 23;
+        slot.endMinute = (Number.isFinite(endM) && endM >= 0 && endM <= 59) ? endM | 0 : 59;
         const industrySelect = row.querySelector('[data-key="industryId"]');
-        if (startInput) slot.startHour = Number(startInput.value) || 0;
-        if (endInput) {
-          const endHour = Number(endInput.value);
-          slot.endHour = (Number.isFinite(endHour) && endHour >= 0 && endHour <= 24) ? endHour : 24;
-        }
         if (industrySelect && industrySelect.value !== NEW_INDUSTRY_VALUE) slot.industryId = industrySelect.value;
       });
     }
@@ -476,8 +480,11 @@ function getDashboardHtml(): string {
         let optHtml = industryIds.length
           ? industryIds.map(id => '<option value="' + escapeAttr(id) + '"' + (slot.industryId === id ? ' selected' : '') + '>' + escapeHtml(id) + '</option>').join('') + '<option value="' + NEW_INDUSTRY_VALUE + '">+ 新建行业</option>'
           : '<option value="">（先添加行业）</option><option value="' + NEW_INDUSTRY_VALUE + '">+ 新建行业</option>';
-        row.innerHTML = '<label style="width:3rem">起</label><input type="number" min="0" max="23" data-key="startHour" placeholder="0" value="' + (slot.startHour ?? 0) + '">' +
-          '<label style="width:3rem">止</label><input type="number" min="0" max="24" data-key="endHour" placeholder="24" value="' + (slot.endHour ?? 24) + '">' +
+        row.innerHTML =
+          '<span class="slot-time-group"><label>起</label><input type="number" min="0" max="23" data-key="startHour" placeholder="时" value="' + (slot.startHour ?? 0) + '" title="时" aria-label="起始小时">' +
+          '<input type="number" min="0" max="59" data-key="startMinute" placeholder="分" value="' + (slot.startMinute ?? 0) + '" title="分" aria-label="起始分钟"></span>' +
+          '<span class="slot-time-group"><label>止</label><input type="number" min="0" max="23" data-key="endHour" placeholder="时" value="' + (slot.endHour ?? 23) + '" title="时" aria-label="结束小时">' +
+          '<input type="number" min="0" max="59" data-key="endMinute" placeholder="分" value="' + (slot.endMinute ?? 59) + '" title="分" aria-label="结束分钟"></span>' +
           '<select data-key="industryId" data-slot-index="' + idx + '">' + optHtml + '</select>' +
           '<button type="button" class="danger" data-remove-slot>删除</button>';
         const selectEl = row.querySelector('[data-key="industryId"]');
@@ -494,7 +501,7 @@ function getDashboardHtml(): string {
         timeSlotsContainer.appendChild(row);
       });
       document.getElementById('btnAddSlot').onclick = () => {
-        slots.push({ startHour: 0, endHour: 1, industryId: industryIds[0] || '' });
+        slots.push({ startHour: 0, startMinute: 0, endHour: 1, endMinute: 0, industryId: industryIds[0] || '' });
         syncScheduleUI();
       };
     }
@@ -656,12 +663,17 @@ function getDashboardHtml(): string {
       const maxRetries = Number(document.getElementById('maxRetries').value) || 3;
       const slots = [];
       timeSlotsContainer.querySelectorAll('.slot-row').forEach(row => {
-        const startHour = Number(row.querySelector('[data-key="startHour"]').value) || 0;
-        const endHour = Number(row.querySelector('[data-key="endHour"]').value);
-        const endHourVal = (Number.isFinite(endHour) && endHour >= 0 && endHour <= 24) ? endHour : 24;
+        const startHour = (Number(row.querySelector('[data-key="startHour"]')?.value) | 0);
+        const startMinute = (Number(row.querySelector('[data-key="startMinute"]')?.value) | 0);
+        const endHour = (Number(row.querySelector('[data-key="endHour"]')?.value) | 0);
+        const endMinute = (Number(row.querySelector('[data-key="endMinute"]')?.value) | 0);
+        const sh = (startHour >= 0 && startHour <= 23) ? startHour : 0;
+        const sm = (startMinute >= 0 && startMinute <= 59) ? startMinute : 0;
+        const eh = (endHour >= 0 && endHour <= 23) ? endHour : 23;
+        const em = (endMinute >= 0 && endMinute <= 59) ? endMinute : 59;
         const industryId = (row.querySelector('[data-key="industryId"]') && row.querySelector('[data-key="industryId"]').value) || '';
         if (industryId === NEW_INDUSTRY_VALUE) return;
-        slots.push({ startHour, endHour: endHourVal, industryId });
+        slots.push({ startHour: sh, startMinute: sm, endHour: eh, endMinute: em, industryId });
       });
       const industries = (currentSchedule && currentSchedule.industries) ? currentSchedule.industries : [];
       const autoClickDuringOutputWait = [];

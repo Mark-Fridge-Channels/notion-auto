@@ -7,7 +7,9 @@
   "timeSlots": [
     {
       "startHour": 1,
+      "startMinute": 0,
       "endHour": 5,
+      "endMinute": 30,
       "industryId": "industryA"
     },
     {

@@ -32,12 +32,19 @@ export interface ScheduleIndustry {
   tasks: ScheduleTask[];
 }
 
-/** 时间区间：左闭右开 [startHour, endHour)；小时 0–23，endHour 可为 24 表示到次日 0 点前 */
+/**
+ * 时间区间：左闭右开 [start, end)；小时仅 0–23，不出现 24。
+ * 止 23:59 表示「到当日结束」（比较时视为 24:00 独占上界）；跨天如 22:30–次日 6:45 用 start < end 的分钟数表示。
+ */
 export interface TimeSlot {
   /** 区间起始小时（含）0–23 */
   startHour: number;
-  /** 区间结束小时（不含）0–24；24 表示 24:00 即次日 0:00 前；跨天如 22–6 用 startHour=22 endHour=6 */
+  /** 区间起始分钟 0–59 */
+  startMinute: number;
+  /** 区间结束小时（不含）0–23 */
   endHour: number;
+  /** 区间结束分钟 0–59；止 23:59 表示到当日结束 */
+  endMinute: number;
   /** 该区间绑定的行业 id */
   industryId: string;
 }
@@ -71,7 +78,7 @@ export function getDefaultSchedule(): Schedule {
     maxRetries: 3,
     storagePath: DEFAULT_STORAGE_PATH,
     timeSlots: [
-      { startHour: 0, endHour: 24, industryId: "default" },
+      { startHour: 0, startMinute: 0, endHour: 23, endMinute: 59, industryId: "default" },
     ],
     industries: [
       {
@@ -123,10 +130,14 @@ function validateIndustry(ind: unknown, index: number): asserts ind is ScheduleI
 function validateTimeSlot(slot: unknown, index: number): asserts slot is TimeSlot {
   if (slot == null || typeof slot !== "object") throw new Error(`时间区间[${index}] 必须为对象`);
   const o = slot as Record<string, unknown>;
-  const start = Number(o.startHour);
-  const end = Number(o.endHour);
-  if (!Number.isInteger(start) || start < 0 || start > 23) throw new Error(`时间区间[${index}].startHour 必须为 0–23 的整数`);
-  if (!Number.isInteger(end) || end < 0 || end > 24) throw new Error(`时间区间[${index}].endHour 必须为 0–24 的整数`);
+  const startH = Number(o.startHour);
+  const endH = Number(o.endHour);
+  const startM = Number(o.startMinute);
+  const endM = Number(o.endMinute);
+  if (!Number.isInteger(startH) || startH < 0 || startH > 23) throw new Error(`时间区间[${index}].startHour 必须为 0–23 的整数`);
+  if (!Number.isInteger(endH) || endH < 0 || endH > 23) throw new Error(`时间区间[${index}].endHour 必须为 0–23 的整数`);
+  if (!Number.isInteger(startM) || startM < 0 || startM > 59) throw new Error(`时间区间[${index}].startMinute 必须为 0–59 的整数`);
+  if (!Number.isInteger(endM) || endM < 0 || endM > 59) throw new Error(`时间区间[${index}].endMinute 必须为 0–59 的整数`);
   if (typeof o.industryId !== "string" || !o.industryId.trim()) throw new Error(`时间区间[${index}].industryId 必须为非空字符串`);
 }
 
@@ -210,6 +221,29 @@ function normalizeIndustry(ind: unknown): ScheduleIndustry {
   };
 }
 
+/**
+ * 归一化单个时间区间：缺 startMinute/endMinute 补 0；旧配置 endHour=24 转为 endHour=23, endMinute=59。
+ */
+function normalizeTimeSlot(raw: unknown, index: number): TimeSlot {
+  const def = getDefaultSchedule().timeSlots[0]!;
+  if (raw == null || typeof raw !== "object") return { ...def };
+  const o = raw as Record<string, unknown>;
+  let startHour = Number(o.startHour);
+  let endHour = Number(o.endHour);
+  let startMinute = Number(o.startMinute);
+  let endMinute = Number(o.endMinute);
+  if (!Number.isInteger(startHour) || startHour < 0 || startHour > 23) startHour = def.startHour;
+  if (!Number.isInteger(endHour) || endHour < 0 || endHour > 24) endHour = def.endHour;
+  if (!Number.isInteger(startMinute) || startMinute < 0 || startMinute > 59) startMinute = 0;
+  if (!Number.isInteger(endMinute) || endMinute < 0 || endMinute > 59) endMinute = 0;
+  if (endHour === 24) {
+    endHour = 23;
+    endMinute = 59;
+  }
+  const industryId = typeof o.industryId === "string" && o.industryId.trim() ? o.industryId.trim() : def.industryId;
+  return { startHour, startMinute, endHour, endMinute, industryId };
+}
+
 /** 从对象合并默认值（不写盘），用于 API 传入的 partial；兼容旧单数字段 → min=max */
 export function mergeSchedule(partial: unknown): Schedule {
   const def = getDefaultSchedule();
@@ -219,6 +253,8 @@ export function mergeSchedule(partial: unknown): Schedule {
   const hasIntervalRange = o.intervalMinMs !== undefined || o.intervalMaxMs !== undefined;
   const intervalMin = hasIntervalRange ? Number(o.intervalMinMs) : intervalMsLegacy;
   const intervalMax = hasIntervalRange ? Number(o.intervalMaxMs) : intervalMsLegacy;
+  const rawSlots = Array.isArray(o.timeSlots) ? o.timeSlots : def.timeSlots;
+  const timeSlots = rawSlots.map((s: unknown, i: number) => normalizeTimeSlot(s, i));
   const out: Schedule = {
     intervalMinMs: (() => {
       const a = Number.isFinite(intervalMin) && intervalMin >= 1 ? intervalMin : def.intervalMinMs;
@@ -233,7 +269,7 @@ export function mergeSchedule(partial: unknown): Schedule {
     loginWaitMs: Number(o.loginWaitMs) ?? def.loginWaitMs,
     maxRetries: Number(o.maxRetries) || def.maxRetries,
     storagePath: typeof o.storagePath === "string" ? o.storagePath : def.storagePath,
-    timeSlots: Array.isArray(o.timeSlots) ? (o.timeSlots as TimeSlot[]) : def.timeSlots,
+    timeSlots,
     industries: Array.isArray(o.industries) ? (o.industries as unknown[]).map(normalizeIndustry) : def.industries,
     autoClickDuringOutputWait: Array.isArray(o.autoClickDuringOutputWait)
       ? (o.autoClickDuringOutputWait as unknown[]).filter((x): x is string => typeof x === "string" && x.trim() !== "")
@@ -248,19 +284,38 @@ export async function saveSchedule(filePath: string, s: Schedule): Promise<void>
   await writeFile(filePath, JSON.stringify(s, null, 2), "utf-8");
 }
 
+const MINUTES_PER_DAY = 24 * 60;
+
+/**
+ * 将 slot 的结束时刻转为「从 0 点起的独占上界分钟数」：止 23:59 视为 1440（即 24:00）。
+ */
+function slotEndMinutesExclusive(slot: TimeSlot): number {
+  if (slot.endHour === 23 && slot.endMinute === 59) return MINUTES_PER_DAY;
+  return slot.endHour * 60 + slot.endMinute;
+}
+
+/**
+ * 将 slot 的起始时刻转为「从 0 点起的分钟数」。
+ */
+function slotStartMinutes(slot: TimeSlot): number {
+  return slot.startHour * 60 + slot.startMinute;
+}
+
 /**
  * 根据当前时间（本地时区）解析所在时间区间，返回对应行业；未落入任何区间返回 null。
- * 左闭右开：[startHour, endHour)。跨天区间如 22–6 表示 22:00 到次日 6:00（即 endHour < startHour 时视为跨天）。
+ * 左闭右开 [start, end)；比较用「从 0 点起的分钟数」，止 23:59 视为 24:00 独占上界；跨天即 endMinutes < startMinutes。
  */
 export function getIndustryForNow(schedule: Schedule): ScheduleIndustry | null {
   const now = new Date();
-  const hour = now.getHours();
+  const currentM = now.getHours() * 60 + now.getMinutes();
   const industryMap = new Map(schedule.industries.map((i) => [i.id, i]));
   for (const slot of schedule.timeSlots) {
+    const startM = slotStartMinutes(slot);
+    const endM = slotEndMinutesExclusive(slot);
     const inSlot =
-      slot.startHour <= slot.endHour
-        ? hour >= slot.startHour && hour < slot.endHour
-        : hour >= slot.startHour || hour < slot.endHour;
+      startM < endM
+        ? currentM >= startM && currentM < endM
+        : currentM >= startM || currentM < endM;
     if (inSlot) {
       const ind = industryMap.get(slot.industryId);
       if (ind) return ind;
