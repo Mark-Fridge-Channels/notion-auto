@@ -103,6 +103,10 @@ async function main(): Promise<void> {
     /** 本会话的 N、M（开新会话时从行业区间随机） */
     let currentN = drawSessionN(currentIndustry);
     let currentM = drawSessionM(currentIndustry);
+    /** 本时段内已跑完的完整任务链轮数（仅完整一轮结束后 +1；跑满 chainRunsPerSlot 后等待离开时段，不持久化） */
+    let chainRunsInSlot = 0;
+    /** 是否刚因「跑满 N 轮」而离开当前时段；再次落入同一行业时重置 chainRunsInSlot */
+    let leftCurrentSlot = false;
 
     for (;;) {
       // 每轮任务链开始前：检查是否跨时间区间需切换行业
@@ -119,6 +123,8 @@ async function main(): Promise<void> {
           throw new Error(`行业 "${currentIndustry.id}" 的 Notion Portal URL 未配置，请在 Dashboard 中填写`);
         }
         runCount = 0;
+        chainRunsInSlot = 0;
+        leftCurrentSlot = false;
         await page.goto(currentIndustry.notionUrl, { waitUntil: "domcontentloaded" });
         await sleep(500);
         const img = page.locator(AI_FACE_IMG).first();
@@ -130,6 +136,10 @@ async function main(): Promise<void> {
         sessionRuns = 0;
         currentN = drawSessionN(currentIndustry);
         currentM = drawSessionM(currentIndustry);
+      } else if (leftCurrentSlot) {
+        // 再次落入同一行业（如次日同一时段），视为新区段，重置本时段已跑轮数
+        chainRunsInSlot = 0;
+        leftCurrentSlot = false;
       }
 
       // 执行一轮任务链
@@ -145,12 +155,12 @@ async function main(): Promise<void> {
             await switchToNextModel(page);
           }
 
-          let ok = await tryTypeAndSend(page, task.content, schedule.maxRetries);
+          let ok = await tryTypeAndSend(page, task.content, schedule.maxRetries, schedule.autoClickDuringOutputWait ?? []);
           if (!ok) {
             logger.warn("本轮流试失败，尝试 New AI chat 后重试…");
             try {
               await clickNewAIChat(page, schedule.maxRetries);
-              ok = await tryTypeAndSend(page, task.content, schedule.maxRetries);
+              ok = await tryTypeAndSend(page, task.content, schedule.maxRetries, schedule.autoClickDuringOutputWait ?? []);
             } catch (e) {
               logger.warn("New AI chat 失败", e);
             }
@@ -160,7 +170,7 @@ async function main(): Promise<void> {
               logger.warn(`重新打开 Notion 并重试（${r + 1}/${MAX_REOPEN_PER_ROUND}）…`);
               try {
                 await reopenNotionAndNewChat(page, currentIndustry.notionUrl, schedule.maxRetries);
-                ok = await tryTypeAndSend(page, task.content, schedule.maxRetries);
+                ok = await tryTypeAndSend(page, task.content, schedule.maxRetries, schedule.autoClickDuringOutputWait ?? []);
               } catch (e) {
                 logger.warn("reopenNotionAndNewChat 失败", e);
               }
@@ -182,7 +192,27 @@ async function main(): Promise<void> {
           await sleep(intervalMs);
         }
       }
-      // 任务链跑完，立刻从头再跑（不 break）
+      // 任务链完整跑完一轮后才计数；若本时段已跑满 chainRunsPerSlot 则等待离开当前时段
+      chainRunsInSlot++;
+      const limit = currentIndustry.chainRunsPerSlot ?? 0;
+      if (limit > 0 && chainRunsInSlot >= limit) {
+        logger.info(`本时段已跑满 ${chainRunsInSlot} 轮任务链（上限 ${limit}），等待离开当前时段…`);
+        let waitMinutes = 0;
+        for (;;) {
+          await sleep(60_000);
+          waitMinutes++;
+          const next = getIndustryForNow(schedule);
+          if (next == null || next.id !== currentIndustry.id) {
+            leftCurrentSlot = true;
+            break;
+          }
+          if (waitMinutes > 0 && waitMinutes % 5 === 0) {
+            logger.info(`仍在当前时段，已等待 ${waitMinutes} 分钟，稍后继续检查…`);
+          }
+        }
+        continue;
+      }
+      // 未设上限或未跑满：立刻从头再跑下一轮任务链（不 break）
     }
   } finally {
     try {
@@ -260,7 +290,78 @@ async function openNotionAI(
 
 const INPUT_CLICK_DELAY_MS = 150;
 
-async function typeAndSend(page: import("playwright").Page, text: string): Promise<void> {
+/** 等待输出结束时的轮询间隔（毫秒） */
+const AUTO_CLICK_POLL_MS = 1500;
+
+/** 转义字符串中的正则特殊字符，用于 getByRole(role, { name: /^...$/ }) 的精确匹配 */
+function escapeRegex(s: string): string {
+  return s.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
+}
+
+/**
+ * 在总超时内轮询：先查发送按钮可见则结束；否则按配置顺序查「role=button、name 精确匹配」的按钮，可见则点击后继续轮询。
+ * 不重置总超时；点击失败仅打日志。
+ */
+async function waitForSendButtonWithAutoClick(
+  page: import("playwright").Page,
+  buttonNames: string[],
+  timeoutMs: number,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const sendBtn = page.locator(SEND_BUTTON).first();
+    if (await sendBtn.isVisible().catch(() => false)) return;
+    for (const name of buttonNames) {
+      const loc = page.getByRole("button", { name: new RegExp("^" + escapeRegex(name) + "$") }).first();
+      if (await loc.isVisible().catch(() => false)) {
+        try {
+          await loc.click();
+        } catch (e) {
+          logger.warn(`等待输出期间自动点击按钮失败 name=${name}`, e);
+        }
+        break;
+      }
+    }
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    await sleep(Math.min(AUTO_CLICK_POLL_MS, remaining));
+  }
+  throw new WaitAfterSendTimeoutError(new Error("timeout"));
+}
+
+/** 事后清扫时长（毫秒）：等待结束后再扫这段时间，覆盖「对话已结束、按钮稍后才弹出」的情况 */
+const SWEEP_DURATION_MS = 5000;
+/** 事后清扫轮询间隔（毫秒） */
+const SWEEP_INTERVAL_MS = 1000;
+
+/**
+ * 事后清扫：在固定时长内轮询，只检测并点击配置的按钮，不查发送按钮、不抛错。
+ * 用于在「等待输出结束」已返回后，捕获稍后才弹出的按钮（如 Delete pages）。
+ */
+async function sweepAutoClickButtons(
+  page: import("playwright").Page,
+  buttonNames: string[],
+): Promise<void> {
+  const deadline = Date.now() + SWEEP_DURATION_MS;
+  while (Date.now() < deadline) {
+    for (const name of buttonNames) {
+      const loc = page.getByRole("button", { name: new RegExp("^" + escapeRegex(name) + "$") }).first();
+      if (await loc.isVisible().catch(() => false)) {
+        try {
+          await loc.click();
+        } catch (e) {
+          logger.warn(`事后清扫自动点击按钮失败 name=${name}`, e);
+        }
+        break;
+      }
+    }
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    await sleep(Math.min(SWEEP_INTERVAL_MS, remaining));
+  }
+}
+
+async function typeAndSend(page: import("playwright").Page, text: string, buttonNames: string[] = []): Promise<void> {
   if (process.env.NOTION_AUTO_SIMULATE_STUCK === "1") {
     throw new Error("模拟卡住（NOTION_AUTO_SIMULATE_STUCK=1）");
   }
@@ -279,9 +380,12 @@ async function typeAndSend(page: import("playwright").Page, text: string): Promi
   await send.waitFor({ state: "visible" });
   await send.click();
   try {
-    await page.locator(SEND_BUTTON).first().waitFor({ state: "visible", timeout: WAIT_SUBMIT_READY_MS });
+    await waitForSendButtonWithAutoClick(page, buttonNames, WAIT_SUBMIT_READY_MS);
   } catch (e) {
     throw new WaitAfterSendTimeoutError(e);
+  }
+  if (buttonNames.length > 0) {
+    await sweepAutoClickButtons(page, buttonNames);
   }
 }
 
@@ -341,10 +445,11 @@ async function tryTypeAndSend(
   page: import("playwright").Page,
   prompt: string,
   max: number,
+  buttonNames: string[],
 ): Promise<boolean> {
   for (let i = 0; i < max; i++) {
     try {
-      await typeAndSend(page, prompt);
+      await typeAndSend(page, prompt, buttonNames);
       return true;
     } catch (e) {
       if (e instanceof WaitAfterSendTimeoutError) {

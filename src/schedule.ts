@@ -26,6 +26,8 @@ export interface ScheduleIndustry {
   /** 每跑 M 次后换模型：区间 [min, max]，开新会话时随机取 M；0 表示本会话不换 */
   modelSwitchIntervalMin: number;
   modelSwitchIntervalMax: number;
+  /** 本时段内跑几轮完整任务链：0 = 一直跑，1 = 跑 1 轮后等待到下一时段，2 = 跑 2 轮后等待，以此类推 */
+  chainRunsPerSlot: number;
   /** 任务链，按顺序执行 */
   tasks: ScheduleTask[];
 }
@@ -54,6 +56,8 @@ export interface Schedule {
   timeSlots: TimeSlot[];
   /** 行业列表 */
   industries: ScheduleIndustry[];
+  /** 等待 AI 输出结束期间若出现这些按钮（role=button，name 精确匹配）则自动点击；仅填按钮名称 */
+  autoClickDuringOutputWait?: string[];
 }
 
 const DEFAULT_STORAGE_PATH = ".notion-auth.json";
@@ -77,6 +81,7 @@ export function getDefaultSchedule(): Schedule {
         newChatEveryRunsMax: 1,
         modelSwitchIntervalMin: 1,
         modelSwitchIntervalMax: 1,
+        chainRunsPerSlot: 0,
         tasks: [
           { content: "@Task — Add new companies", runCount: 1 },
         ],
@@ -108,6 +113,8 @@ function validateIndustry(ind: unknown, index: number): asserts ind is ScheduleI
   if (!Number.isInteger(mMin) || mMin < 0) throw new Error(`行业[${index}].modelSwitchIntervalMin 必须为非负整数`);
   if (!Number.isInteger(mMax) || mMax < 0) throw new Error(`行业[${index}].modelSwitchIntervalMax 必须为非负整数`);
   if (mMin > mMax) throw new Error(`行业[${index}] modelSwitchIntervalMin 不能大于 modelSwitchIntervalMax`);
+  const chainRuns = Number(o.chainRunsPerSlot);
+  if (!Number.isInteger(chainRuns) || chainRuns < 0) throw new Error(`行业[${index}].chainRunsPerSlot 必须为非负整数`);
   if (!Array.isArray(o.tasks)) throw new Error(`行业[${index}].tasks 必须为数组`);
   if (o.tasks.length === 0) throw new Error(`行业[${index}].tasks 不能为空`);
   o.tasks.forEach((t, i) => validateTask(t, i));
@@ -141,6 +148,14 @@ export function validateSchedule(s: Schedule): void {
   if (!Number.isFinite(s.maxRetries) || s.maxRetries < 1) throw new Error("maxRetries 必须为正整数");
   if (typeof s.storagePath !== "string" || s.storagePath.includes("..") || s.storagePath.startsWith("/"))
     throw new Error("storagePath 必须为当前目录下的相对路径");
+  if (s.autoClickDuringOutputWait !== undefined) {
+    if (!Array.isArray(s.autoClickDuringOutputWait))
+      throw new Error("autoClickDuringOutputWait 必须为数组");
+    s.autoClickDuringOutputWait.forEach((item, i) => {
+      if (typeof item !== "string" || item.trim() === "")
+        throw new Error(`autoClickDuringOutputWait[${i}] 必须为非空字符串`);
+    });
+  }
 }
 
 const SCHEDULE_FILENAME = "schedule.json";
@@ -182,6 +197,7 @@ function normalizeIndustry(ind: unknown): ScheduleIndustry {
   const nMax = o.newChatEveryRunsMax !== undefined ? Number(o.newChatEveryRunsMax) : Number(o.newChatEveryRuns);
   const mMin = o.modelSwitchIntervalMin !== undefined ? Number(o.modelSwitchIntervalMin) : Number(o.modelSwitchInterval);
   const mMax = o.modelSwitchIntervalMax !== undefined ? Number(o.modelSwitchIntervalMax) : Number(o.modelSwitchInterval);
+  const chainRuns = o.chainRunsPerSlot !== undefined ? Number(o.chainRunsPerSlot) : def.chainRunsPerSlot;
   return {
     id: typeof o.id === "string" ? o.id : def.id,
     notionUrl: typeof o.notionUrl === "string" ? o.notionUrl : def.notionUrl,
@@ -189,6 +205,7 @@ function normalizeIndustry(ind: unknown): ScheduleIndustry {
     newChatEveryRunsMax: Number.isInteger(nMax) && nMax >= 0 ? nMax : def.newChatEveryRunsMax,
     modelSwitchIntervalMin: Number.isInteger(mMin) && mMin >= 0 ? mMin : def.modelSwitchIntervalMin,
     modelSwitchIntervalMax: Number.isInteger(mMax) && mMax >= 0 ? mMax : def.modelSwitchIntervalMax,
+    chainRunsPerSlot: Number.isInteger(chainRuns) && chainRuns >= 0 ? chainRuns : def.chainRunsPerSlot,
     tasks: Array.isArray(o.tasks) ? (o.tasks as ScheduleTask[]) : def.tasks,
   };
 }
@@ -218,6 +235,9 @@ export function mergeSchedule(partial: unknown): Schedule {
     storagePath: typeof o.storagePath === "string" ? o.storagePath : def.storagePath,
     timeSlots: Array.isArray(o.timeSlots) ? (o.timeSlots as TimeSlot[]) : def.timeSlots,
     industries: Array.isArray(o.industries) ? (o.industries as unknown[]).map(normalizeIndustry) : def.industries,
+    autoClickDuringOutputWait: Array.isArray(o.autoClickDuringOutputWait)
+      ? (o.autoClickDuringOutputWait as unknown[]).filter((x): x is string => typeof x === "string" && x.trim() !== "")
+      : undefined,
   };
   return out;
 }

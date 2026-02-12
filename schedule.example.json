@@ -5,9 +5,21 @@
   "maxRetries": 3,
   "storagePath": ".notion-auth.json",
   "timeSlots": [
-    { "startHour": 1, "endHour": 5, "industryId": "industryA" },
-    { "startHour": 5, "endHour": 10, "industryId": "industryB" },
-    { "startHour": 10, "endHour": 15, "industryId": "industryC" }
+    {
+      "startHour": 1,
+      "endHour": 5,
+      "industryId": "industryA"
+    },
+    {
+      "startHour": 5,
+      "endHour": 10,
+      "industryId": "industryB"
+    },
+    {
+      "startHour": 10,
+      "endHour": 15,
+      "industryId": "industryC"
+    }
   ],
   "industries": [
     {
@@ -18,9 +30,16 @@
       "modelSwitchIntervalMin": 1,
       "modelSwitchIntervalMax": 1,
       "tasks": [
-        { "content": "@Task A1 — 输入内容示例", "runCount": 1 },
-        { "content": "@Task A2 — 另一条", "runCount": 2 }
-      ]
+        {
+          "content": "@Task A1 — 输入内容示例",
+          "runCount": 1
+        },
+        {
+          "content": "@Task A2 — 另一条",
+          "runCount": 2
+        }
+      ],
+      "chainRunsPerSlot": 0
     },
     {
       "id": "industryB",
@@ -29,7 +48,13 @@
       "newChatEveryRunsMax": 1,
       "modelSwitchIntervalMin": 1,
       "modelSwitchIntervalMax": 1,
-      "tasks": [{ "content": "@Task B — 行业 B 文案", "runCount": 1 }]
+      "tasks": [
+        {
+          "content": "@Task B — 行业 B 文案",
+          "runCount": 1
+        }
+      ],
+      "chainRunsPerSlot": 0
     },
     {
       "id": "industryC",
@@ -38,7 +63,13 @@
       "newChatEveryRunsMax": 10,
       "modelSwitchIntervalMin": 0,
       "modelSwitchIntervalMax": 0,
-      "tasks": [{ "content": "@Task C — 行业 C 文案", "runCount": 5 }]
+      "tasks": [
+        {
+          "content": "@Task C — 行业 C 文案",
+          "runCount": 5
+        }
+      ],
+      "chainRunsPerSlot": 0
     }
   ]
 }

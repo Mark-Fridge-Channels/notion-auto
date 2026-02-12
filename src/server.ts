@@ -353,6 +353,11 @@ function getDashboardHtml(): string {
         <label>最大重试次数 <span class="hint">打开 Notion AI、点击新建对话、输入发送等单步失败时最多尝试次数，默认 3</span></label>
         <input id="maxRetries" type="number" min="1" placeholder="3">
       </div>
+      <div class="row">
+        <label>等待输出期间自动点击的按钮 <span class="hint">将按列表顺序依次检测并点击出现的按钮。填写按钮上显示的文字，精确匹配。</span></label>
+      </div>
+      <div id="autoClickButtonsContainer"></div>
+      <button type="button" id="btnAddAutoClickButton" class="primary" style="margin-top:0.25rem">添加一项</button>
     </div>
     <div class="card">
       <h2>时间区间 <span class="hint">左闭右开，本地时区</span></h2>
@@ -371,6 +376,7 @@ function getDashboardHtml(): string {
         <div class="row"><label>Notion Portal URL</label><input type="url" id="modalNotionUrl" placeholder="https://..."></div>
         <div class="row"><label>每 N 次开启新会话（区间内随机次数，每次开启新会话后更新N）</label><span><input type="number" id="modalNewChatEveryRunsMin" min="0" value="1" style="width:4rem"> ～ <input type="number" id="modalNewChatEveryRunsMax" min="0" value="1" style="width:4rem"></span></div>
         <div class="row"><label>每 M 次换模型（区间，0=不换）</label><span><input type="number" id="modalModelSwitchIntervalMin" min="0" value="0" style="width:4rem"> ～ <input type="number" id="modalModelSwitchIntervalMax" min="0" value="0" style="width:4rem"></span></div>
+        <div class="row"><label>时段内跑几轮任务链（0=一直跑）</label><input type="number" id="modalChainRunsPerSlot" min="0" value="0" style="width:4rem" placeholder="0"></div>
         <div class="row"><label>任务链</label><div id="modalTasksContainer"></div><button type="button" id="modalAddTask">添加任务</button></div>
         <div class="form-actions">
           <button type="button" id="modalSave" class="primary">保存</button>
@@ -390,6 +396,7 @@ function getDashboardHtml(): string {
     const msgEl = document.getElementById('msg');
     const timeSlotsContainer = document.getElementById('timeSlotsContainer');
     const industriesContainer = document.getElementById('industriesContainer');
+    const autoClickButtonsContainer = document.getElementById('autoClickButtonsContainer');
     const logTabs = document.getElementById('logTabs');
     const logContent = document.getElementById('logContent');
 
@@ -438,7 +445,28 @@ function getDashboardHtml(): string {
     }
 
     const NEW_INDUSTRY_VALUE = '__new__';
+
+    /** 将当前 DOM 中时间区间行的输入值写回 currentSchedule.timeSlots，避免重绘时丢失未保存编辑 */
+    function syncTimeSlotsFromDOM() {
+      if (!currentSchedule || !currentSchedule.timeSlots) return;
+      const rows = timeSlotsContainer.querySelectorAll('.slot-row');
+      rows.forEach((row, idx) => {
+        if (idx >= currentSchedule.timeSlots.length) return;
+        const slot = currentSchedule.timeSlots[idx];
+        const startInput = row.querySelector('[data-key="startHour"]');
+        const endInput = row.querySelector('[data-key="endHour"]');
+        const industrySelect = row.querySelector('[data-key="industryId"]');
+        if (startInput) slot.startHour = Number(startInput.value) || 0;
+        if (endInput) {
+          const endHour = Number(endInput.value);
+          slot.endHour = (Number.isFinite(endHour) && endHour >= 0 && endHour <= 24) ? endHour : 24;
+        }
+        if (industrySelect && industrySelect.value !== NEW_INDUSTRY_VALUE) slot.industryId = industrySelect.value;
+      });
+    }
+
     function renderTimeSlots(schedule) {
+      syncTimeSlotsFromDOM();
       const slots = schedule.timeSlots || [];
       const industryIds = (schedule.industries || []).map(i => i.id);
       timeSlotsContainer.innerHTML = '';
@@ -456,7 +484,7 @@ function getDashboardHtml(): string {
         selectEl.onchange = function() {
           if (selectEl.value !== NEW_INDUSTRY_VALUE) return;
           const newId = 'new_' + Date.now();
-          const newInd = { id: newId, notionUrl: '', newChatEveryRunsMin: 1, newChatEveryRunsMax: 1, modelSwitchIntervalMin: 0, modelSwitchIntervalMax: 0, tasks: [{ content: '', runCount: 1 }] };
+          const newInd = { id: newId, notionUrl: '', newChatEveryRunsMin: 1, newChatEveryRunsMax: 1, modelSwitchIntervalMin: 0, modelSwitchIntervalMax: 0, chainRunsPerSlot: 0, tasks: [{ content: '', runCount: 1 }] };
           schedule.industries.push(newInd);
           slot.industryId = newId;
           syncScheduleUI();
@@ -486,7 +514,7 @@ function getDashboardHtml(): string {
         industriesContainer.appendChild(row);
       });
       document.getElementById('btnAddIndustry').onclick = () => {
-        industries.push({ id: 'new_' + Date.now(), notionUrl: '', newChatEveryRunsMin: 1, newChatEveryRunsMax: 1, modelSwitchIntervalMin: 0, modelSwitchIntervalMax: 0, tasks: [{ content: '', runCount: 1 }] });
+        industries.push({ id: 'new_' + Date.now(), notionUrl: '', newChatEveryRunsMin: 1, newChatEveryRunsMax: 1, modelSwitchIntervalMin: 0, modelSwitchIntervalMax: 0, chainRunsPerSlot: 0, tasks: [{ content: '', runCount: 1 }] });
         syncScheduleUI();
         openEditModal(industries.length - 1);
       };
@@ -520,6 +548,8 @@ function getDashboardHtml(): string {
       document.getElementById('modalNewChatEveryRunsMax').value = ind.newChatEveryRunsMax ?? 1;
       document.getElementById('modalModelSwitchIntervalMin').value = ind.modelSwitchIntervalMin ?? 0;
       document.getElementById('modalModelSwitchIntervalMax').value = ind.modelSwitchIntervalMax ?? 0;
+      const modalChainRunsEl = document.getElementById('modalChainRunsPerSlot');
+      if (modalChainRunsEl) modalChainRunsEl.value = (ind.chainRunsPerSlot ?? 0);
       const tasksContainer = document.getElementById('modalTasksContainer');
       tasksContainer.innerHTML = '';
       /** 删除任务：只移除该行并 splice，不重填表单，避免清空用户已填未保存内容 */
@@ -562,6 +592,7 @@ function getDashboardHtml(): string {
       const newChatEveryRunsMax = Number(document.getElementById('modalNewChatEveryRunsMax').value);
       const modelSwitchIntervalMin = Number(document.getElementById('modalModelSwitchIntervalMin').value);
       const modelSwitchIntervalMax = Number(document.getElementById('modalModelSwitchIntervalMax').value);
+      const chainRunsPerSlotVal = Number(document.getElementById('modalChainRunsPerSlot')?.value ?? 0);
       const tasks = [];
       document.querySelectorAll('#modalTasksContainer .task-row').forEach(tr => {
         const content = (tr.querySelector('[data-key="content"]') && tr.querySelector('[data-key="content"]').value) || '';
@@ -578,6 +609,8 @@ function getDashboardHtml(): string {
       const mMax = Number.isInteger(modelSwitchIntervalMax) && modelSwitchIntervalMax >= 0 ? modelSwitchIntervalMax : 0;
       ind.modelSwitchIntervalMin = Math.min(mMin, mMax);
       ind.modelSwitchIntervalMax = Math.max(mMin, mMax);
+      const cr = Number.isInteger(chainRunsPerSlotVal) && chainRunsPerSlotVal >= 0 ? chainRunsPerSlotVal : 0;
+      ind.chainRunsPerSlot = cr;
       ind.tasks = tasks;
       if (oldId !== newId) {
         (currentSchedule.timeSlots || []).forEach(slot => {
@@ -597,6 +630,20 @@ function getDashboardHtml(): string {
       document.getElementById('intervalSecondsMax').value = schedule.intervalMaxMs != null ? Math.round(schedule.intervalMaxMs / 1000) : 120;
       document.getElementById('loginWaitSeconds').value = schedule.loginWaitMs != null ? Math.round(schedule.loginWaitMs / 1000) : 60;
       document.getElementById('maxRetries').value = schedule.maxRetries ?? 3;
+      const names = schedule.autoClickDuringOutputWait || [];
+      autoClickButtonsContainer.innerHTML = '';
+      names.forEach(function (name) {
+        appendAutoClickRow(name);
+      });
+    }
+    /** 在「自动点击按钮」列表末尾追加一行；value 为输入框初始值 */
+    function appendAutoClickRow(value) {
+      const row = document.createElement('div');
+      row.className = 'row auto-click-row';
+      row.innerHTML = '<input type="text" data-key="name" placeholder="例如 Delete pages" value="' + escapeAttr(value || '') + '" style="flex:1; max-width:20rem">' +
+        '<button type="button" class="danger" data-remove-auto-click>删除</button>';
+      row.querySelector('[data-remove-auto-click]').onclick = function () { row.remove(); };
+      autoClickButtonsContainer.appendChild(row);
     }
 
     /** 从 DOM 收集时间区间，行业数据以内存 currentSchedule.industries 为准 */
@@ -617,8 +664,16 @@ function getDashboardHtml(): string {
         slots.push({ startHour, endHour: endHourVal, industryId });
       });
       const industries = (currentSchedule && currentSchedule.industries) ? currentSchedule.industries : [];
-      return { intervalMinMs, intervalMaxMs, loginWaitMs, maxRetries, storagePath: '.notion-auth.json', timeSlots: slots, industries };
+      const autoClickDuringOutputWait = [];
+      autoClickButtonsContainer.querySelectorAll('.auto-click-row').forEach(function (row) {
+        const input = row.querySelector('[data-key="name"]');
+        const val = (input && input.value && input.value.trim()) || '';
+        if (val) autoClickDuringOutputWait.push(val);
+      });
+      return { intervalMinMs, intervalMaxMs, loginWaitMs, maxRetries, storagePath: '.notion-auth.json', timeSlots: slots, industries, autoClickDuringOutputWait };
     }
+
+    document.getElementById('btnAddAutoClickButton').onclick = function () { appendAutoClickRow(''); };
 
     async function loadSchedule() {
       const s = await api('/api/schedule');
