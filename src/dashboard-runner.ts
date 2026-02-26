@@ -95,16 +95,23 @@ function spawnChild(configPath: string, isAutoResume: boolean): void {
     lines: [],
   };
 
+  const verbose = process.env.NOTION_AUTO_VERBOSE === "1";
   child.stdout?.on("data", (chunk: Buffer) => {
     const text = chunk.toString("utf-8");
     text.split("\n").forEach((line) => {
-      if (line) appendLine(line);
+      if (line) {
+        appendLine(line);
+        if (verbose) process.stderr.write(`[Playwright] ${line}\n`);
+      }
     });
   });
   child.stderr?.on("data", (chunk: Buffer) => {
     const text = chunk.toString("utf-8");
     text.split("\n").forEach((line) => {
-      if (line) appendLine(line);
+      if (line) {
+        appendLine(line);
+        if (verbose) process.stderr.write(`[Playwright] ${line}\n`);
+      }
     });
   });
 

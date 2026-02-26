@@ -72,6 +72,20 @@
         }
       ],
       "chainRunsPerSlot": 0
+    },
+    {
+      "id": "queueOutbound",
+      "type": "queue",
+      "notionUrl": "",
+      "newChatEveryRunsMin": 1,
+      "newChatEveryRunsMax": 1,
+      "modelSwitchIntervalMin": 0,
+      "modelSwitchIntervalMax": 0,
+      "chainRunsPerSlot": 0,
+      "tasks": [{ "content": "", "runCount": 1 }],
+      "queueDatabaseUrl": "https://www.notion.so/your-queue-db-id",
+      "senderAccountsDatabaseUrl": "https://www.notion.so/your-sender-accounts-db-id",
+      "batchSize": 20
     }
   ]
 }

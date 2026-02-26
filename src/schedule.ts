@@ -14,22 +14,33 @@ export interface ScheduleTask {
   runCount: number;
 }
 
-/** 行业：Notion Portal URL + 任务链 + 行业级每 N 次新会话、每 M 次换模型（区间，开新会话时随机） */
+/** 行业类型：Playwright 任务链 或 Queue 出站发送 */
+export type ScheduleIndustryType = "playwright" | "queue";
+
+/** 行业：Playwright 时为 Notion Portal URL + 任务链；Queue 时为 Queue 数据库 URL + 发件人库 URL。 */
 export interface ScheduleIndustry {
   /** 行业唯一标识，时间区间通过此 id 引用行业 */
   id: string;
-  /** 该行业对应的 Notion 页面 URL */
+  /** 行业类型，默认 playwright；queue 时使用 queueDatabaseUrl / senderAccountsDatabaseUrl，不跑任务链 */
+  type?: ScheduleIndustryType;
+  /** 该行业对应的 Notion 页面 URL（Playwright 时必填） */
   notionUrl: string;
-  /** 每跑 N 次后新建会话：区间 [min, max]，开新会话时随机取 N；0 表示本会话不主动新建 */
+  /** 每跑 N 次后新建会话：区间 [min, max]，开新会话时随机取 N；0 表示本会话不主动新建（仅 Playwright） */
   newChatEveryRunsMin: number;
   newChatEveryRunsMax: number;
-  /** 每跑 M 次后换模型：区间 [min, max]，开新会话时随机取 M；0 表示本会话不换 */
+  /** 每跑 M 次后换模型：区间 [min, max]，开新会话时随机取 M；0 表示本会话不换（仅 Playwright） */
   modelSwitchIntervalMin: number;
   modelSwitchIntervalMax: number;
-  /** 本时段内跑几轮完整任务链：0 = 一直跑，1 = 跑 1 轮后等待到下一时段，2 = 跑 2 轮后等待，以此类推 */
+  /** 本时段内跑几轮完整任务链：0 = 一直跑（仅 Playwright） */
   chainRunsPerSlot: number;
-  /** 任务链，按顺序执行 */
+  /** 任务链，按顺序执行（仅 Playwright） */
   tasks: ScheduleTask[];
+  /** Queue 数据库 URL（type=queue 时必填） */
+  queueDatabaseUrl?: string;
+  /** 发件人库 URL，各自用（type=queue 时必填） */
+  senderAccountsDatabaseUrl?: string;
+  /** 每批取条数（type=queue 时可选，默认 20） */
+  batchSize?: number;
 }
 
 /**
@@ -109,6 +120,17 @@ function validateIndustry(ind: unknown, index: number): asserts ind is ScheduleI
   if (ind == null || typeof ind !== "object") throw new Error(`行业[${index}] 必须为对象`);
   const o = ind as Record<string, unknown>;
   if (typeof o.id !== "string" || !o.id.trim()) throw new Error(`行业[${index}].id 必须为非空字符串`);
+  const industryType = o.type === "queue" ? "queue" : "playwright";
+  if (industryType === "queue") {
+    if (typeof o.queueDatabaseUrl !== "string" || !String(o.queueDatabaseUrl).trim())
+      throw new Error(`行业[${index}].queueDatabaseUrl 必须为非空字符串（Queue 类型）`);
+    if (typeof o.senderAccountsDatabaseUrl !== "string" || !String(o.senderAccountsDatabaseUrl).trim())
+      throw new Error(`行业[${index}].senderAccountsDatabaseUrl 必须为非空字符串（Queue 类型）`);
+    const batchSize = Number(o.batchSize);
+    if (o.batchSize !== undefined && (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > 100))
+      throw new Error(`行业[${index}].batchSize 必须为 1–100 的整数`);
+    return;
+  }
   if (typeof o.notionUrl !== "string") throw new Error(`行业[${index}].notionUrl 必须为字符串`);
   const nMin = Number(o.newChatEveryRunsMin);
   const nMax = Number(o.newChatEveryRunsMax);
@@ -197,20 +219,25 @@ export async function loadSchedule(filePath: string): Promise<Schedule> {
   }
 }
 
+const DEFAULT_BATCH_SIZE = 20;
+
 /**
- * 从区间 [min, max] 规范化行业：若仅有旧单数字段则设 min=max=原值。
+ * 从区间 [min, max] 规范化行业：若仅有旧单数字段则设 min=max=原值；支持 type=queue 及 Queue 字段。
  */
 function normalizeIndustry(ind: unknown): ScheduleIndustry {
   const def = getDefaultSchedule().industries[0]!;
   if (ind == null || typeof ind !== "object") return def;
   const o = ind as Record<string, unknown>;
+  const industryType = o.type === "queue" ? "queue" : "playwright";
   const nMin = o.newChatEveryRunsMin !== undefined ? Number(o.newChatEveryRunsMin) : Number(o.newChatEveryRuns);
   const nMax = o.newChatEveryRunsMax !== undefined ? Number(o.newChatEveryRunsMax) : Number(o.newChatEveryRuns);
   const mMin = o.modelSwitchIntervalMin !== undefined ? Number(o.modelSwitchIntervalMin) : Number(o.modelSwitchInterval);
   const mMax = o.modelSwitchIntervalMax !== undefined ? Number(o.modelSwitchIntervalMax) : Number(o.modelSwitchInterval);
   const chainRuns = o.chainRunsPerSlot !== undefined ? Number(o.chainRunsPerSlot) : def.chainRunsPerSlot;
-  return {
+  const batchSizeVal = o.batchSize !== undefined ? Number(o.batchSize) : DEFAULT_BATCH_SIZE;
+  const base = {
     id: typeof o.id === "string" ? o.id : def.id,
+    type: industryType,
     notionUrl: typeof o.notionUrl === "string" ? o.notionUrl : def.notionUrl,
     newChatEveryRunsMin: Number.isInteger(nMin) && nMin >= 0 ? nMin : def.newChatEveryRunsMin,
     newChatEveryRunsMax: Number.isInteger(nMax) && nMax >= 0 ? nMax : def.newChatEveryRunsMax,
@@ -219,6 +246,15 @@ function normalizeIndustry(ind: unknown): ScheduleIndustry {
     chainRunsPerSlot: Number.isInteger(chainRuns) && chainRuns >= 0 ? chainRuns : def.chainRunsPerSlot,
     tasks: Array.isArray(o.tasks) ? (o.tasks as ScheduleTask[]) : def.tasks,
   };
+  if (industryType === "queue") {
+    return {
+      ...base,
+      queueDatabaseUrl: typeof o.queueDatabaseUrl === "string" ? o.queueDatabaseUrl : "",
+      senderAccountsDatabaseUrl: typeof o.senderAccountsDatabaseUrl === "string" ? o.senderAccountsDatabaseUrl : "",
+      batchSize: Number.isInteger(batchSizeVal) && batchSizeVal >= 1 && batchSizeVal <= 100 ? batchSizeVal : DEFAULT_BATCH_SIZE,
+    };
+  }
+  return base;
 }
 
 /**

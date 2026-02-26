@@ -9,11 +9,21 @@ import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { resolve, relative } from "node:path";
 import * as runner from "./dashboard-runner.js";
+import * as queueSenderRunner from "./dashboard-queue-sender-runner.js";
 import { loadSchedule, saveSchedule, getSchedulePath, mergeSchedule, validateSchedule } from "./schedule.js";
 import { logger } from "./logger.js";
 
-const PORT = 9000;
+const PORT = 9001;
 const HOST = "127.0.0.1";
+
+/** 进程退出时先停止由 Dashboard 启动的子进程，避免残留 Queue Sender / Playwright 进程 */
+function shutdown(): void {
+  queueSenderRunner.stopQueueSender();
+  runner.stop();
+  process.exit(0);
+}
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
 
 /** 拉取并重启流程进行中时置为 true，防止重复点击 */
 let isPullRestartInProgress = false;
@@ -120,6 +130,7 @@ function runNpmInstall(cwd: string): Promise<{ exitCode: number; stdout: string;
  * 跨平台：Windows 使用 shell + 单命令，与 dashboard-runner 一致。
  */
 function spawnNewServerAndExit(): void {
+  queueSenderRunner.stopQueueSender();
   runner.stop();
   const env = { ...process.env, NOTION_AUTO_RESTART: "1" };
   const cwd = process.cwd();
@@ -186,8 +197,30 @@ async function handleRequest(
       return;
     }
     if (path === "/api/logs" && method === "GET") {
-      const runs = runner.getRecentRunLogs(10);
+      const playRuns = runner.getRecentRunLogs(10).map((r) => ({ kind: "playwright" as const, ...r }));
+      const queueRuns = queueSenderRunner.getQueueSenderRunLogs(10).map((r) => ({ kind: "queue-sender" as const, ...r }));
+      const runs = [...playRuns, ...queueRuns].sort((a, b) => b.startTime - a.startTime).slice(0, 20);
       sendJson(res, 200, { runs });
+      return;
+    }
+    if (path === "/api/queue-sender/status" && method === "GET") {
+      sendJson(res, 200, { status: queueSenderRunner.getQueueSenderStatus() });
+      return;
+    }
+    if (path === "/api/queue-sender/start" && method === "POST") {
+      if (queueSenderRunner.getQueueSenderStatus() === "running") {
+        sendJson(res, 400, { error: "Queue Sender 已在运行，请先停止" });
+        return;
+      }
+      queueSenderRunner.startQueueSender();
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    if (path === "/api/queue-sender/stop" && method === "POST") {
+      queueSenderRunner.stopQueueSender();
+      res.writeHead(204);
+      res.end();
       return;
     }
     if (path === "/api/pull-and-restart" && method === "POST") {
@@ -313,6 +346,7 @@ function getDashboardHtml(): string {
       .card { padding: 1rem; }
       .slot-row { flex-wrap: wrap; }
       .slot-row select { max-width: none; }
+      .industry-row .type { min-width: 4.5rem; font-size: 0.875em; color: #666; }
       .industry-row .id { min-width: 4rem; }
       .modal-box { min-width: 0; width: 100%; max-width: calc(100vw - 1.5rem); margin: 1rem; }
     }
@@ -329,11 +363,14 @@ function getDashboardHtml(): string {
     <div>
       <h1>${pageTitle}</h1>
       <div id="statusEl" class="status" style="margin-top:0.5rem">加载中…</div>
+      <div id="queueSenderStatusEl" class="status" style="margin-top:0.25rem;font-size:0.9em">Queue Sender：—</div>
     </div>
     <div>
       <div class="actions">
         <button type="button" id="btnStart" class="primary">启动</button>
         <button type="button" id="btnStop" class="danger">停止</button>
+        <button type="button" id="btnQueueSenderStart" class="primary">启动 Queue Sender</button>
+        <button type="button" id="btnQueueSenderStop" class="danger">停止 Queue Sender</button>
         <button type="button" id="btnSave">保存配置</button>
         <button type="button" id="btnPullRestart">拉取并重启</button>
       </div>
@@ -376,11 +413,22 @@ function getDashboardHtml(): string {
       <div class="modal-box">
         <h3 id="industryModalTitle">编辑行业</h3>
         <div class="row"><label>行业 id（名称）</label><input type="text" id="modalIndustryId" placeholder="id"></div>
-        <div class="row"><label>Notion Portal URL</label><input type="url" id="modalNotionUrl" placeholder="https://..."></div>
-        <div class="row"><label>每 N 次开启新会话（区间内随机次数，每次开启新会话后更新N）</label><span><input type="number" id="modalNewChatEveryRunsMin" min="0" value="1" style="width:4rem"> ～ <input type="number" id="modalNewChatEveryRunsMax" min="0" value="1" style="width:4rem"></span></div>
-        <div class="row"><label>每 M 次换模型（区间，0=不换）</label><span><input type="number" id="modalModelSwitchIntervalMin" min="0" value="0" style="width:4rem"> ～ <input type="number" id="modalModelSwitchIntervalMax" min="0" value="0" style="width:4rem"></span></div>
-        <div class="row"><label>时段内跑几轮任务链（0=一直跑）</label><input type="number" id="modalChainRunsPerSlot" min="0" value="0" style="width:4rem" placeholder="0"></div>
-        <div class="row"><label>任务链</label><div id="modalTasksContainer"></div><button type="button" id="modalAddTask">添加任务</button></div>
+        <div class="row">
+          <label>行业类型</label>
+          <span><label><input type="radio" name="modalIndustryType" value="playwright" checked> Playwright 任务链</label> &nbsp; <label><input type="radio" name="modalIndustryType" value="queue"> Queue 出站发送</label></span>
+        </div>
+        <div id="modalPlaywrightBlock">
+          <div class="row"><label>Notion Portal URL</label><input type="url" id="modalNotionUrl" placeholder="https://..."></div>
+          <div class="row"><label>每 N 次开启新会话（区间内随机次数）</label><span><input type="number" id="modalNewChatEveryRunsMin" min="0" value="1" style="width:4rem"> ～ <input type="number" id="modalNewChatEveryRunsMax" min="0" value="1" style="width:4rem"></span></div>
+          <div class="row"><label>每 M 次换模型（区间，0=不换）</label><span><input type="number" id="modalModelSwitchIntervalMin" min="0" value="0" style="width:4rem"> ～ <input type="number" id="modalModelSwitchIntervalMax" min="0" value="0" style="width:4rem"></span></div>
+          <div class="row"><label>时段内跑几轮任务链（0=一直跑）</label><input type="number" id="modalChainRunsPerSlot" min="0" value="0" style="width:4rem" placeholder="0"></div>
+          <div class="row"><label>任务链</label><div id="modalTasksContainer"></div><button type="button" id="modalAddTask">添加任务</button></div>
+        </div>
+        <div id="modalQueueBlock" style="display:none">
+          <div class="row"><label>Queue 数据库 URL</label><input type="url" id="modalQueueDatabaseUrl" placeholder="https://www.notion.so/..."></div>
+          <div class="row"><label>发件人库 URL</label><input type="url" id="modalSenderAccountsDatabaseUrl" placeholder="https://www.notion.so/..."></div>
+          <div class="row"><label>每批条数（10–30 建议）</label><input type="number" id="modalQueueBatchSize" min="1" max="100" value="20" style="width:4rem"></div>
+        </div>
         <div class="form-actions">
           <button type="button" id="modalSave" class="primary">保存</button>
           <button type="button" id="modalCancel">取消</button>
@@ -439,6 +487,16 @@ function getDashboardHtml(): string {
       document.getElementById('btnStart').disabled = status === 'running';
       document.getElementById('btnStop').disabled = status === 'idle';
     }
+    async function refreshQueueSenderStatus() {
+      try {
+        const { status } = await api('/api/queue-sender/status');
+        const el = document.getElementById('queueSenderStatusEl');
+        el.textContent = status === 'running' ? 'Queue Sender：运行中' : 'Queue Sender：已停止';
+        el.className = 'status ' + status;
+        document.getElementById('btnQueueSenderStart').disabled = status === 'running';
+        document.getElementById('btnQueueSenderStop').disabled = status === 'idle';
+      } catch (_) {}
+    }
 
     /** 重绘时间区间与行业列表，保持数据一致 */
     function syncScheduleUI() {
@@ -491,7 +549,7 @@ function getDashboardHtml(): string {
         selectEl.onchange = function() {
           if (selectEl.value !== NEW_INDUSTRY_VALUE) return;
           const newId = 'new_' + Date.now();
-          const newInd = { id: newId, notionUrl: '', newChatEveryRunsMin: 1, newChatEveryRunsMax: 1, modelSwitchIntervalMin: 0, modelSwitchIntervalMax: 0, chainRunsPerSlot: 0, tasks: [{ content: '', runCount: 1 }] };
+          const newInd = { id: newId, type: 'playwright', notionUrl: '', newChatEveryRunsMin: 1, newChatEveryRunsMax: 1, modelSwitchIntervalMin: 0, modelSwitchIntervalMax: 0, chainRunsPerSlot: 0, tasks: [{ content: '', runCount: 1 }] };
           schedule.industries.push(newInd);
           slot.industryId = newId;
           syncScheduleUI();
@@ -506,22 +564,25 @@ function getDashboardHtml(): string {
       };
     }
 
-    /** 行业主视图：仅列表行（id、URL 截断、编辑、删除） */
+    /** 行业主视图：类型 + id + 主 URL 截断 + 编辑、删除 */
     function renderIndustries(schedule) {
       const industries = schedule.industries || [];
       industriesContainer.innerHTML = '';
       industries.forEach((ind, indIdx) => {
+        const isQueue = ind.type === 'queue';
+        const typeLabel = isQueue ? 'Queue' : 'Playwright';
+        const mainUrl = isQueue ? (ind.queueDatabaseUrl || '') : (ind.notionUrl || '');
         const row = document.createElement('div');
         row.className = 'industry-row';
-        row.innerHTML = '<span class="id">' + escapeHtml(ind.id || '') + '</span>' +
-          '<span class="url" title="' + escapeAttr(ind.notionUrl || '') + '">' + escapeHtml(truncateUrl(ind.notionUrl)) + '</span>' +
+        row.innerHTML = '<span class="type">' + escapeHtml(typeLabel) + '</span><span class="id">' + escapeHtml(ind.id || '') + '</span>' +
+          '<span class="url" title="' + escapeAttr(mainUrl) + '">' + escapeHtml(truncateUrl(mainUrl)) + '</span>' +
           '<span class="actions"><button type="button" data-edit-industry>编辑</button><button type="button" class="danger" data-remove-industry>删除</button></span>';
         row.querySelector('[data-edit-industry]').onclick = () => openEditModal(indIdx);
         row.querySelector('[data-remove-industry]').onclick = () => removeIndustry(schedule, indIdx);
         industriesContainer.appendChild(row);
       });
       document.getElementById('btnAddIndustry').onclick = () => {
-        industries.push({ id: 'new_' + Date.now(), notionUrl: '', newChatEveryRunsMin: 1, newChatEveryRunsMax: 1, modelSwitchIntervalMin: 0, modelSwitchIntervalMax: 0, chainRunsPerSlot: 0, tasks: [{ content: '', runCount: 1 }] });
+        industries.push({ id: 'new_' + Date.now(), type: 'playwright', notionUrl: '', newChatEveryRunsMin: 1, newChatEveryRunsMax: 1, modelSwitchIntervalMin: 0, modelSwitchIntervalMax: 0, chainRunsPerSlot: 0, tasks: [{ content: '', runCount: 1 }] });
         syncScheduleUI();
         openEditModal(industries.length - 1);
       };
@@ -544,12 +605,22 @@ function getDashboardHtml(): string {
     /** 当前编辑的行业在 schedule.industries 中的下标，-1 表示未打开 */
     let editingIndustryIndex = -1;
 
+    function toggleModalIndustryType(isQueue) {
+      document.getElementById('modalPlaywrightBlock').style.display = isQueue ? 'none' : '';
+      document.getElementById('modalQueueBlock').style.display = isQueue ? '' : 'none';
+    }
+
     function openEditModal(indIdx) {
       if (!currentSchedule || indIdx < 0 || indIdx >= (currentSchedule.industries || []).length) return;
       editingIndustryIndex = indIdx;
       const ind = currentSchedule.industries[indIdx];
+      const isQueue = ind.type === 'queue';
       document.getElementById('industryModalTitle').textContent = ind.id ? ('编辑行业: ' + ind.id) : '新建行业';
       document.getElementById('modalIndustryId').value = ind.id || '';
+      const typeRadios = document.querySelectorAll('input[name="modalIndustryType"]');
+      typeRadios.forEach(r => { r.checked = (r.value === 'queue') === isQueue; });
+      toggleModalIndustryType(isQueue);
+      typeRadios.forEach(r => { r.onchange = () => toggleModalIndustryType(document.querySelector('input[name="modalIndustryType"]:checked').value === 'queue'); });
       document.getElementById('modalNotionUrl').value = ind.notionUrl || '';
       document.getElementById('modalNewChatEveryRunsMin').value = ind.newChatEveryRunsMin ?? 1;
       document.getElementById('modalNewChatEveryRunsMax').value = ind.newChatEveryRunsMax ?? 1;
@@ -557,9 +628,11 @@ function getDashboardHtml(): string {
       document.getElementById('modalModelSwitchIntervalMax').value = ind.modelSwitchIntervalMax ?? 0;
       const modalChainRunsEl = document.getElementById('modalChainRunsPerSlot');
       if (modalChainRunsEl) modalChainRunsEl.value = (ind.chainRunsPerSlot ?? 0);
+      document.getElementById('modalQueueDatabaseUrl').value = ind.queueDatabaseUrl || '';
+      document.getElementById('modalSenderAccountsDatabaseUrl').value = ind.senderAccountsDatabaseUrl || '';
+      document.getElementById('modalQueueBatchSize').value = (ind.batchSize ?? 20);
       const tasksContainer = document.getElementById('modalTasksContainer');
       tasksContainer.innerHTML = '';
-      /** 删除任务：只移除该行并 splice，不重填表单，避免清空用户已填未保存内容 */
       function removeTaskRow(row) {
         const rows = tasksContainer.querySelectorAll('.task-row');
         const idx = Array.from(rows).indexOf(row);
@@ -594,31 +667,40 @@ function getDashboardHtml(): string {
       const ind = currentSchedule.industries[editingIndustryIndex];
       const oldId = (ind && ind.id) || '';
       const newId = document.getElementById('modalIndustryId').value.trim() || 'unnamed';
-      const notionUrl = document.getElementById('modalNotionUrl').value.trim() || '';
-      const newChatEveryRunsMin = Number(document.getElementById('modalNewChatEveryRunsMin').value);
-      const newChatEveryRunsMax = Number(document.getElementById('modalNewChatEveryRunsMax').value);
-      const modelSwitchIntervalMin = Number(document.getElementById('modalModelSwitchIntervalMin').value);
-      const modelSwitchIntervalMax = Number(document.getElementById('modalModelSwitchIntervalMax').value);
-      const chainRunsPerSlotVal = Number(document.getElementById('modalChainRunsPerSlot')?.value ?? 0);
-      const tasks = [];
-      document.querySelectorAll('#modalTasksContainer .task-row').forEach(tr => {
-        const content = (tr.querySelector('[data-key="content"]') && tr.querySelector('[data-key="content"]').value) || '';
-        const runCount = Number(tr.querySelector('[data-key="runCount"]') && tr.querySelector('[data-key="runCount"]').value) || 1;
-        tasks.push({ content, runCount });
-      });
+      const isQueue = document.querySelector('input[name="modalIndustryType"]:checked')?.value === 'queue';
       ind.id = newId;
-      ind.notionUrl = notionUrl;
-      const nMin = Number.isInteger(newChatEveryRunsMin) && newChatEveryRunsMin >= 0 ? newChatEveryRunsMin : 1;
-      const nMax = Number.isInteger(newChatEveryRunsMax) && newChatEveryRunsMax >= 0 ? newChatEveryRunsMax : 1;
-      ind.newChatEveryRunsMin = Math.min(nMin, nMax);
-      ind.newChatEveryRunsMax = Math.max(nMin, nMax);
-      const mMin = Number.isInteger(modelSwitchIntervalMin) && modelSwitchIntervalMin >= 0 ? modelSwitchIntervalMin : 0;
-      const mMax = Number.isInteger(modelSwitchIntervalMax) && modelSwitchIntervalMax >= 0 ? modelSwitchIntervalMax : 0;
-      ind.modelSwitchIntervalMin = Math.min(mMin, mMax);
-      ind.modelSwitchIntervalMax = Math.max(mMin, mMax);
-      const cr = Number.isInteger(chainRunsPerSlotVal) && chainRunsPerSlotVal >= 0 ? chainRunsPerSlotVal : 0;
-      ind.chainRunsPerSlot = cr;
-      ind.tasks = tasks;
+      ind.type = isQueue ? 'queue' : 'playwright';
+      if (isQueue) {
+        ind.queueDatabaseUrl = document.getElementById('modalQueueDatabaseUrl').value.trim() || '';
+        ind.senderAccountsDatabaseUrl = document.getElementById('modalSenderAccountsDatabaseUrl').value.trim() || '';
+        const batchVal = Number(document.getElementById('modalQueueBatchSize').value);
+        ind.batchSize = (Number.isInteger(batchVal) && batchVal >= 1 && batchVal <= 100) ? batchVal : 20;
+      } else {
+        const notionUrl = document.getElementById('modalNotionUrl').value.trim() || '';
+        const newChatEveryRunsMin = Number(document.getElementById('modalNewChatEveryRunsMin').value);
+        const newChatEveryRunsMax = Number(document.getElementById('modalNewChatEveryRunsMax').value);
+        const modelSwitchIntervalMin = Number(document.getElementById('modalModelSwitchIntervalMin').value);
+        const modelSwitchIntervalMax = Number(document.getElementById('modalModelSwitchIntervalMax').value);
+        const chainRunsPerSlotVal = Number(document.getElementById('modalChainRunsPerSlot')?.value ?? 0);
+        const tasks = [];
+        document.querySelectorAll('#modalTasksContainer .task-row').forEach(tr => {
+          const content = (tr.querySelector('[data-key="content"]') && tr.querySelector('[data-key="content"]').value) || '';
+          const runCount = Number(tr.querySelector('[data-key="runCount"]') && tr.querySelector('[data-key="runCount"]').value) || 1;
+          tasks.push({ content, runCount });
+        });
+        ind.notionUrl = notionUrl;
+        const nMin = Number.isInteger(newChatEveryRunsMin) && newChatEveryRunsMin >= 0 ? newChatEveryRunsMin : 1;
+        const nMax = Number.isInteger(newChatEveryRunsMax) && newChatEveryRunsMax >= 0 ? newChatEveryRunsMax : 1;
+        ind.newChatEveryRunsMin = Math.min(nMin, nMax);
+        ind.newChatEveryRunsMax = Math.max(nMin, nMax);
+        const mMin = Number.isInteger(modelSwitchIntervalMin) && modelSwitchIntervalMin >= 0 ? modelSwitchIntervalMin : 0;
+        const mMax = Number.isInteger(modelSwitchIntervalMax) && modelSwitchIntervalMax >= 0 ? modelSwitchIntervalMax : 0;
+        ind.modelSwitchIntervalMin = Math.min(mMin, mMax);
+        ind.modelSwitchIntervalMax = Math.max(mMin, mMax);
+        const cr = Number.isInteger(chainRunsPerSlotVal) && chainRunsPerSlotVal >= 0 ? chainRunsPerSlotVal : 0;
+        ind.chainRunsPerSlot = cr;
+        ind.tasks = tasks;
+      }
       if (oldId !== newId) {
         (currentSchedule.timeSlots || []).forEach(slot => {
           if (slot.industryId === oldId) slot.industryId = newId;
@@ -713,6 +795,22 @@ function getDashboardHtml(): string {
         await refreshLogs();
       } catch (e) { showMsg(e instanceof Error ? e.message : String(e), true); }
     };
+    document.getElementById('btnQueueSenderStart').onclick = async () => {
+      showMsg('');
+      try {
+        await api('/api/queue-sender/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+        await refreshQueueSenderStatus();
+        await refreshLogs();
+      } catch (e) { showMsg(e instanceof Error ? e.message : String(e), true); }
+    };
+    document.getElementById('btnQueueSenderStop').onclick = async () => {
+      showMsg('');
+      try {
+        await api('/api/queue-sender/stop', { method: 'POST' });
+        await refreshQueueSenderStatus();
+        await refreshLogs();
+      } catch (e) { showMsg(e instanceof Error ? e.message : String(e), true); }
+    };
     document.getElementById('btnSave').onclick = async () => {
       showMsg('');
       try {
@@ -749,8 +847,10 @@ function getDashboardHtml(): string {
     function renderLogTabs() {
       logTabs.innerHTML = '';
       runs.forEach((r, i) => {
+        const kind = r.kind === 'queue-sender' ? 'Queue' : 'Playwright';
+        const label = r.endTime ? kind + ' #' + r.id + ' ' + new Date(r.startTime).toLocaleTimeString() : kind + ' #' + r.id + ' 运行中';
         const btn = document.createElement('button');
-        btn.textContent = r.endTime ? '运行 #' + r.id + ' (' + new Date(r.startTime).toLocaleTimeString() + ')' : '当前 #' + r.id;
+        btn.textContent = label;
         btn.onclick = () => { logContent.textContent = (r.lines || []).join('\\n') || '（无输出）'; logTabs.querySelectorAll('button').forEach(b => b.classList.remove('active')); btn.classList.add('active'); };
         logTabs.appendChild(btn);
         if (i === 0) { btn.click(); btn.classList.add('active'); }
@@ -766,8 +866,10 @@ function getDashboardHtml(): string {
     (async () => {
       await loadSchedule();
       await refreshStatus();
+      await refreshQueueSenderStatus();
       await refreshLogs();
       setInterval(refreshStatus, 3000);
+      setInterval(refreshQueueSenderStatus, 3000);
       setInterval(refreshLogs, 5000);
     })();
   </script>

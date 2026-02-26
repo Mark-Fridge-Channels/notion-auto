@@ -30,6 +30,11 @@ import { saveProgress } from "./progress.js";
 import { EXIT_RECOVERY_RESTART } from "./exit-codes.js";
 import type { ScheduleIndustry } from "./schedule.js";
 
+/** 当前行业是否为 Playwright 任务链（非 Queue 出站发送） */
+function isPlaywrightIndustry(ind: ScheduleIndustry): boolean {
+  return ind.type !== "queue";
+}
+
 /** 闭区间 [min, max] 内随机整数（含两端），用于间隔与 N/M 区间 */
 function randomIntInclusive(min: number, max: number): number {
   const lo = Math.min(min, max);
@@ -55,12 +60,18 @@ async function main(): Promise<void> {
     throw new Error("配置中时间区间列表为空，无法运行");
   }
 
-  // 等待直至当前时间落入某区间（不先开浏览器）
+  // 等待直至当前时间落入某区间且为 Playwright 行业（Queue 时段由 Queue Sender 进程处理，本进程跳过）
   logger.info("正在根据当前时间解析运行区间…");
   let currentIndustry = getIndustryForNow(schedule);
   if (currentIndustry == null) {
     logger.info("当前时间未落入任何配置区间，等待中…");
     currentIndustry = await waitUntilInSlot(schedule);
+  }
+  while (!isPlaywrightIndustry(currentIndustry)) {
+    logger.info("当前时段为 Queue 行业，Playwright 不执行，等待…");
+    await sleep(60_000);
+    currentIndustry = getIndustryForNow(schedule);
+    if (currentIndustry == null) currentIndustry = await waitUntilInSlot(schedule);
   }
   logger.info(`当前行业: ${currentIndustry.id}, URL: ${currentIndustry.notionUrl}`);
 
@@ -119,6 +130,11 @@ async function main(): Promise<void> {
       if (industryNow.id !== currentIndustry.id) {
         logger.info(`时间区间切换: ${currentIndustry.id} → ${industryNow.id}`);
         currentIndustry = industryNow;
+        if (!isPlaywrightIndustry(currentIndustry)) {
+          logger.info("当前时段为 Queue 行业，Playwright 不执行，等待…");
+          await sleep(60_000);
+          continue;
+        }
         if (!currentIndustry.notionUrl?.trim()) {
           throw new Error(`行业 "${currentIndustry.id}" 的 Notion Portal URL 未配置，请在 Dashboard 中填写`);
         }
