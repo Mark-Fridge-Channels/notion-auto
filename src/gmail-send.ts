@@ -90,6 +90,31 @@ function buildFollowupMime(
 }
 
 /**
+ * 在同一 thread 内发送回复，仅传 threadId，不设 In-Reply-To/References（首版简化）。
+ * Gmail 会根据 threadId 将邮件归入同一会话。
+ */
+export async function sendInThread(
+  gmail: import("googleapis").gmail_v1.Gmail,
+  userId: string,
+  threadId: string,
+  from: string,
+  to: string,
+  subject: string,
+  htmlBody: string,
+): Promise<{ messageId: string; threadId: string }> {
+  const mime = buildCold1Mime(from, to, subject, htmlBody);
+  const raw = toBase64Url(mime);
+  const res = await gmail.users.messages.send({
+    userId,
+    requestBody: { raw, threadId },
+  });
+  const messageId = res.data.id;
+  const returnedThreadId = res.data.threadId;
+  if (!messageId || !returnedThreadId) throw new Error("Gmail API 未返回 message id 或 threadId");
+  return { messageId, threadId: returnedThreadId };
+}
+
+/**
  * Followup：在同一 thread 内发送；需传入 threadId 与 Message ID Last（用于 In-Reply-To/References）。
  */
 export async function sendFollowup(

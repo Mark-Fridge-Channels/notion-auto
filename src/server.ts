@@ -10,15 +10,31 @@ import { spawn } from "node:child_process";
 import { resolve, relative } from "node:path";
 import * as runner from "./dashboard-runner.js";
 import * as queueSenderRunner from "./dashboard-queue-sender-runner.js";
+import * as inboundListenerRunner from "./dashboard-inbound-listener-runner.js";
 import { loadSchedule, saveSchedule, getSchedulePath, mergeSchedule, validateSchedule } from "./schedule.js";
+import {
+  getInboundListenerConfigPath,
+  loadInboundListenerConfigOrDefault,
+  saveInboundListenerConfig,
+  validateInboundListenerConfig,
+} from "./inbound-listener-config.js";
+import {
+  loadReplyTasksConfigOrDefault,
+  saveReplyTasksConfig,
+  validateReplyTasksConfig,
+} from "./reply-tasks-config.js";
+import { listReplyTasks, getReplyTaskSendContext } from "./notion-reply-tasks.js";
+import { sendOneReplyTask, sendBatchReplyTasks } from "./reply-tasks-send.js";
+import { Client as NotionClient } from "@notionhq/client";
 import { logger } from "./logger.js";
 
 const PORT = 9001;
 const HOST = "127.0.0.1";
 
-/** 进程退出时先停止由 Dashboard 启动的子进程，避免残留 Queue Sender / Playwright 进程 */
+/** 进程退出时先停止由 Dashboard 启动的子进程，避免残留 Queue Sender / Inbound Listener / Playwright 进程 */
 function shutdown(): void {
   queueSenderRunner.stopQueueSender();
+  inboundListenerRunner.stopInboundListener();
   runner.stop();
   process.exit(0);
 }
@@ -38,6 +54,16 @@ function resolveConfigPath(configured: string | undefined): string {
   return resolved;
 }
 
+/** Inbound Listener 配置路径：防路径穿越，非法则用默认路径 */
+function resolveInboundListenerConfigPath(configured: string | undefined): string {
+  const base = getInboundListenerConfigPath();
+  if (configured == null || configured.trim() === "") return base;
+  const resolved = resolve(process.cwd(), configured.trim());
+  const rel = relative(process.cwd(), resolved);
+  if (rel.startsWith("..") || rel.includes("..")) return base;
+  return resolved;
+}
+
 async function readJsonBody(req: import("node:http").IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = [];
   for await (const chunk of req) chunks.push(chunk);
@@ -49,6 +75,13 @@ async function readJsonBody(req: import("node:http").IncomingMessage): Promise<u
 function sendJson(res: import("node:http").ServerResponse, status: number, data: unknown): void {
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
   res.end(JSON.stringify(data));
+}
+
+/** Notion API 的「未找到」类错误（404 / object_not_found），用于 Reply Tasks API 返回 404 而非 500 */
+function isNotionNotFoundError(e: unknown): boolean {
+  const msg = e instanceof Error ? e.message : String(e);
+  const code = e && typeof e === "object" && "code" in e ? (e as { code: string }).code : "";
+  return /could not find|object_not_found|not found|404/i.test(msg) || code === "object_not_found";
 }
 
 function sendHtml(res: import("node:http").ServerResponse, html: string): void {
@@ -131,6 +164,7 @@ function runNpmInstall(cwd: string): Promise<{ exitCode: number; stdout: string;
  */
 function spawnNewServerAndExit(): void {
   queueSenderRunner.stopQueueSender();
+  inboundListenerRunner.stopInboundListener();
   runner.stop();
   const env = { ...process.env, NOTION_AUTO_RESTART: "1" };
   const cwd = process.cwd();
@@ -154,6 +188,7 @@ async function handleRequest(
   const url = req.url ?? "/";
   const method = req.method ?? "GET";
   const path = url.split("?")[0];
+  const query = path !== url ? new URLSearchParams(url.slice(url.indexOf("?") + 1)) : new URLSearchParams();
 
   try {
     if (path === "/" && method === "GET") {
@@ -199,7 +234,8 @@ async function handleRequest(
     if (path === "/api/logs" && method === "GET") {
       const playRuns = runner.getRecentRunLogs(10).map((r) => ({ kind: "playwright" as const, ...r }));
       const queueRuns = queueSenderRunner.getQueueSenderRunLogs(10).map((r) => ({ kind: "queue-sender" as const, ...r }));
-      const runs = [...playRuns, ...queueRuns].sort((a, b) => b.startTime - a.startTime).slice(0, 20);
+      const inboundRuns = inboundListenerRunner.getInboundListenerRunLogs(10).map((r) => ({ kind: "inbound-listener" as const, ...r }));
+      const runs = [...playRuns, ...queueRuns, ...inboundRuns].sort((a, b) => b.startTime - a.startTime).slice(0, 20);
       sendJson(res, 200, { runs });
       return;
     }
@@ -221,6 +257,164 @@ async function handleRequest(
       queueSenderRunner.stopQueueSender();
       res.writeHead(204);
       res.end();
+      return;
+    }
+    if (path === "/api/inbound-listener/config" && method === "GET") {
+      const config = await loadInboundListenerConfigOrDefault();
+      sendJson(res, 200, config);
+      return;
+    }
+    if (path === "/api/inbound-listener/config" && method === "POST") {
+      const body = await readJsonBody(req);
+      const config = validateInboundListenerConfig(body);
+      await saveInboundListenerConfig(config);
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    if (path === "/api/inbound-listener/status" && method === "GET") {
+      sendJson(res, 200, { status: inboundListenerRunner.getInboundListenerStatus() });
+      return;
+    }
+    if (path === "/api/inbound-listener/start" && method === "POST") {
+      if (inboundListenerRunner.getInboundListenerStatus() === "running") {
+        sendJson(res, 400, { error: "Inbound Listener 已在运行，请先停止" });
+        return;
+      }
+      const body = (await readJsonBody(req)) as { configPath?: string } | undefined;
+      const inboundConfigPath = resolveInboundListenerConfigPath(body?.configPath);
+      inboundListenerRunner.startInboundListener(inboundConfigPath);
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    if (path === "/api/inbound-listener/stop" && method === "POST") {
+      inboundListenerRunner.stopInboundListener();
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    if (path === "/api/reply-tasks/config" && method === "GET") {
+      const config = await loadReplyTasksConfigOrDefault();
+      sendJson(res, 200, config);
+      return;
+    }
+    if (path === "/api/reply-tasks/config" && method === "POST") {
+      const body = await readJsonBody(req);
+      const config = validateReplyTasksConfig(body);
+      await saveReplyTasksConfig(config);
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    if (path === "/api/reply-tasks/list" && method === "GET") {
+      const config = await loadReplyTasksConfigOrDefault();
+      const idx = config.selected_index >= 0 ? config.selected_index : 0;
+      const entry = config.entries[idx];
+      if (!entry) {
+        sendJson(res, 200, []);
+        return;
+      }
+      const token = process.env.NOTION_API_KEY;
+      if (!token?.trim()) {
+        sendJson(res, 500, { error: "缺少 NOTION_API_KEY" });
+        return;
+      }
+      try {
+        const notion = new NotionClient({ auth: token });
+        const tasks = await listReplyTasks(notion, entry.reply_tasks_db_id);
+        sendJson(res, 200, tasks);
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        const status = isNotionNotFoundError(e) ? 404 : 500;
+        sendJson(res, status, { error: message });
+      }
+      return;
+    }
+    if (path === "/api/reply-tasks/context" && method === "GET") {
+      const taskPageId = query.get("taskPageId")?.trim();
+      if (!taskPageId) {
+        sendJson(res, 400, { error: "缺少 taskPageId" });
+        return;
+      }
+      const config = await loadReplyTasksConfigOrDefault();
+      const idx = config.selected_index >= 0 ? config.selected_index : 0;
+      const entry = config.entries[idx];
+      if (!entry) {
+        sendJson(res, 400, { error: "未选择 Reply Tasks 配置项" });
+        return;
+      }
+      const token = process.env.NOTION_API_KEY;
+      if (!token?.trim()) {
+        sendJson(res, 500, { error: "缺少 NOTION_API_KEY" });
+        return;
+      }
+      try {
+        const notion = new NotionClient({ auth: token });
+        const ctx = await getReplyTaskSendContext(notion, taskPageId);
+        sendJson(res, 200, {
+          suggestedReply: ctx.suggestedReply,
+          lastInboundBodyPlain: ctx.lastInboundBodyPlain ?? "",
+          to: ctx.to,
+          subject: ctx.subject,
+        });
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        const status = isNotionNotFoundError(e) ? 404 : 500;
+        sendJson(res, status, { error: message });
+      }
+      return;
+    }
+    if (path === "/api/reply-tasks/send" && method === "POST") {
+      const body = (await readJsonBody(req)) as { taskPageId: string; bodyHtml?: string } | undefined;
+      const taskPageId = body?.taskPageId?.trim();
+      if (!taskPageId) {
+        sendJson(res, 400, { error: "缺少 taskPageId" });
+        return;
+      }
+      const config = await loadReplyTasksConfigOrDefault();
+      const idx = config.selected_index >= 0 ? config.selected_index : 0;
+      const entry = config.entries[idx];
+      if (!entry) {
+        sendJson(res, 400, { error: "未选择 Reply Tasks 配置项" });
+        return;
+      }
+      const token = process.env.NOTION_API_KEY;
+      if (!token?.trim()) {
+        sendJson(res, 500, { error: "缺少 NOTION_API_KEY" });
+        return;
+      }
+      try {
+        const notion = new NotionClient({ auth: token });
+        const result = await sendOneReplyTask(
+          notion,
+          taskPageId,
+          entry.sender_accounts_database_url,
+          body?.bodyHtml,
+        );
+        sendJson(res, 200, result);
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        const status = isNotionNotFoundError(e) ? 404 : 500;
+        sendJson(res, status, { error: message });
+      }
+      return;
+    }
+    if (path === "/api/reply-tasks/send-batch" && method === "POST") {
+      const token = process.env.NOTION_API_KEY;
+      if (!token?.trim()) {
+        sendJson(res, 500, { error: "缺少 NOTION_API_KEY" });
+        return;
+      }
+      try {
+        const notion = new NotionClient({ auth: token });
+        const batchResult = await sendBatchReplyTasks(notion);
+        sendJson(res, 200, batchResult);
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        const status = isNotionNotFoundError(e) ? 404 : 500;
+        sendJson(res, status, { error: message });
+      }
       return;
     }
     if (path === "/api/pull-and-restart" && method === "POST") {
@@ -324,18 +518,29 @@ function getDashboardHtml(): string {
     .industry-row .id { font-weight: 600; min-width: 5rem; }
     .industry-row .url { flex: 1; min-width: 0; color: #666; font-size: 0.85rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .industry-row .actions { display: flex; gap: 0.35rem; flex-shrink: 0; }
+    .industry-row.selected { background: #e8f4fd; border-left: 3px solid #0d6efd; }
     .modal-overlay { display: none; position: fixed; inset: 0; padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); background: rgba(0,0,0,.4); z-index: 100; align-items: center; justify-content: center; overflow-y: auto; }
     .modal-overlay.visible { display: flex; }
     .modal-box { background: #fff; border-radius: 8px; padding: 1.25rem; min-width: 280px; max-width: min(90vw, 360px); max-height: 85vh; overflow-y: auto; box-shadow: 0 4px 20px rgba(0,0,0,.15); margin: auto; }
     .modal-box h3 { margin: 0 0 1rem; font-size: 1rem; }
     .modal-box .form-actions { margin-top: 1rem; display: flex; gap: 0.5rem; flex-wrap: wrap; }
     .modal-box .form-actions button { min-height: 44px; }
+    .modal-box--wide { max-width: min(90vw, 720px); }
+    .reply-tasks-detail-text, .reply-tasks-detail-pre, .reply-tasks-inbound-pre { margin: 0; padding: 0.5rem; background: #f8f9fa; border: 1px solid #eee; border-radius: 6px; font-size: 0.875rem; white-space: pre-wrap; word-break: break-word; max-height: 200px; overflow-y: auto; }
+    .reply-tasks-detail-pre, .reply-tasks-inbound-pre { font-family: ui-monospace, monospace; }
     .task-row textarea { flex: 1; min-width: 0; }
     .logs-card { grid-column: 1 / -1; }
     .logs { background: #1e1e1e; color: #d4d4d4; padding: 1rem; border-radius: 6px; font-family: ui-monospace, monospace; font-size: 12px; white-space: pre-wrap; max-height: 380px; overflow-y: auto; -webkit-overflow-scrolling: touch; }
     .log-tabs { margin-bottom: 0.5rem; display: flex; flex-wrap: wrap; gap: 0.35rem; }
     .log-tabs button { min-height: 36px; padding: 0.35rem 0.65rem; border-radius: 4px; border: 1px solid #ddd; background: #fff; cursor: pointer; font-size: 0.8rem; touch-action: manipulation; }
     .log-tabs button.active { background: #0d6efd; color: #fff; border-color: #0d6efd; }
+    /* Dashboard 三 Tab：导航与 panel 显隐 */
+    .tab-nav { display: flex; flex-wrap: wrap; gap: 0.35rem; margin-bottom: 1rem; }
+    .tab-nav button { min-height: 36px; padding: 0.35rem 0.75rem; border-radius: 6px; border: 1px solid #ddd; background: #fff; cursor: pointer; font-size: 0.875rem; touch-action: manipulation; }
+    .tab-nav button:hover { background: #f0f0f0; }
+    .tab-nav button.active { background: #0d6efd; color: #fff; border-color: #0d6efd; }
+    .tab-panel { display: none; }
+    .tab-panel.active { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
     #msg { margin-top: 0.5rem; font-size: 0.875rem; min-height: 1.25em; word-break: break-word; }
     @media (max-width: 768px) {
       body { padding: 0.75rem; }
@@ -343,6 +548,7 @@ function getDashboardHtml(): string {
       .header .actions { width: 100%; }
       .header .actions button { flex: 1; min-width: 0; }
       .layout { grid-template-columns: 1fr; gap: 1rem; }
+      .tab-panel.active { grid-template-columns: 1fr; gap: 1rem; }
       .card { padding: 1rem; }
       .slot-row { flex-wrap: wrap; }
       .slot-row select { max-width: none; }
@@ -357,6 +563,7 @@ function getDashboardHtml(): string {
       .industry-row .url { white-space: normal; }
     }
   </style>
+  <link href="https://cdn.quilljs.com/1.3.7/quill.snow.css" rel="stylesheet">
 </head>
 <body>
   <header class="header">
@@ -364,6 +571,7 @@ function getDashboardHtml(): string {
       <h1>${pageTitle}</h1>
       <div id="statusEl" class="status" style="margin-top:0.5rem">加载中…</div>
       <div id="queueSenderStatusEl" class="status" style="margin-top:0.25rem;font-size:0.9em">Queue Sender：—</div>
+      <div id="inboundListenerStatusEl" class="status" style="margin-top:0.25rem;font-size:0.9em">Inbound Listener：—</div>
     </div>
     <div>
       <div class="actions">
@@ -371,6 +579,8 @@ function getDashboardHtml(): string {
         <button type="button" id="btnStop" class="danger">停止</button>
         <button type="button" id="btnQueueSenderStart" class="primary">启动 Queue Sender</button>
         <button type="button" id="btnQueueSenderStop" class="danger">停止 Queue Sender</button>
+        <button type="button" id="btnInboundListenerStart" class="primary">启动 Inbound Listener</button>
+        <button type="button" id="btnInboundListenerStop" class="danger">停止 Inbound Listener</button>
         <button type="button" id="btnSave">保存配置</button>
         <button type="button" id="btnPullRestart">拉取并重启</button>
       </div>
@@ -378,7 +588,13 @@ function getDashboardHtml(): string {
     </div>
   </header>
 
-  <div class="layout">
+  <nav class="tab-nav" id="dashboardTabNav" aria-label="Dashboard 分区">
+    <button type="button" class="active" data-tab="main">主视图</button>
+    <button type="button" data-tab="reply-tasks">Reply Tasks</button>
+    <button type="button" data-tab="inbound">Inbound Listener</button>
+  </nav>
+
+  <div id="tab-main" class="tab-panel active">
     <div class="card">
       <h2>全局设置</h2>
       <div class="row">
@@ -409,6 +625,85 @@ function getDashboardHtml(): string {
       <div id="industriesContainer" class="industry-list"></div>
       <button type="button" id="btnAddIndustry" class="primary" style="margin-top:0.5rem">添加行业</button>
     </div>
+    <div class="card logs-card" style="grid-column: 1 / -1;">
+      <h2>最近运行日志</h2>
+      <div class="log-tabs" id="logTabs"></div>
+      <div id="logContent" class="logs">（选择一次运行查看）</div>
+    </div>
+  </div>
+  <div id="tab-inbound" class="tab-panel">
+    <div class="card" style="grid-column: 1 / -1;">
+      <h2>Inbound Listener 配置 <span class="hint">写入 inbound-listener.json，无文件时保存即创建</span></h2>
+      <div class="row">
+        <label>轮询间隔（秒）<span class="hint">默认 120，不小于 10</span></label>
+        <input id="inboundPollInterval" type="number" min="10" placeholder="120" style="width:6rem">
+      </div>
+      <div class="row">
+        <label>Body Plain 最大字符数 <span class="hint">超长保留开头+结尾，默认 40000</span></label>
+        <input id="inboundBodyPlainMaxChars" type="number" min="1000" placeholder="40000" style="width:8rem">
+      </div>
+      <h3 style="margin-top:1rem;font-size:1rem">监听组</h3>
+      <div id="inboundListenerGroupsContainer" class="industry-list"></div>
+      <button type="button" id="btnAddInboundGroup" class="primary" style="margin-top:0.5rem">添加一组</button>
+      <button type="button" id="btnSaveInboundConfig" class="primary" style="margin-left:0.5rem">保存 Inbound Listener 配置</button>
+    </div>
+  </div>
+  <div id="tab-reply-tasks" class="tab-panel">
+    <div class="card" style="grid-column: 1 / -1;">
+      <h2>Reply Tasks 配置 <span class="hint">写入 reply-tasks.json，切换后加载 Task 列表</span></h2>
+      <div id="replyTasksEntriesContainer" class="industry-list"></div>
+      <button type="button" id="btnAddReplyTasksEntry" class="primary" style="margin-top:0.5rem">添加一条</button>
+      <button type="button" id="btnSaveReplyTasksConfig" class="primary" style="margin-left:0.5rem">保存 Reply Tasks 配置</button>
+      <h3 style="margin-top:1rem;font-size:1rem">当前库 Task 列表</h3>
+      <button type="button" id="btnLoadReplyTasksList" class="primary" style="margin-bottom:0.5rem">加载 Task 列表</button>
+      <button type="button" id="btnSendBatchReplyTasks" style="margin-left:0.5rem">批量发送未完成</button>
+      <div id="replyTasksListContainer" class="industry-list" style="max-height:320px;overflow-y:auto"></div>
+    </div>
+  </div>
+  <div id="inboundListenerGroupModal" class="modal-overlay">
+      <div class="modal-box">
+        <h3>编辑监听组</h3>
+        <div class="row"><label>📥 Inbound Messages 数据库 ID 或 URL</label><input type="text" id="modalInboundImDbId" placeholder="32位hex或Notion URL"></div>
+        <div class="row"><label>📬 Touchpoints 数据库 ID 或 URL</label><input type="text" id="modalInboundTouchpointsDbId" placeholder="与 Queue 表同一张"></div>
+        <div class="row"><label>发件人库 URL</label><input type="url" id="modalInboundSenderAccountsUrl" placeholder="https://www.notion.so/..."></div>
+        <div class="row"><label>Mailboxes（发件人库 Email，每行一个）</label><textarea id="modalInboundMailboxes" rows="4" placeholder="sender1@example.com"></textarea></div>
+        <div class="form-actions">
+          <button type="button" id="modalInboundGroupSave" class="primary">保存</button>
+          <button type="button" id="modalInboundGroupCancel">取消</button>
+        </div>
+      </div>
+    </div>
+  <div id="replyTasksEntryModal" class="modal-overlay">
+      <div class="modal-box">
+        <h3>编辑 Reply Tasks 配置</h3>
+        <div class="row"><label>Reply Tasks 数据库 ID 或 URL</label><input type="text" id="modalReplyTasksDbId" placeholder="32位hex或Notion URL"></div>
+        <div class="row"><label>发件人库 URL</label><input type="url" id="modalReplyTasksSenderUrl" placeholder="https://www.notion.so/..."></div>
+        <div class="form-actions">
+          <button type="button" id="modalReplyTasksEntrySave" class="primary">保存</button>
+          <button type="button" id="modalReplyTasksEntryCancel">取消</button>
+        </div>
+      </div>
+    </div>
+    <div id="replyTasksDetailModal" class="modal-overlay">
+      <div class="modal-box">
+        <h3>Task 详情</h3>
+        <div class="row"><label>Task Summary</label><div id="replyTasksDetailSummary" class="reply-tasks-detail-text"></div></div>
+        <div class="row"><label>Status</label><span id="replyTasksDetailStatus" class="hint"></span></div>
+        <div class="row"><label>Suggested Reply</label><pre id="replyTasksDetailSuggestedReply" class="reply-tasks-detail-pre"></pre></div>
+        <div class="form-actions"><button type="button" id="replyTasksDetailClose" class="primary">关闭</button></div>
+      </div>
+    </div>
+    <div id="replyTasksSendModal" class="modal-overlay">
+      <div class="modal-box modal-box--wide">
+        <h3>发送回复（可编辑正文）</h3>
+        <div class="row"><label>对方上一条回复</label><pre id="replyTasksLastInboundEl" class="reply-tasks-inbound-pre"></pre></div>
+        <div class="row"><label>正文（富文本）</label><div id="replyTasksBodyEditor" style="min-height:200px;background:#fff"></div></div>
+        <div class="form-actions">
+          <button type="button" id="modalReplyTasksSendConfirm" class="primary">发送</button>
+          <button type="button" id="modalReplyTasksSendCancel">取消</button>
+        </div>
+      </div>
+    </div>
     <div id="industryModal" class="modal-overlay">
       <div class="modal-box">
         <h3 id="industryModalTitle">编辑行业</h3>
@@ -435,13 +730,8 @@ function getDashboardHtml(): string {
         </div>
       </div>
     </div>
-    <div class="card logs-card">
-      <h2>最近运行日志</h2>
-      <div class="log-tabs" id="logTabs"></div>
-      <div id="logContent" class="logs">（选择一次运行查看）</div>
-    </div>
-  </div>
 
+  <script src="https://cdn.quilljs.com/1.3.7/quill.min.js"></script>
   <script>
     const statusEl = document.getElementById('statusEl');
     const msgEl = document.getElementById('msg');
@@ -451,8 +741,32 @@ function getDashboardHtml(): string {
     const logTabs = document.getElementById('logTabs');
     const logContent = document.getElementById('logContent');
 
+    /** Dashboard 三 Tab 切换：仅显隐 panel，不重绑事件 */
+    (function initDashboardTabs() {
+      const nav = document.getElementById('dashboardTabNav');
+      const panels = document.querySelectorAll('.tab-panel');
+      if (!nav || !panels.length) return;
+      nav.querySelectorAll('button[data-tab]').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          const tab = btn.getAttribute('data-tab');
+          if (!tab) return;
+          nav.querySelectorAll('button[data-tab]').forEach(function (b) { b.classList.remove('active'); });
+          panels.forEach(function (p) { p.classList.remove('active'); });
+          btn.classList.add('active');
+          const panel = document.getElementById('tab-' + tab);
+          if (panel) panel.classList.add('active');
+        });
+      });
+    })();
+
     /** 当前页使用的 schedule，行业数据以内存为准，列表仅展示 */
     let currentSchedule = null;
+    /** Inbound Listener 配置，以内存为准 */
+    let currentInboundConfig = null;
+    /** Reply Tasks 配置，以内存为准 */
+    let currentReplyTasksConfig = null;
+    /** 单条发送时暂存的 taskPageId */
+    let replyTasksSendTaskPageId = null;
 
     function showMsg(text, isError) {
       msgEl.textContent = text || '';
@@ -497,6 +811,234 @@ function getDashboardHtml(): string {
         document.getElementById('btnQueueSenderStop').disabled = status === 'idle';
       } catch (_) {}
     }
+    async function refreshInboundListenerStatus() {
+      try {
+        const { status } = await api('/api/inbound-listener/status');
+        const el = document.getElementById('inboundListenerStatusEl');
+        el.textContent = status === 'running' ? 'Inbound Listener：运行中' : 'Inbound Listener：已停止';
+        el.className = 'status ' + status;
+        document.getElementById('btnInboundListenerStart').disabled = status === 'running';
+        document.getElementById('btnInboundListenerStop').disabled = status === 'idle';
+      } catch (_) {}
+    }
+
+    let editingInboundGroupIndex = -1;
+    async function loadInboundListenerConfig() {
+      const c = await api('/api/inbound-listener/config');
+      currentInboundConfig = c;
+      document.getElementById('inboundPollInterval').value = c.poll_interval_seconds ?? 120;
+      document.getElementById('inboundBodyPlainMaxChars').value = c.body_plain_max_chars ?? 40000;
+      renderInboundListenerGroups();
+    }
+    function renderInboundListenerGroups() {
+      if (!currentInboundConfig || !currentInboundConfig.groups) return;
+      const container = document.getElementById('inboundListenerGroupsContainer');
+      container.innerHTML = '';
+      currentInboundConfig.groups.forEach((g, idx) => {
+        const row = document.createElement('div');
+        row.className = 'industry-row';
+        const mailboxesPreview = (g.mailboxes || []).length ? (g.mailboxes.length + ' 个邮箱') : '—';
+        row.innerHTML = '<span class="url" title="' + escapeAttr(g.inbound_messages_db_id || '') + '">' + escapeHtml(truncateUrl(g.inbound_messages_db_id)) + '</span>' +
+          '<span class="hint">' + mailboxesPreview + '</span>' +
+          '<span class="actions"><button type="button" data-edit-inbound-group>编辑</button><button type="button" class="danger" data-remove-inbound-group>删除</button></span>';
+        row.querySelector('[data-edit-inbound-group]').onclick = () => openInboundGroupModal(idx);
+        row.querySelector('[data-remove-inbound-group]').onclick = () => { currentInboundConfig.groups.splice(idx, 1); renderInboundListenerGroups(); };
+        container.appendChild(row);
+      });
+      document.getElementById('btnAddInboundGroup').onclick = () => {
+        currentInboundConfig.groups.push({ inbound_messages_db_id: '', touchpoints_db_id: '', sender_accounts_database_url: '', mailboxes: [] });
+        openInboundGroupModal(currentInboundConfig.groups.length - 1);
+      };
+    }
+    function openInboundGroupModal(idx) {
+      editingInboundGroupIndex = idx;
+      const g = currentInboundConfig.groups[idx] || {};
+      document.getElementById('modalInboundImDbId').value = g.inbound_messages_db_id || '';
+      document.getElementById('modalInboundTouchpointsDbId').value = g.touchpoints_db_id || '';
+      document.getElementById('modalInboundSenderAccountsUrl').value = g.sender_accounts_database_url || '';
+      document.getElementById('modalInboundMailboxes').value = (g.mailboxes || []).join('\\n');
+      document.getElementById('inboundListenerGroupModal').classList.add('visible');
+    }
+    function closeInboundGroupModal() {
+      document.getElementById('inboundListenerGroupModal').classList.remove('visible');
+      editingInboundGroupIndex = -1;
+    }
+    document.getElementById('modalInboundGroupCancel').onclick = closeInboundGroupModal;
+    document.getElementById('modalInboundGroupSave').onclick = () => {
+      const g = currentInboundConfig.groups[editingInboundGroupIndex];
+      g.inbound_messages_db_id = document.getElementById('modalInboundImDbId').value.trim();
+      g.touchpoints_db_id = document.getElementById('modalInboundTouchpointsDbId').value.trim();
+      g.sender_accounts_database_url = document.getElementById('modalInboundSenderAccountsUrl').value.trim();
+      g.mailboxes = document.getElementById('modalInboundMailboxes').value.split(new RegExp('[\\n,]')).map((s) => s.trim()).filter(Boolean);
+      closeInboundGroupModal();
+      renderInboundListenerGroups();
+    };
+    document.getElementById('btnSaveInboundConfig').onclick = async () => {
+      showMsg('');
+      try {
+        const pollSec = parseInt(document.getElementById('inboundPollInterval').value, 10);
+        const bodyMax = parseInt(document.getElementById('inboundBodyPlainMaxChars').value, 10);
+        const config = {
+          groups: currentInboundConfig.groups,
+          poll_interval_seconds: Number.isInteger(pollSec) && pollSec >= 10 ? pollSec : 120,
+          body_plain_max_chars: Number.isInteger(bodyMax) && bodyMax >= 1000 ? bodyMax : 40000
+        };
+        await api('/api/inbound-listener/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(config) });
+        showMsg('Inbound Listener 配置已保存', false);
+        setTimeout(() => showMsg(''), 2000);
+      } catch (e) { showMsg(e instanceof Error ? e.message : String(e), true); }
+    };
+
+    let editingReplyTasksEntryIndex = -1;
+    async function loadReplyTasksConfig() {
+      const c = await api('/api/reply-tasks/config');
+      currentReplyTasksConfig = c;
+      renderReplyTasksEntries();
+    }
+    function renderReplyTasksEntries() {
+      if (!currentReplyTasksConfig || !currentReplyTasksConfig.entries) return;
+      const container = document.getElementById('replyTasksEntriesContainer');
+      container.innerHTML = '';
+      currentReplyTasksConfig.entries.forEach((e, idx) => {
+        const row = document.createElement('div');
+        row.className = 'industry-row';
+        if (currentReplyTasksConfig.selected_index === idx) row.classList.add('selected');
+        const curLabel = currentReplyTasksConfig.selected_index === idx ? ' [当前]' : '';
+        row.innerHTML = '<span class="url" title="' + escapeAttr(e.reply_tasks_db_id || '') + '">' + escapeHtml(truncateUrl(e.reply_tasks_db_id)) + curLabel + '</span>' +
+          '<span class="hint">' + escapeHtml(truncateUrl(e.sender_accounts_database_url || '')) + '</span>' +
+          '<span class="actions">' +
+          '<button type="button" data-reply-tasks-select>选中</button>' +
+          '<button type="button" data-edit-reply-tasks-entry>编辑</button>' +
+          '<button type="button" class="danger" data-remove-reply-tasks-entry>删除</button></span>';
+        row.querySelector('[data-reply-tasks-select]').onclick = () => { currentReplyTasksConfig.selected_index = idx; renderReplyTasksEntries(); };
+        row.querySelector('[data-edit-reply-tasks-entry]').onclick = () => openReplyTasksEntryModal(idx);
+        row.querySelector('[data-remove-reply-tasks-entry]').onclick = () => {
+          currentReplyTasksConfig.entries.splice(idx, 1);
+          if (currentReplyTasksConfig.selected_index >= currentReplyTasksConfig.entries.length)
+            currentReplyTasksConfig.selected_index = currentReplyTasksConfig.entries.length - 1;
+          renderReplyTasksEntries();
+        };
+        container.appendChild(row);
+      });
+      document.getElementById('btnAddReplyTasksEntry').onclick = () => {
+        currentReplyTasksConfig.entries.push({ reply_tasks_db_id: '', sender_accounts_database_url: '' });
+        openReplyTasksEntryModal(currentReplyTasksConfig.entries.length - 1);
+      };
+    }
+    function openReplyTasksEntryModal(idx) {
+      editingReplyTasksEntryIndex = idx;
+      const e = currentReplyTasksConfig.entries[idx] || {};
+      document.getElementById('modalReplyTasksDbId').value = e.reply_tasks_db_id || '';
+      document.getElementById('modalReplyTasksSenderUrl').value = e.sender_accounts_database_url || '';
+      document.getElementById('replyTasksEntryModal').classList.add('visible');
+    }
+    function closeReplyTasksEntryModal() {
+      document.getElementById('replyTasksEntryModal').classList.remove('visible');
+      editingReplyTasksEntryIndex = -1;
+    }
+    document.getElementById('modalReplyTasksEntryCancel').onclick = closeReplyTasksEntryModal;
+    document.getElementById('modalReplyTasksEntrySave').onclick = () => {
+      if (editingReplyTasksEntryIndex < 0 || !currentReplyTasksConfig.entries || editingReplyTasksEntryIndex >= currentReplyTasksConfig.entries.length) {
+        closeReplyTasksEntryModal();
+        return;
+      }
+      const e = currentReplyTasksConfig.entries[editingReplyTasksEntryIndex];
+      e.reply_tasks_db_id = document.getElementById('modalReplyTasksDbId').value.trim();
+      e.sender_accounts_database_url = document.getElementById('modalReplyTasksSenderUrl').value.trim();
+      closeReplyTasksEntryModal();
+      renderReplyTasksEntries();
+    };
+    document.getElementById('btnSaveReplyTasksConfig').onclick = async () => {
+      showMsg('');
+      try {
+        await api('/api/reply-tasks/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(currentReplyTasksConfig) });
+        showMsg('Reply Tasks 配置已保存', false);
+        setTimeout(() => showMsg(''), 2000);
+      } catch (err) { showMsg(err instanceof Error ? err.message : String(err), true); }
+    };
+    let replyTasksList = [];
+    document.getElementById('btnLoadReplyTasksList').onclick = async () => {
+      showMsg('');
+      try {
+        replyTasksList = await api('/api/reply-tasks/list') || [];
+        renderReplyTasksList();
+      } catch (err) { showMsg(err instanceof Error ? err.message : String(err), true); }
+    };
+    function renderReplyTasksList() {
+      const container = document.getElementById('replyTasksListContainer');
+      container.innerHTML = '';
+      replyTasksList.forEach((t) => {
+        const row = document.createElement('div');
+        row.className = 'industry-row';
+        const summary = (t.taskSummary || '').slice(0, 50) + ((t.taskSummary || '').length > 50 ? '…' : '');
+        const status = t.status || '—';
+        const snippet = (t.suggestedReply || '').slice(0, 80) + ((t.suggestedReply || '').length > 80 ? '…' : '');
+        const isDone = t.status === 'Done';
+        const sendBtnHtml = isDone ? '' : '<button type="button" data-reply-tasks-send-one>发送</button>';
+        row.innerHTML = '<span class="url" title="' + escapeAttr(t.taskSummary || '') + '">' + escapeHtml(summary) + '</span>' +
+          '<span class="hint">' + escapeHtml(status) + '</span>' +
+          '<span class="hint" style="max-width:12rem" title="' + escapeAttr(t.suggestedReply || '') + '">' + escapeHtml(snippet) + '</span>' +
+          '<span class="actions">' + sendBtnHtml + '<button type="button" data-reply-tasks-detail>详情</button></span>';
+        const sendBtn = row.querySelector('[data-reply-tasks-send-one]');
+        if (sendBtn) sendBtn.onclick = () => openReplyTasksSendModal(t);
+        row.querySelector('[data-reply-tasks-detail]').onclick = () => openReplyTasksDetailModal(t);
+        container.appendChild(row);
+      });
+      if (replyTasksList.length === 0) container.innerHTML = '<p class="hint">（无任务或请先选择配置并加载列表）</p>';
+    }
+    function openReplyTasksDetailModal(task) {
+      document.getElementById('replyTasksDetailSummary').textContent = task.taskSummary || '—';
+      document.getElementById('replyTasksDetailStatus').textContent = task.status || '—';
+      document.getElementById('replyTasksDetailSuggestedReply').textContent = task.suggestedReply || '';
+      document.getElementById('replyTasksDetailModal').classList.add('visible');
+    }
+    document.getElementById('replyTasksDetailClose').onclick = () => document.getElementById('replyTasksDetailModal').classList.remove('visible');
+    let replyTasksQuill = null;
+    async function openReplyTasksSendModal(task) {
+      replyTasksSendTaskPageId = task.pageId;
+      const lastInboundEl = document.getElementById('replyTasksLastInboundEl');
+      lastInboundEl.textContent = '加载中…';
+      document.getElementById('replyTasksSendModal').classList.add('visible');
+      try {
+        const ctx = await api('/api/reply-tasks/context?taskPageId=' + encodeURIComponent(task.pageId));
+        lastInboundEl.textContent = (ctx.lastInboundBodyPlain || '') || '（无）';
+        if (!replyTasksQuill) {
+          replyTasksQuill = new Quill('#replyTasksBodyEditor', { theme: 'snow', placeholder: '编辑回复正文…' });
+        }
+        replyTasksQuill.root.innerHTML = (ctx.suggestedReply || '').replace(new RegExp('\\n', 'g'), '<br>');
+      } catch (err) {
+        lastInboundEl.textContent = '加载失败: ' + (err instanceof Error ? err.message : String(err));
+        if (!replyTasksQuill) {
+          replyTasksQuill = new Quill('#replyTasksBodyEditor', { theme: 'snow', placeholder: '编辑回复正文…' });
+        }
+        replyTasksQuill.root.innerHTML = (task.suggestedReply || '').replace(new RegExp('\\n', 'g'), '<br>');
+      }
+    }
+    function closeReplyTasksSendModal() {
+      document.getElementById('replyTasksSendModal').classList.remove('visible');
+      replyTasksSendTaskPageId = null;
+    }
+    document.getElementById('modalReplyTasksSendCancel').onclick = closeReplyTasksSendModal;
+    document.getElementById('modalReplyTasksSendConfirm').onclick = async () => {
+      if (!replyTasksSendTaskPageId) return;
+      showMsg('');
+      try {
+        const bodyHtml = replyTasksQuill ? replyTasksQuill.root.innerHTML : '';
+        const body = { taskPageId: replyTasksSendTaskPageId, bodyHtml: bodyHtml || undefined };
+        const result = await api('/api/reply-tasks/send', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        closeReplyTasksSendModal();
+        if (result.ok) { showMsg('发送成功并已标为 Done', false); document.getElementById('btnLoadReplyTasksList').click(); }
+        else { showMsg(result.error || '发送失败', true); }
+      } catch (err) { showMsg(err instanceof Error ? err.message : String(err), true); }
+    };
+    document.getElementById('btnSendBatchReplyTasks').onclick = async () => {
+      showMsg('');
+      try {
+        const result = await api('/api/reply-tasks/send-batch', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+        showMsg('批量发送: 共 ' + result.total + '，成功 ' + result.ok + '，失败 ' + result.failed, result.failed > 0);
+        document.getElementById('btnLoadReplyTasksList').click();
+      } catch (err) { showMsg(err instanceof Error ? err.message : String(err), true); }
+    };
 
     /** 重绘时间区间与行业列表，保持数据一致 */
     function syncScheduleUI() {
@@ -811,6 +1353,22 @@ function getDashboardHtml(): string {
         await refreshLogs();
       } catch (e) { showMsg(e instanceof Error ? e.message : String(e), true); }
     };
+    document.getElementById('btnInboundListenerStart').onclick = async () => {
+      showMsg('');
+      try {
+        await api('/api/inbound-listener/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+        await refreshInboundListenerStatus();
+        await refreshLogs();
+      } catch (e) { showMsg(e instanceof Error ? e.message : String(e), true); }
+    };
+    document.getElementById('btnInboundListenerStop').onclick = async () => {
+      showMsg('');
+      try {
+        await api('/api/inbound-listener/stop', { method: 'POST' });
+        await refreshInboundListenerStatus();
+        await refreshLogs();
+      } catch (e) { showMsg(e instanceof Error ? e.message : String(e), true); }
+    };
     document.getElementById('btnSave').onclick = async () => {
       showMsg('');
       try {
@@ -847,7 +1405,7 @@ function getDashboardHtml(): string {
     function renderLogTabs() {
       logTabs.innerHTML = '';
       runs.forEach((r, i) => {
-        const kind = r.kind === 'queue-sender' ? 'Queue' : 'Playwright';
+        const kind = r.kind === 'queue-sender' ? 'Queue' : r.kind === 'inbound-listener' ? 'Inbound' : 'Playwright';
         const label = r.endTime ? kind + ' #' + r.id + ' ' + new Date(r.startTime).toLocaleTimeString() : kind + ' #' + r.id + ' 运行中';
         const btn = document.createElement('button');
         btn.textContent = label;
@@ -864,13 +1422,24 @@ function getDashboardHtml(): string {
     }
 
     (async () => {
-      await loadSchedule();
-      await refreshStatus();
-      await refreshQueueSenderStatus();
-      await refreshLogs();
-      setInterval(refreshStatus, 3000);
-      setInterval(refreshQueueSenderStatus, 3000);
-      setInterval(refreshLogs, 5000);
+      try {
+        await loadSchedule();
+        await loadInboundListenerConfig();
+        await loadReplyTasksConfig();
+        await refreshStatus();
+        await refreshQueueSenderStatus();
+        await refreshInboundListenerStatus();
+        await refreshLogs();
+        setInterval(refreshStatus, 3000);
+        setInterval(refreshQueueSenderStatus, 3000);
+        setInterval(refreshInboundListenerStatus, 3000);
+        setInterval(refreshLogs, 5000);
+      } catch (e) {
+        var errMsg = e instanceof Error ? e.message : String(e);
+        if (msgEl) msgEl.textContent = '初始化失败: ' + errMsg + ' — 若持续出现，请用无痕模式或禁用本页的浏览器扩展后刷新';
+        if (msgEl) msgEl.style.color = '#dc3545';
+        console.error('[Dashboard] init error', e);
+      }
     })();
   </script>
 </body>

@@ -1,6 +1,7 @@
 /**
  * Gmail OAuth2 授权页：本地起 HTTP 服务，用户点击「用 Google 登录授权」完成授权后，
  * 页面展示 refresh_token 供复制到发件人库的 password 列。
+ * 申请的权限：发信（gmail.send）+ 读邮件（gmail.readonly），同一 refresh_token 用于 Queue Sender 与 Inbound Listener。
  *
  * 使用方式：
  *   1. 在 Google Cloud 创建「Web 应用」类型 OAuth 客户端（桌面应用无法添加重定向 URI，会报「此应用的请求无效」），
@@ -19,7 +20,11 @@ import { google } from "googleapis";
 const PORT = 9010;
 const HOST = "127.0.0.1";
 const REDIRECT_URI = `http://${HOST}:${PORT}/callback`;
-const GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.send";
+/** 发信 + 读信（Inbound Listener 需读邮件），一次授权同时用于 Queue Sender 与 Inbound Listener */
+const GMAIL_SCOPES = [
+  "https://www.googleapis.com/auth/gmail.send",
+  "https://www.googleapis.com/auth/gmail.readonly",
+];
 
 function getOAuth2Client(): ReturnType<typeof google.auth.OAuth2.prototype.constructor> {
   const clientId = process.env.GMAIL_CLIENT_ID;
@@ -36,7 +41,7 @@ function pageIndex(authUrl: string): string {
 <head><meta charset="utf-8"><title>Gmail 授权</title></head>
 <body>
   <h1>Gmail 授权获取 refresh_token</h1>
-  <p>点击下方链接，使用 Google 账号登录并授权后，将跳回本页并显示 refresh_token。</p>
+  <p>点击下方链接，使用 Google 账号登录并授权。将申请「发送邮件」与「查看邮件」权限（Inbound Listener 需读邮件）。授权后跳回本页并显示 refresh_token。</p>
   <p><a href="${authUrl}">用 Google 账号登录授权</a></p>
   <p style="color:#666;font-size:14px;">可将得到的 refresh_token 复制到 Notion 发件人库对应行的 password 列。服务保持运行，可多次授权不同账号。</p>
   <p style="color:#b00;font-size:13px;">若点击授权后出现「此应用的请求无效」：请使用「Web 应用」类型 OAuth 客户端，并在控制台添加重定向 URI：<code>http://127.0.0.1:9010/callback</code>（桌面应用类型无法添加）。</p>
@@ -107,7 +112,7 @@ async function handleRequest(
     const authUrl = oauth2.generateAuthUrl({
       access_type: "offline",
       prompt: "consent",
-      scope: [GMAIL_SCOPE],
+      scope: GMAIL_SCOPES,
     });
     sendHtml(res, 200, pageIndex(authUrl));
     return;

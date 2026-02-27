@@ -1,0 +1,9 @@
+{
+  "entries": [
+    {
+      "reply_tasks_db_id": "YOUR_REPLY_TASKS_DATABASE_ID_OR_URL",
+      "sender_accounts_database_url": "https://www.notion.so/your-workspace/YOUR_SENDER_ACCOUNTS_DB_ID"
+    }
+  ],
+  "selected_index": 0
+}

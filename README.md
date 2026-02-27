@@ -68,6 +68,10 @@ npm run run -- --help
 
 **Queue Sender 与 NOTION_API_KEY**：出站发送依赖 Notion API 与 Gmail API。需配置环境变量 `NOTION_API_KEY`（Notion Integration Token，且 Integration 需加入 Queue 库与发件人库的 Collaborators）、`GMAIL_CLIENT_ID`、`GMAIL_CLIENT_SECRET`；发件人库中存各账号的 `Email` 与 `password`（作为 refresh_token 使用）。详见 issues/010 与 PLAN-014。
 
+**Inbound Listener**：常驻进程，轮询 Gmail 入站（INBOX、排除 SENT），幂等写入 📥 RE Inbound Messages，按 Thread ID 路由到 📬 Touchpoints（与 Queue 表同一张），并对 Unsubscribe/Hard Bounce 写回 Touchpoints 止损。由 Dashboard「启动 Inbound Listener」启停。配置可在 **Dashboard 页面「Inbound Listener 配置」卡片**里填写并保存，会写入项目目录下的 `inbound-listener.json`。Gmail 需 **读邮件**（`gmail.readonly`）：若此前仅授权发信，须重新跑授权脚本并勾选「查看邮件」，再更新发件人库 password 列。**📥 RE Inbound Messages 表的 Classification 列需包含：Human Reply、Auto Reply、Unsubscribe、Bounce Hard、Bounce Soft、Other**（见 issues/019）。**具体配置步骤见下方「Inbound Listener 配置说明」**。详见 issues/014 与 PLAN-016。
+
+**Reply Tasks**：在 Dashboard「Reply Tasks 配置」卡片中可管理多条 RE Reply Tasks 数据库 URL（及对应发件人库 URL），切换当前库后加载 Task 列表（**当前列表最多返回 100 条**，超出部分不展示）。支持单条发送（可编辑正文）与批量发送（Status ≠ Done）；发信使用 Touchpoint 的 Sender Account、入站 Thread ID，发送成功后将该 Task 的 Status 标为 Done。配置写入 `reply-tasks.json`，示例见 `reply-tasks.json.example`。详见 issues/018 与 PLAN-018。
+
 **发送节奏与节流**：发送节奏完全由程序控制，Notion 的 Planned Send At **不参与**是否可发判断；满足四 Flag、Subject/Body 等的 Pending 均进入待发，顺序与发送时机由程序决定。节流为全局配置、**按发送者**生效：两封间隔 3～5 分钟（可配）、每小时每发送者最多 10 封、每天每发送者最多 50 封（见 env `QUEUE_THROTTLE_*`）。无固定轮询间隔：有待发时按「下次可发时间」休眠，无待发时每 1 分钟拉一次 Notion。
 
 ### Gmail OAuth2 凭据（GMAIL_CLIENT_ID / GMAIL_CLIENT_SECRET）
@@ -93,6 +97,29 @@ npm run run -- --help
 2. 在项目目录执行：`npx tsx scripts/gmail-oauth-refresh-token.ts`。
 3. 在浏览器打开终端提示的地址（如 `http://127.0.0.1:9010`），点击「用 Google 账号登录授权」，完成登录与授权。
 4. 授权成功后页面会显示 **refresh_token**，请手动选中复制，粘贴到 Notion 发件人库对应行的 **password** 列。可多次点击「返回首页」再授权其他账号；用完后在终端按 Ctrl+C 停止脚本。
+
+### Inbound Listener 配置说明
+
+Inbound Listener 的作用是：**定时拉取 Gmail 收件箱里的新邮件，把每封邮件写成一条「入站消息」存进 Notion，并尽量关联到已有的 Touchpoint（联系人）；若识别到退订/退信，会更新对应 Touchpoint 不再发信。** 配置前需要 Notion 里已有三样东西（或你打算马上建好）：
+
+1. **📥 RE Inbound Messages**：一张数据库，用来存「收到的每封邮件」一条一行（标题、发件人、收件人、时间、正文摘要等）。  
+2. **📬 Touchpoints（和 Queue 同一张表）**：就是你出站发信用的那张「联系人/队列」表，每行有 Thread ID 等；入站邮件会按 Thread ID 找到对应行并关联。**收到回复时**程序会把该行的 **Email Status** 更新为 **Replied**，请确保该属性在 Notion 中有「Replied」选项（退订/退信时会设为 Stopped）。退订/退信时还会写 **Unsubscribe Flag**、**Bounce Flag** 等；若需 **Bounce Type**、**Last Inbound At**，请在表中预先加列，未加时程序仅打日志不中断。  
+3. **发件人库**：和 Queue Sender 共用的那张表，每行一个邮箱 + password 列（存该邮箱的 Gmail refresh_token）。  
+   - 用来**收信**的邮箱也要在这张表里有一行，且 **password 列必须是带「查看邮件」权限的 refresh_token**（若之前只授权了发信，需要重新跑一次授权脚本并勾选「查看邮件」，再更新该行的 password）。
+
+**在 Dashboard 里怎么配：**
+
+1. 打开 Dashboard（`npm run dashboard`），在页面上找到 **「Inbound Listener 配置」** 卡片。
+2. **轮询间隔**、**Body 最大字符数**：一般用默认即可（120 秒、40000）。
+3. 点 **「添加一组」**（或编辑已有的一组），在弹窗里填：
+   - **📥 Inbound Messages 数据库 ID 或 URL**：你的「入站消息」Notion 数据库的链接，或从链接里复制出的 32 位 ID。  
+   - **📬 Touchpoints 数据库 ID 或 URL**：和 Queue 出站用的是**同一张**联系人/队列表的链接或 ID。  
+   - **发件人库 URL**：和 Queue Sender 里「发件人库」填的**同一个** Notion 数据库链接。  
+   - **Mailboxes**：要监听哪几个邮箱的收件箱？每行写一个邮箱，且**必须是发件人库里某一行的 Email 列**（程序会用这个邮箱去发件人库查 refresh_token，再拉该邮箱的 Gmail 入站）。
+4. 点弹窗里的 **「保存」**，再点卡片上的 **「保存 Inbound Listener 配置」**。  
+   - 第一次保存会在项目目录下生成 `inbound-listener.json`；之后 Inbound Listener 进程就能读到配置。
+5. 回到页面上方，点 **「启动 Inbound Listener」**。  
+   - 若报错「未找到发件人凭据」，检查：发件人库里是否有 Mailboxes 里填的那几个邮箱、该行的 password 列是否已填 refresh_token、该 token 是否包含「查看邮件」权限。
 
 **自动恢复**：脚本异常退出时 Dashboard 会自动重启；脚本按当前时间对应行业从任务 1 开始（不恢复任务进度）。连续自动重启超过 5 次时会发一封告警邮件（需配置 SMTP 环境变量，见下）。
 

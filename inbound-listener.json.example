@@ -1,0 +1,12 @@
+{
+  "groups": [
+    {
+      "inbound_messages_db_id": "YOUR_IM_DATABASE_ID_OR_URL",
+      "touchpoints_db_id": "YOUR_TOUCHPOINTS_DATABASE_ID_OR_URL",
+      "sender_accounts_database_url": "https://www.notion.so/your-workspace/YOUR_SENDER_ACCOUNTS_DB_ID",
+      "mailboxes": ["sender1@example.com", "sender2@example.com"]
+    }
+  ],
+  "poll_interval_seconds": 120,
+  "body_plain_max_chars": 40000
+}
