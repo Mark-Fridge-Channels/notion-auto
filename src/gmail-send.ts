@@ -22,6 +22,18 @@ export function getGmailClient(refreshToken: string): { gmail: import("googleapi
   return { gmail, userId: "me" };
 }
 
+/**
+ * 纯文本转 HTML 正文：转义 & < >，换行 → <br>。
+ * 用于以 text/html 发送时的正文，使 \n 在邮件客户端显示为换行。Queue Sender 与 Reply Tasks 共用。
+ */
+export function plainToHtml(plain: string): string {
+  const escaped = String(plain)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+  return escaped.replace(/\n/g, "<br>\n");
+}
+
 /** 将 MIME 字符串转为 Gmail API 要求的 base64url（无填充，+ -> -, / -> _） */
 function toBase64Url(mime: string): string {
   const raw = Buffer.from(mime, "utf-8").toString("base64");

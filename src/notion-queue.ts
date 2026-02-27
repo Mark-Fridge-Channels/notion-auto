@@ -45,11 +45,23 @@ function getSelectOrStatusName(prop: unknown): string | null {
   return null;
 }
 
-/** 从 Notion 属性对象中取 rich_text 的 plain_text 拼接 */
+/** 从 Notion 属性对象中取 rich_text 的 plain_text 拼接（无分隔符，用于单行字段如 Subject、Sender Account）。 */
 function getRichText(prop: unknown): string {
   if (prop && typeof prop === "object" && "rich_text" in prop) {
     const arr = (prop as { rich_text: Array<{ plain_text?: string }> }).rich_text;
     if (Array.isArray(arr)) return arr.map((t) => t.plain_text ?? "").join("");
+  }
+  return "";
+}
+
+/**
+ * 从 Notion rich_text 取纯文本，段与段之间用换行连接。
+ * 用于多行文本属性（如 Email Body），避免 Notion 多 segment 时被 join("") 连成一行。
+ */
+function getRichTextWithNewlines(prop: unknown): string {
+  if (prop && typeof prop === "object" && "rich_text" in prop) {
+    const arr = (prop as { rich_text: Array<{ plain_text?: string }> }).rich_text;
+    if (Array.isArray(arr)) return arr.map((t) => t.plain_text ?? "").join("\n");
   }
   return "";
 }
@@ -113,7 +125,7 @@ function pageToQueueItem(
   const recipientProp = getRecipientPropertyName();
   const email = getEmailOrRichText(props[recipientProp]);
   const emailSubject = getRichText(props["Email Subject"]).trim();
-  const emailBody = getRichText(props["Email Body"]).trim();
+  const emailBody = getRichTextWithNewlines(props["Email Body"]).trim();
   const plannedSendAt = getDate(props["Planned Send At"]);
   const rawPlannedStart =
     (props["Planned Send At"] && typeof props["Planned Send At"] === "object" && "date" in props["Planned Send At"])

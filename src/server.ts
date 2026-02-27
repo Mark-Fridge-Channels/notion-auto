@@ -11,7 +11,15 @@ import { resolve, relative } from "node:path";
 import * as runner from "./dashboard-runner.js";
 import * as queueSenderRunner from "./dashboard-queue-sender-runner.js";
 import * as inboundListenerRunner from "./dashboard-inbound-listener-runner.js";
-import { loadSchedule, saveSchedule, getSchedulePath, mergeSchedule, validateSchedule } from "./schedule.js";
+import {
+  loadSchedule,
+  saveSchedule,
+  getSchedulePath,
+  mergeSchedule,
+  validateSchedule,
+  getDefaultSchedule,
+  type QueueThrottle,
+} from "./schedule.js";
 import {
   getInboundListenerConfigPath,
   loadInboundListenerConfigOrDefault,
@@ -215,6 +223,7 @@ async function handleRequest(
     }
     if (path === "/api/stop" && method === "POST") {
       runner.stop();
+      queueSenderRunner.stopQueueSender();
       res.writeHead(204);
       res.end();
       return;
@@ -226,7 +235,32 @@ async function handleRequest(
       }
       const body = (await readJsonBody(req)) as { configPath?: string } | undefined;
       const configPath = resolveConfigPath(body?.configPath);
+
+      const schedule = await loadSchedule(getSchedulePath());
+      const qt: QueueThrottle = schedule.queueThrottle ?? getDefaultSchedule().queueThrottle!;
+      const prevMin = process.env.QUEUE_THROTTLE_MIN_INTERVAL_MS;
+      const prevMax = process.env.QUEUE_THROTTLE_MAX_INTERVAL_MS;
+      const prevHour = process.env.QUEUE_THROTTLE_MAX_PER_HOUR;
+      const prevDay = process.env.QUEUE_THROTTLE_MAX_PER_DAY;
+      process.env.QUEUE_THROTTLE_MIN_INTERVAL_MS = String((qt.minIntervalSec ?? 180) * 1000);
+      process.env.QUEUE_THROTTLE_MAX_INTERVAL_MS = String((qt.maxIntervalSec ?? 300) * 1000);
+      process.env.QUEUE_THROTTLE_MAX_PER_HOUR = String(qt.maxPerHour ?? 10);
+      process.env.QUEUE_THROTTLE_MAX_PER_DAY = String(qt.maxPerDay ?? 50);
+
+      if (queueSenderRunner.getQueueSenderStatus() !== "running") {
+        queueSenderRunner.startQueueSender();
+      }
       runner.start({ configPath });
+
+      if (prevMin !== undefined) process.env.QUEUE_THROTTLE_MIN_INTERVAL_MS = prevMin;
+      else delete process.env.QUEUE_THROTTLE_MIN_INTERVAL_MS;
+      if (prevMax !== undefined) process.env.QUEUE_THROTTLE_MAX_INTERVAL_MS = prevMax;
+      else delete process.env.QUEUE_THROTTLE_MAX_INTERVAL_MS;
+      if (prevHour !== undefined) process.env.QUEUE_THROTTLE_MAX_PER_HOUR = prevHour;
+      else delete process.env.QUEUE_THROTTLE_MAX_PER_HOUR;
+      if (prevDay !== undefined) process.env.QUEUE_THROTTLE_MAX_PER_DAY = prevDay;
+      else delete process.env.QUEUE_THROTTLE_MAX_PER_DAY;
+
       res.writeHead(204);
       res.end();
       return;
@@ -290,6 +324,12 @@ async function handleRequest(
     }
     if (path === "/api/inbound-listener/stop" && method === "POST") {
       inboundListenerRunner.stopInboundListener();
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    if (path === "/api/inbound-listener/restart" && method === "POST") {
+      inboundListenerRunner.restartInboundListener(resolveInboundListenerConfigPath(undefined));
       res.writeHead(204);
       res.end();
       return;
@@ -577,10 +617,7 @@ function getDashboardHtml(): string {
       <div class="actions">
         <button type="button" id="btnStart" class="primary">启动</button>
         <button type="button" id="btnStop" class="danger">停止</button>
-        <button type="button" id="btnQueueSenderStart" class="primary">启动 Queue Sender</button>
-        <button type="button" id="btnQueueSenderStop" class="danger">停止 Queue Sender</button>
-        <button type="button" id="btnInboundListenerStart" class="primary">启动 Inbound Listener</button>
-        <button type="button" id="btnInboundListenerStop" class="danger">停止 Inbound Listener</button>
+        <button type="button" id="btnInboundListenerRestart" class="primary">手动重启 Inbound Listener</button>
         <button type="button" id="btnSave">保存配置</button>
         <button type="button" id="btnPullRestart">拉取并重启</button>
       </div>
@@ -608,6 +645,24 @@ function getDashboardHtml(): string {
       <div class="row">
         <label>最大重试次数 <span class="hint">打开 Notion AI、点击新建对话、输入发送等单步失败时最多尝试次数，默认 3</span></label>
         <input id="maxRetries" type="number" min="1" placeholder="3">
+      </div>
+      <h3 style="margin-top:1rem;font-size:1rem">Queue 发信节流（按每个发件人单独限制）</h3>
+      <p class="hint" style="margin-bottom:0.5rem">下面四项控制「从 Queue 里用 Gmail 发邮件」的节奏：两封之间隔多少秒、每个发件人每小时/每天最多发几封。保存后，下次点击「启动」时生效。</p>
+      <div class="row">
+        <label>两封邮件之间最少间隔（秒）<span class="hint">例如 180 表示至少隔 3 分钟再发下一封，默认 180</span></label>
+        <input id="queueThrottleMinIntervalSec" type="number" min="0" placeholder="180" style="width:5rem">
+      </div>
+      <div class="row">
+        <label>两封邮件之间最多间隔（秒）<span class="hint">与上面一起构成随机区间，默认 300</span></label>
+        <input id="queueThrottleMaxIntervalSec" type="number" min="0" placeholder="300" style="width:5rem">
+      </div>
+      <div class="row">
+        <label>每个发件人每小时最多发几封<span class="hint">默认 10</span></label>
+        <input id="queueThrottleMaxPerHour" type="number" min="1" placeholder="10" style="width:5rem">
+      </div>
+      <div class="row">
+        <label>每个发件人每天最多发几封<span class="hint">默认 50</span></label>
+        <input id="queueThrottleMaxPerDay" type="number" min="1" placeholder="50" style="width:5rem">
       </div>
       <div class="row">
         <label>等待输出期间自动点击的按钮 <span class="hint">将按列表顺序依次检测并点击出现的按钮。填写按钮上显示的文字，精确匹配。</span></label>
@@ -796,7 +851,7 @@ function getDashboardHtml(): string {
 
     async function refreshStatus() {
       const { status } = await api('/api/status');
-      statusEl.textContent = status === 'running' ? '运行中' : '已停止';
+      statusEl.textContent = status === 'running' ? 'Notion Auto 运行中' : 'Notion Auto 已停止';
       statusEl.className = 'status ' + status;
       document.getElementById('btnStart').disabled = status === 'running';
       document.getElementById('btnStop').disabled = status === 'idle';
@@ -807,8 +862,6 @@ function getDashboardHtml(): string {
         const el = document.getElementById('queueSenderStatusEl');
         el.textContent = status === 'running' ? 'Queue Sender：运行中' : 'Queue Sender：已停止';
         el.className = 'status ' + status;
-        document.getElementById('btnQueueSenderStart').disabled = status === 'running';
-        document.getElementById('btnQueueSenderStop').disabled = status === 'idle';
       } catch (_) {}
     }
     async function refreshInboundListenerStatus() {
@@ -817,8 +870,6 @@ function getDashboardHtml(): string {
         const el = document.getElementById('inboundListenerStatusEl');
         el.textContent = status === 'running' ? 'Inbound Listener：运行中' : 'Inbound Listener：已停止';
         el.className = 'status ' + status;
-        document.getElementById('btnInboundListenerStart').disabled = status === 'running';
-        document.getElementById('btnInboundListenerStop').disabled = status === 'idle';
       } catch (_) {}
     }
 
@@ -1261,6 +1312,11 @@ function getDashboardHtml(): string {
       document.getElementById('intervalSecondsMax').value = schedule.intervalMaxMs != null ? Math.round(schedule.intervalMaxMs / 1000) : 120;
       document.getElementById('loginWaitSeconds').value = schedule.loginWaitMs != null ? Math.round(schedule.loginWaitMs / 1000) : 60;
       document.getElementById('maxRetries').value = schedule.maxRetries ?? 3;
+      const qt = schedule.queueThrottle || {};
+      document.getElementById('queueThrottleMinIntervalSec').value = qt.minIntervalSec != null ? qt.minIntervalSec : 180;
+      document.getElementById('queueThrottleMaxIntervalSec').value = qt.maxIntervalSec != null ? qt.maxIntervalSec : 300;
+      document.getElementById('queueThrottleMaxPerHour').value = qt.maxPerHour != null ? qt.maxPerHour : 10;
+      document.getElementById('queueThrottleMaxPerDay').value = qt.maxPerDay != null ? qt.maxPerDay : 50;
       const names = schedule.autoClickDuringOutputWait || [];
       autoClickButtonsContainer.innerHTML = '';
       names.forEach(function (name) {
@@ -1285,6 +1341,19 @@ function getDashboardHtml(): string {
       const intervalMaxMs = Math.max(secMin, secMax) * 1000;
       const loginWaitMs = (Number(document.getElementById('loginWaitSeconds').value) || 60) * 1000;
       const maxRetries = Number(document.getElementById('maxRetries').value) || 3;
+      const throttleMinSec = Number(document.getElementById('queueThrottleMinIntervalSec').value);
+      const throttleMaxSec = Number(document.getElementById('queueThrottleMaxIntervalSec').value);
+      const throttlePerHour = Number(document.getElementById('queueThrottleMaxPerHour').value);
+      const throttlePerDay = Number(document.getElementById('queueThrottleMaxPerDay').value);
+      const queueThrottle = {
+        minIntervalSec: Number.isFinite(throttleMinSec) && throttleMinSec >= 0 ? throttleMinSec : 180,
+        maxIntervalSec: Number.isFinite(throttleMaxSec) && throttleMaxSec >= 0 ? throttleMaxSec : 300,
+        maxPerHour: Number.isInteger(throttlePerHour) && throttlePerHour >= 1 ? throttlePerHour : 10,
+        maxPerDay: Number.isInteger(throttlePerDay) && throttlePerDay >= 1 ? throttlePerDay : 50
+      };
+      if (queueThrottle.minIntervalSec > queueThrottle.maxIntervalSec) {
+        queueThrottle.minIntervalSec = queueThrottle.maxIntervalSec;
+      }
       const slots = [];
       timeSlotsContainer.querySelectorAll('.slot-row').forEach(row => {
         const startHour = (Number(row.querySelector('[data-key="startHour"]')?.value) | 0);
@@ -1306,7 +1375,7 @@ function getDashboardHtml(): string {
         const val = (input && input.value && input.value.trim()) || '';
         if (val) autoClickDuringOutputWait.push(val);
       });
-      return { intervalMinMs, intervalMaxMs, loginWaitMs, maxRetries, storagePath: '.notion-auth.json', timeSlots: slots, industries, autoClickDuringOutputWait };
+      return { intervalMinMs, intervalMaxMs, loginWaitMs, maxRetries, storagePath: '.notion-auth.json', timeSlots: slots, industries, autoClickDuringOutputWait, queueThrottle };
     }
 
     document.getElementById('btnAddAutoClickButton').onclick = function () { appendAutoClickRow(''); };
@@ -1326,6 +1395,8 @@ function getDashboardHtml(): string {
         await api('/api/schedule', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(schedule) });
         await api('/api/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
         await refreshStatus();
+        await refreshQueueSenderStatus();
+        await refreshInboundListenerStatus();
         await refreshLogs();
       } catch (e) { showMsg(e instanceof Error ? e.message : String(e), true); }
     };
@@ -1334,39 +1405,19 @@ function getDashboardHtml(): string {
       try {
         await api('/api/stop', { method: 'POST' });
         await refreshStatus();
-        await refreshLogs();
-      } catch (e) { showMsg(e instanceof Error ? e.message : String(e), true); }
-    };
-    document.getElementById('btnQueueSenderStart').onclick = async () => {
-      showMsg('');
-      try {
-        await api('/api/queue-sender/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
         await refreshQueueSenderStatus();
-        await refreshLogs();
-      } catch (e) { showMsg(e instanceof Error ? e.message : String(e), true); }
-    };
-    document.getElementById('btnQueueSenderStop').onclick = async () => {
-      showMsg('');
-      try {
-        await api('/api/queue-sender/stop', { method: 'POST' });
-        await refreshQueueSenderStatus();
-        await refreshLogs();
-      } catch (e) { showMsg(e instanceof Error ? e.message : String(e), true); }
-    };
-    document.getElementById('btnInboundListenerStart').onclick = async () => {
-      showMsg('');
-      try {
-        await api('/api/inbound-listener/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
         await refreshInboundListenerStatus();
         await refreshLogs();
       } catch (e) { showMsg(e instanceof Error ? e.message : String(e), true); }
     };
-    document.getElementById('btnInboundListenerStop').onclick = async () => {
+    document.getElementById('btnInboundListenerRestart').onclick = async () => {
       showMsg('');
       try {
-        await api('/api/inbound-listener/stop', { method: 'POST' });
+        await api('/api/inbound-listener/restart', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
         await refreshInboundListenerStatus();
         await refreshLogs();
+        showMsg('Inbound Listener 已重启', false);
+        setTimeout(function () { showMsg(''); }, 2000);
       } catch (e) { showMsg(e instanceof Error ? e.message : String(e), true); }
     };
     document.getElementById('btnSave').onclick = async () => {
@@ -1455,6 +1506,14 @@ async function startListening(): Promise<void> {
   }
   server.listen(PORT, HOST, () => {
     logger.info(`Dashboard: http://${HOST}:${PORT}`);
+    if (inboundListenerRunner.getInboundListenerStatus() !== "running") {
+      inboundListenerRunner.startInboundListener(resolveInboundListenerConfigPath(undefined));
+    }
+    setInterval(() => {
+      if (inboundListenerRunner.getInboundListenerStatus() === "idle") {
+        inboundListenerRunner.startInboundListener(resolveInboundListenerConfigPath(undefined));
+      }
+    }, 60_000);
   });
 }
 startListening();

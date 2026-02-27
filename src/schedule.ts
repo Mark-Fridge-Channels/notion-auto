@@ -60,6 +60,21 @@ export interface TimeSlot {
   industryId: string;
 }
 
+/**
+ * Queue Sender 节流配置（按发送者）：两封间隔秒数、每小时/每天每发送者上限。
+ * 存于 Schedule.queueThrottle，Dashboard 可编辑；启动 Queue Sender 时由 server 转为 env 注入。
+ */
+export interface QueueThrottle {
+  /** 两封邮件之间最少间隔（秒），默认 180 */
+  minIntervalSec: number;
+  /** 两封邮件之间最多间隔（秒），默认 300 */
+  maxIntervalSec: number;
+  /** 每个发件人每小时最多发几封，默认 10 */
+  maxPerHour: number;
+  /** 每个发件人每天最多发几封，默认 50 */
+  maxPerDay: number;
+}
+
 export interface Schedule {
   /** 每轮间隔（毫秒）：区间 [min, max]，每次发送完成后随机取再 sleep */
   intervalMinMs: number;
@@ -76,9 +91,19 @@ export interface Schedule {
   industries: ScheduleIndustry[];
   /** 等待 AI 输出结束期间若出现这些按钮（role=button，name 精确匹配）则自动点击；仅填按钮名称 */
   autoClickDuringOutputWait?: string[];
+  /** Queue Sender 节流：两封间隔（秒）、每小时/每天每发送者上限；未配置时用默认值 */
+  queueThrottle?: QueueThrottle;
 }
 
 const DEFAULT_STORAGE_PATH = ".notion-auth.json";
+
+/** Queue Sender 节流默认值：180/300 秒间隔，10/50 每小时/每天 */
+const DEFAULT_QUEUE_THROTTLE: QueueThrottle = {
+  minIntervalSec: 180,
+  maxIntervalSec: 300,
+  maxPerHour: 10,
+  maxPerDay: 50,
+};
 
 /** 默认/示例配置：一个区间 + 一个行业 + 一个任务 */
 export function getDefaultSchedule(): Schedule {
@@ -88,6 +113,7 @@ export function getDefaultSchedule(): Schedule {
     loginWaitMs: 60 * 1000,
     maxRetries: 3,
     storagePath: DEFAULT_STORAGE_PATH,
+    queueThrottle: { ...DEFAULT_QUEUE_THROTTLE },
     timeSlots: [
       { startHour: 0, startMinute: 0, endHour: 23, endMinute: 59, industryId: "default" },
     ],
@@ -188,6 +214,19 @@ export function validateSchedule(s: Schedule): void {
       if (typeof item !== "string" || item.trim() === "")
         throw new Error(`autoClickDuringOutputWait[${i}] 必须为非空字符串`);
     });
+  }
+  if (s.queueThrottle !== undefined) {
+    const qt = s.queueThrottle;
+    if (!Number.isFinite(qt.minIntervalSec) || qt.minIntervalSec < 0)
+      throw new Error("queueThrottle.minIntervalSec 必须为非负数");
+    if (!Number.isFinite(qt.maxIntervalSec) || qt.maxIntervalSec < 0)
+      throw new Error("queueThrottle.maxIntervalSec 必须为非负数");
+    if (qt.minIntervalSec > qt.maxIntervalSec)
+      throw new Error("queueThrottle.minIntervalSec 不能大于 maxIntervalSec");
+    if (!Number.isInteger(qt.maxPerHour) || qt.maxPerHour < 1)
+      throw new Error("queueThrottle.maxPerHour 必须为正整数");
+    if (!Number.isInteger(qt.maxPerDay) || qt.maxPerDay < 1)
+      throw new Error("queueThrottle.maxPerDay 必须为正整数");
   }
 }
 
@@ -310,6 +349,21 @@ export function mergeSchedule(partial: unknown): Schedule {
     autoClickDuringOutputWait: Array.isArray(o.autoClickDuringOutputWait)
       ? (o.autoClickDuringOutputWait as unknown[]).filter((x): x is string => typeof x === "string" && x.trim() !== "")
       : undefined,
+    queueThrottle: (() => {
+      const raw = o.queueThrottle;
+      if (raw == null || typeof raw !== "object") return def.queueThrottle ?? { ...DEFAULT_QUEUE_THROTTLE };
+      const r = raw as Record<string, unknown>;
+      const minSec = Number(r.minIntervalSec);
+      const maxSec = Number(r.maxIntervalSec);
+      const perHour = Number(r.maxPerHour);
+      const perDay = Number(r.maxPerDay);
+      return {
+        minIntervalSec: Number.isFinite(minSec) && minSec >= 0 ? minSec : DEFAULT_QUEUE_THROTTLE.minIntervalSec,
+        maxIntervalSec: Number.isFinite(maxSec) && maxSec >= 0 ? maxSec : DEFAULT_QUEUE_THROTTLE.maxIntervalSec,
+        maxPerHour: Number.isInteger(perHour) && perHour >= 1 ? perHour : DEFAULT_QUEUE_THROTTLE.maxPerHour,
+        maxPerDay: Number.isInteger(perDay) && perDay >= 1 ? perDay : DEFAULT_QUEUE_THROTTLE.maxPerDay,
+      };
+    })(),
   };
   return out;
 }

@@ -4,9 +4,7 @@
       "inbound_messages_db_id": "https://www.notion.so/47dea091b3b642fdbbf28f0b1a9e5d41?v=74da6fd531c1436ca53958e3aaac2626",
       "touchpoints_db_id": "https://www.notion.so/3119166fd9fd80cdbf5adc345229fedf?v=3119166fd9fd8114a825000caa22c4b1",
       "sender_accounts_database_url": "https://www.notion.so/3129166fd9fd805b9c8bff5ed3d361cc?v=3129166fd9fd8009890d000c93c7bdf8",
-      "mailboxes": [
-        "mark@fridgechannels.com"
-      ]
+      "mailboxes": []
     }
   ],
   "poll_interval_seconds": 120,

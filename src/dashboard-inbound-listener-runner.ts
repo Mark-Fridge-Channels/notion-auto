@@ -112,6 +112,12 @@ export function stopInboundListener(): void {
   }
 }
 
+/** 先停止再启动，用于「手动重启」或自动拉活；configPath 可选，默认由调用方通过 env 等决定。 */
+export function restartInboundListener(configPath?: string): void {
+  stopInboundListener();
+  setImmediate(() => startInboundListener(configPath));
+}
+
 export function getInboundListenerRunLogs(n: number = MAX_RUN_LOGS): InboundListenerRunLog[] {
   const list = currentRunLog ? [currentRunLog, ...runLogs] : [...runLogs];
   return list.slice(0, n);

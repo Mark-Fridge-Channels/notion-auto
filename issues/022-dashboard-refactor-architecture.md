@@ -104,3 +104,57 @@
 - [ ] Dashboard 的 HTML/CSS/JS 不再以「一大段」形式存在于 `server.ts`。
 - [ ] 现有功能不变：三 Tab、主视图配置与时间槽/行业、Reply Tasks 配置与列表/发送、Inbound 配置、日志、拉取并重启等均正常。
 - [ ] 新结构有简单说明（如 README 或代码内注释），说明各模块/文件职责与组装方式。
+
+---
+
+## Exploration 结论与建议（是否调整需求）
+
+### 已确认的事实
+
+- **server.ts**：约 1461 行；其中 `getDashboardHtml()` 约 474–1444 行（~970 行），其余为 HTTP 处理、API、工具函数。API 与路由已清晰，无需动。
+- **项目现状**：无前端构建（无 vite/webpack/esbuild for frontend），`npm run dashboard` 直接 `tsx src/server.ts`，零构建步骤。若引入前端打包，会改变现有「单命令启动」的使用方式。
+- **前端形态**：单页、内联 CSS + 内联 JS、依赖 Quill CDN；大量闭包与模块级变量（`currentSchedule`、`replyTasksQuill` 等），无框架。
+
+### 建议对需求做的调整
+
+1. **明确「不引入构建」为首选方案（至少 Phase 1）**  
+   - 在需求/计划中写死：**第一阶段只做「从 server.ts 抽离到独立文件，由 Node 在运行时 `readFileSync`（或等价）读入并拼成单 HTML 响应」**，不增加 `npm run build`、不提供 `/static/xxx.js` 这类静态路由。  
+   - 这样：部署与启动方式不变、回归面更小、潜在 bug 主要来自「拆分后的作用域与初始化顺序」，而不是构建/路径问题。
+
+2. **收敛「符合项目架构」的定义**  
+   - 当前 issue 里「符合项目架构」较宽泛（既提到独立 HTML/CSS/JS 文件，又提到构建打包）。建议收敛为：  
+   - **Phase 1**：架构目标 = 「Dashboard 相关的内容按职责拆成若干 **Node 侧可读的源文件**（如 `dashboard/template.html`、`dashboard/styles.css`、`dashboard/app.js` 或按 tab 再拆），由 `server.ts` 或单一 `dashboard-index.ts` 在运行时拼成一段 HTML 字符串并 `sendHtml`」，与现有后端模块（`dashboard-runner.ts` 等）平级，而不是「引入 SPA/构建」。  
+   - 若未来有 Phase 2（例如真正独立静态资源 + 构建），再单独开 issue，避免本 issue 范围蔓延。
+
+3. **分阶段验收，便于随时刹车**  
+   - **Phase 1a**：只拆 **HTML 结构** 与 **CSS** 到独立文件，JS 仍内联在拼出的 HTML 里；验收 = 页面外观与行为完全一致。  
+   - **Phase 1b**：再把 **JS** 抽到 1 个或多个 `.js` 文件，由 Node 读入后以 `<script>...</script>` 形式注入同一 HTML；不增加静态路由。  
+   - 这样若 1a 后觉得收益已够，可停在这里；若继续 1b，风险也集中在「JS 作用域/顺序」上，文档中的 7 条潜在 bug 仍适用。
+
+4. **建议明确排除的范围（写在 issue 或计划里）**  
+   - 不要求：引入 React/Vue、引入前端构建、支持多语言、可插拔主题、Dashboard 路由改为 `/dashboard`。  
+   - 避免「顺便把 Dashboard 也做成 SPA」之类的 scope creep。
+
+### 需要你拍板的决策（再做 Plan 前建议先定）
+
+| 决策点 | 选项 | 建议 |
+|--------|------|------|
+| 是否接受「Node 运行时读文件拼 HTML」为 Phase 1 唯一形态？ | A. 是，不引入构建<br>B. 否，希望一步到位上静态资源+构建 | A：风险与改动最小，与现有 `npm run dashboard` 一致。 |
+| JS 拆分粒度 | A. 先只拆成 1 个 `dashboard-app.js`（由 Node 读入注入）<br>B. 按 Tab 拆成 main / reply-tasks / inbound 三个脚本<br>C. 更细（按组件/弹窗再拆） | A 或 B。A 实现最快；B 可读性更好，但要注意共享状态（见潜在 Bug 第 2 条）。 |
+| 文件落点 | A. `src/dashboard/` 下（与 `src/dashboard-runner.ts` 等并列）<br>B. 项目根下 `dashboard/` 或 `static/dashboard/` | A 更符合「源码即资产」、与现有 `src/` 结构一致；若未来上静态路由，再考虑迁到 `static/`。 |
+
+### 产品/排期上下文（已澄清）
+
+- **近期不会大改，但会持续迭代功能**。  
+  → 本 refactor 的价值是：在持续加功能时，改动的是一小块块文件而不是 server.ts 里一大段，利于维护和 code review。不追求「立刻大动」，可安排在方便的时间做（例如某次迭代前做 Phase 1a，或功能稳定后集中做 1a+1b）。
+
+### 歧义与待澄清
+
+- **「符合项目架构」**：若你心里有具体参照（例如「像 schedule.js / inbound-listener-config.js 那样一个功能一个模块」），可补充一句，便于 Plan 里对齐「Dashboard 前端」的模块边界。
+
+### 总结建议
+
+- **要调整**：在 issue 中**明确 Phase 1 不引入构建、只做「多文件 + Node 拼 HTML」**，并**明确排除** SPA/构建/路由变更；分阶段验收（先 HTML+CSS，再 JS）。  
+- **可保持**：风险与潜在 bug 的 7 条、建议实施方式、验收标准整体保留，它们与上述 Phase 1 方案兼容。  
+- **排期**：因会持续迭代功能，refactor 不必抢跑；可在某次迭代前做 Phase 1a（先拆 HTML+CSS），或功能稳定后集中做 1a+1b。  
+- **下一步**：你确认上述决策点（尤其是「是否接受不引入构建」「JS 粒度选 A 还是 B」「文件落点」）后，可以基于本 issue 写 **Plan**，再进入实现。

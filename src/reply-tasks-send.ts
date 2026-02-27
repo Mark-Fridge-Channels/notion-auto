@@ -4,7 +4,7 @@
  */
 
 import type { Client } from "@notionhq/client";
-import { getGmailClient, sendInThread } from "./gmail-send.js";
+import { getGmailClient, plainToHtml, sendInThread } from "./gmail-send.js";
 import {
   getReplyTaskSendContext,
   listReplyTasks,
@@ -13,15 +13,6 @@ import {
 import { fetchSenderCredentials } from "./notion-queue.js";
 import { loadReplyTasksConfigOrDefault } from "./reply-tasks-config.js";
 import { logger } from "./logger.js";
-
-/** 纯文本转 HTML：换行 → <br>，并转义 < > & */
-function plainToHtml(plain: string): string {
-  const escaped = String(plain)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-  return escaped.replace(/\n/g, "<br>\n");
-}
 
 /** 单条发送结果 */
 export interface SendOneResult {

@@ -13,7 +13,7 @@ import {
   fetchSenderCredentials,
   type QueueItem,
 } from "./notion-queue.js";
-import { getGmailClient, sendCold1, sendFollowup } from "./gmail-send.js";
+import { getGmailClient, plainToHtml, sendCold1, sendFollowup } from "./gmail-send.js";
 import { loadSchedule, getSchedulePath, getIndustryForNow } from "./schedule.js";
 import type { ScheduleIndustry } from "./schedule.js";
 import { logger } from "./logger.js";
@@ -152,7 +152,7 @@ async function processOne(
           creds.email,
           item.email,
           item.emailSubject,
-          item.emailBody,
+          plainToHtml(item.emailBody),
         );
         await updateQueuePageSuccess(notion, item.pageId, {
           sentAt: new Date(),
@@ -169,7 +169,7 @@ async function processOne(
         creds.email,
         item.email,
         item.emailSubject,
-        item.emailBody,
+        plainToHtml(item.emailBody),
       );
       await updateQueuePageSuccess(notion, item.pageId, {
         sentAt: new Date(),
