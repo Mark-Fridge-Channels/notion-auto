@@ -111,6 +111,12 @@ type PageParseResult =
 export interface PageToQueueItemOptions {
   /** 为 true 时不因 now < plannedSendAt 跳过；发送节奏由调用方（如 queue-sender）控制 */
   ignorePlannedSendAt?: boolean;
+  /**
+   * Planned Send At 发送窗口（毫秒）。
+   * 传入后将启用严格窗口过滤：仅当 plannedSendAt 非空且满足 (now - windowMs) ≤ plannedSendAt ≤ now 才纳入；
+   * plannedSendAt 为空/未到/过期均跳过。
+   */
+  plannedSendWindowMs?: number;
 }
 
 function pageToQueueItem(
@@ -160,7 +166,39 @@ function pageToQueueItem(
       .join(",");
     return { ok: false, skipReason: `必填为空: ${missing || "Email/Subject/Body"}`, readSummary };
   }
-  if (!options?.ignorePlannedSendAt && plannedSendAt != null && now < plannedSendAt) {
+  const windowMsRaw = options?.plannedSendWindowMs;
+  if (windowMsRaw != null) {
+    const windowMs = Number.isFinite(windowMsRaw) ? Math.max(0, windowMsRaw) : 0;
+    const nowTs = now.getTime();
+    const minTs = nowTs - windowMs;
+    if (plannedSendAt == null) {
+      return {
+        ok: false,
+        skipReason: "Planned Send At 为空（本模式要求必须填写）",
+        readSummary: { ...readSummary, plannedSendWindowMs: windowMs },
+      };
+    }
+    const plannedTs = plannedSendAt.getTime();
+    if (plannedTs > nowTs) {
+      return {
+        ok: false,
+        skipReason: `Planned Send At 未到（plannedSendAt > now）`,
+        readSummary: { ...readSummary, plannedSendWindowMs: windowMs, nowBeforePlanned: true },
+      };
+    }
+    if (plannedTs < minTs) {
+      return {
+        ok: false,
+        skipReason: `Planned Send At 已过期（超过窗口 ${Math.round(windowMs / 60000)} 分钟）`,
+        readSummary: {
+          ...readSummary,
+          plannedSendWindowMs: windowMs,
+          plannedSendAtTooOld: true,
+          nowMinusPlannedMs: nowTs - plannedTs,
+        },
+      };
+    }
+  } else if (!options?.ignorePlannedSendAt && plannedSendAt != null && now < plannedSendAt) {
     return {
       ok: false,
       skipReason: `Planned Send At 未到（now < plannedSendAt）`,
@@ -203,11 +241,15 @@ const QUEUE_BASE_FILTER = [
 export interface QueryQueuePendingOptions {
   /** 为 true 时不因 now < plannedSendAt 过滤；传入 pageToQueueItem，发送节奏由调用方控制 */
   ignorePlannedSendAt?: boolean;
+  /** Planned Send At 严格发送窗口（毫秒），见 PageToQueueItemOptions.plannedSendWindowMs */
+  plannedSendWindowMs?: number;
 }
 
 /**
  * 查询 Queue 库中符合条件的 Pending 项：Email Status=Pending，四 Flag 全 false，Email/Subject/Body 非空；
- * 排序 Queued At 升序；仅当 now >= Planned Send At（或 options.ignorePlannedSendAt 为 true 时忽略）且 Sent At Last / Message ID Last 为空时纳入。
+ * 排序 Queued At 升序；Planned Send At 参与过滤策略由 options 控制：
+ * - plannedSendWindowMs：严格窗口 (now - windowMs) ≤ plannedSendAt ≤ now 且 plannedSendAt 非空；
+ * - ignorePlannedSendAt：仅忽略 now < plannedSendAt 的过滤（不推荐与窗口同时使用）。
  * 兼容 Email Status 为 Notion Status 或 Select 类型。
  */
 export async function queryQueuePending(
@@ -271,7 +313,12 @@ export async function queryQueuePending(
     logger.info(`因 API 返回 0 条，无逐条「查到的内容」可输出`);
   }
   const items: QueueItem[] = [];
-  const parseOptions = options?.ignorePlannedSendAt ? { ignorePlannedSendAt: true } : undefined;
+  const parseOptions =
+    options?.plannedSendWindowMs != null
+      ? { plannedSendWindowMs: options.plannedSendWindowMs }
+      : options?.ignorePlannedSendAt
+        ? { ignorePlannedSendAt: true }
+        : undefined;
   for (const page of response.results) {
     if (!("properties" in page)) continue;
     const result = pageToQueueItem({ id: page.id, properties: page.properties }, now, parseOptions);
@@ -355,15 +402,34 @@ function getPasswordFromProps(props: Record<string, unknown>): string {
 }
 
 /**
- * 从发件人库按 Sender Account（匹配 Email 属性）取一行，返回 Email + password。
+ * 从发件人库行取 Provider（Select 的 name 或 Rich text）；无该列或为空时视为 Gmail。
+ * 用于多厂商（Gmail / Zoho / Microsoft 365）时按 Provider 分支调用对应 API。
+ */
+function getProviderFromProps(props: Record<string, unknown>): string {
+  const prop = props["Provider"] ?? props["provider"];
+  if (prop && typeof prop === "object" && "select" in prop) {
+    const name = (prop as { select?: { name?: string } }).select?.name?.trim();
+    if (name) return name;
+  }
+  const rich = getRichText(prop).trim();
+  if (rich) return rich;
+  return "Gmail";
+}
+
+/** 发件人凭据：email、password（refresh_token）及 Provider（Gmail/Zoho/Microsoft 365） */
+export type SenderCredentials = { email: string; password: string; provider: string };
+
+/**
+ * 从发件人库按 Sender Account（匹配 Email 属性）取一行，返回 Email + password + provider。
  * 发件人库的 Email 列可能为 email 或 rich_text 类型，Notion 查询 filter 对 email 类型可能不生效，
  * 故先按 rich_text 查；若无结果则拉取多行在内存中按 Email 匹配。
+ * Provider 列缺省或为空时返回 "Gmail"（兼容旧库）。
  */
 export async function fetchSenderCredentials(
   notion: Client,
   senderAccountsDatabaseUrl: string,
   senderAccount: string,
-): Promise<{ email: string; password: string } | null> {
+): Promise<SenderCredentials | null> {
   const databaseId = parseDatabaseId(senderAccountsDatabaseUrl);
   const databaseIdWithHyphens = databaseId.length === 32
     ? `${databaseId.slice(0, 8)}-${databaseId.slice(8, 12)}-${databaseId.slice(12, 16)}-${databaseId.slice(16, 20)}-${databaseId.slice(20, 32)}`
@@ -395,7 +461,8 @@ export async function fetchSenderCredentials(
     if (email !== normalizedAccount) continue;
     const password = getPasswordFromProps(props);
     if (!password) continue;
-    return { email, password };
+    const provider = getProviderFromProps(props);
+    return { email, password, provider };
   }
   return null;
 }

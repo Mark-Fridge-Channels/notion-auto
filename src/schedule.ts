@@ -14,33 +14,27 @@ export interface ScheduleTask {
   runCount: number;
 }
 
-/** 行业类型：Playwright 任务链 或 Queue 出站发送 */
-export type ScheduleIndustryType = "playwright" | "queue";
+/** 行业类型：仅 Playwright 任务链；Queue 出站发送已迁至 queue-sender.json 独立配置 */
+export type ScheduleIndustryType = "playwright";
 
-/** 行业：Playwright 时为 Notion Portal URL + 任务链；Queue 时为 Queue 数据库 URL + 发件人库 URL。 */
+/** 行业：Notion Portal URL + 任务链（仅 Playwright）。 */
 export interface ScheduleIndustry {
   /** 行业唯一标识，时间区间通过此 id 引用行业 */
   id: string;
-  /** 行业类型，默认 playwright；queue 时使用 queueDatabaseUrl / senderAccountsDatabaseUrl，不跑任务链 */
+  /** 行业类型，默认 playwright */
   type?: ScheduleIndustryType;
-  /** 该行业对应的 Notion 页面 URL（Playwright 时必填） */
+  /** 该行业对应的 Notion 页面 URL */
   notionUrl: string;
-  /** 每跑 N 次后新建会话：区间 [min, max]，开新会话时随机取 N；0 表示本会话不主动新建（仅 Playwright） */
+  /** 每跑 N 次后新建会话：区间 [min, max]，开新会话时随机取 N；0 表示本会话不主动新建 */
   newChatEveryRunsMin: number;
   newChatEveryRunsMax: number;
-  /** 每跑 M 次后换模型：区间 [min, max]，开新会话时随机取 M；0 表示本会话不换（仅 Playwright） */
+  /** 每跑 M 次后换模型：区间 [min, max]，开新会话时随机取 M；0 表示本会话不换 */
   modelSwitchIntervalMin: number;
   modelSwitchIntervalMax: number;
-  /** 本时段内跑几轮完整任务链：0 = 一直跑（仅 Playwright） */
+  /** 本时段内跑几轮完整任务链：0 = 一直跑 */
   chainRunsPerSlot: number;
-  /** 任务链，按顺序执行（仅 Playwright） */
+  /** 任务链，按顺序执行 */
   tasks: ScheduleTask[];
-  /** Queue 数据库 URL（type=queue 时必填） */
-  queueDatabaseUrl?: string;
-  /** 发件人库 URL，各自用（type=queue 时必填） */
-  senderAccountsDatabaseUrl?: string;
-  /** 每批取条数（type=queue 时可选，默认 20） */
-  batchSize?: number;
 }
 
 /**
@@ -61,16 +55,10 @@ export interface TimeSlot {
 }
 
 /**
- * Queue Sender 节流配置（按发送者）：两封间隔秒数、每小时/每天每发送者上限。
+ * Queue Sender 节流配置（按发送者）：仅每发件人每天上限，作保底限制。
  * 存于 Schedule.queueThrottle，Dashboard 可编辑；启动 Queue Sender 时由 server 转为 env 注入。
  */
 export interface QueueThrottle {
-  /** 两封邮件之间最少间隔（秒），默认 180 */
-  minIntervalSec: number;
-  /** 两封邮件之间最多间隔（秒），默认 300 */
-  maxIntervalSec: number;
-  /** 每个发件人每小时最多发几封，默认 10 */
-  maxPerHour: number;
   /** 每个发件人每天最多发几封，默认 50 */
   maxPerDay: number;
 }
@@ -91,17 +79,14 @@ export interface Schedule {
   industries: ScheduleIndustry[];
   /** 等待 AI 输出结束期间若出现这些按钮（role=button，name 精确匹配）则自动点击；仅填按钮名称 */
   autoClickDuringOutputWait?: string[];
-  /** Queue Sender 节流：两封间隔（秒）、每小时/每天每发送者上限；未配置时用默认值 */
+  /** Queue Sender 节流：每发件人每天最多发几封；未配置时用默认值 */
   queueThrottle?: QueueThrottle;
 }
 
 const DEFAULT_STORAGE_PATH = ".notion-auth.json";
 
-/** Queue Sender 节流默认值：180/300 秒间隔，10/50 每小时/每天 */
+/** Queue Sender 节流默认值：每发件人每天最多 50 */
 const DEFAULT_QUEUE_THROTTLE: QueueThrottle = {
-  minIntervalSec: 180,
-  maxIntervalSec: 300,
-  maxPerHour: 10,
   maxPerDay: 50,
 };
 
@@ -146,17 +131,6 @@ function validateIndustry(ind: unknown, index: number): asserts ind is ScheduleI
   if (ind == null || typeof ind !== "object") throw new Error(`行业[${index}] 必须为对象`);
   const o = ind as Record<string, unknown>;
   if (typeof o.id !== "string" || !o.id.trim()) throw new Error(`行业[${index}].id 必须为非空字符串`);
-  const industryType = o.type === "queue" ? "queue" : "playwright";
-  if (industryType === "queue") {
-    if (typeof o.queueDatabaseUrl !== "string" || !String(o.queueDatabaseUrl).trim())
-      throw new Error(`行业[${index}].queueDatabaseUrl 必须为非空字符串（Queue 类型）`);
-    if (typeof o.senderAccountsDatabaseUrl !== "string" || !String(o.senderAccountsDatabaseUrl).trim())
-      throw new Error(`行业[${index}].senderAccountsDatabaseUrl 必须为非空字符串（Queue 类型）`);
-    const batchSize = Number(o.batchSize);
-    if (o.batchSize !== undefined && (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > 100))
-      throw new Error(`行业[${index}].batchSize 必须为 1–100 的整数`);
-    return;
-  }
   if (typeof o.notionUrl !== "string") throw new Error(`行业[${index}].notionUrl 必须为字符串`);
   const nMin = Number(o.newChatEveryRunsMin);
   const nMax = Number(o.newChatEveryRunsMax);
@@ -217,14 +191,6 @@ export function validateSchedule(s: Schedule): void {
   }
   if (s.queueThrottle !== undefined) {
     const qt = s.queueThrottle;
-    if (!Number.isFinite(qt.minIntervalSec) || qt.minIntervalSec < 0)
-      throw new Error("queueThrottle.minIntervalSec 必须为非负数");
-    if (!Number.isFinite(qt.maxIntervalSec) || qt.maxIntervalSec < 0)
-      throw new Error("queueThrottle.maxIntervalSec 必须为非负数");
-    if (qt.minIntervalSec > qt.maxIntervalSec)
-      throw new Error("queueThrottle.minIntervalSec 不能大于 maxIntervalSec");
-    if (!Number.isInteger(qt.maxPerHour) || qt.maxPerHour < 1)
-      throw new Error("queueThrottle.maxPerHour 必须为正整数");
     if (!Number.isInteger(qt.maxPerDay) || qt.maxPerDay < 1)
       throw new Error("queueThrottle.maxPerDay 必须为正整数");
   }
@@ -258,42 +224,31 @@ export async function loadSchedule(filePath: string): Promise<Schedule> {
   }
 }
 
-const DEFAULT_BATCH_SIZE = 20;
-
 /**
- * 从区间 [min, max] 规范化行业：若仅有旧单数字段则设 min=max=原值；支持 type=queue 及 Queue 字段。
+ * 从区间 [min, max] 规范化行业：若仅有旧单数字段则设 min=max=原值。
+ * 兼容旧配置中 type=queue 的行业：忽略并转为默认 Playwright 行业（同 id），保证加载不报错。
  */
 function normalizeIndustry(ind: unknown): ScheduleIndustry {
   const def = getDefaultSchedule().industries[0]!;
   if (ind == null || typeof ind !== "object") return def;
   const o = ind as Record<string, unknown>;
-  const industryType = o.type === "queue" ? "queue" : "playwright";
+  const isLegacyQueue = o.type === "queue";
   const nMin = o.newChatEveryRunsMin !== undefined ? Number(o.newChatEveryRunsMin) : Number(o.newChatEveryRuns);
   const nMax = o.newChatEveryRunsMax !== undefined ? Number(o.newChatEveryRunsMax) : Number(o.newChatEveryRuns);
   const mMin = o.modelSwitchIntervalMin !== undefined ? Number(o.modelSwitchIntervalMin) : Number(o.modelSwitchInterval);
   const mMax = o.modelSwitchIntervalMax !== undefined ? Number(o.modelSwitchIntervalMax) : Number(o.modelSwitchInterval);
   const chainRuns = o.chainRunsPerSlot !== undefined ? Number(o.chainRunsPerSlot) : def.chainRunsPerSlot;
-  const batchSizeVal = o.batchSize !== undefined ? Number(o.batchSize) : DEFAULT_BATCH_SIZE;
-  const base = {
+  return {
     id: typeof o.id === "string" ? o.id : def.id,
-    type: industryType,
-    notionUrl: typeof o.notionUrl === "string" ? o.notionUrl : def.notionUrl,
+    type: "playwright",
+    notionUrl: isLegacyQueue ? def.notionUrl : (typeof o.notionUrl === "string" ? o.notionUrl : def.notionUrl),
     newChatEveryRunsMin: Number.isInteger(nMin) && nMin >= 0 ? nMin : def.newChatEveryRunsMin,
     newChatEveryRunsMax: Number.isInteger(nMax) && nMax >= 0 ? nMax : def.newChatEveryRunsMax,
     modelSwitchIntervalMin: Number.isInteger(mMin) && mMin >= 0 ? mMin : def.modelSwitchIntervalMin,
     modelSwitchIntervalMax: Number.isInteger(mMax) && mMax >= 0 ? mMax : def.modelSwitchIntervalMax,
     chainRunsPerSlot: Number.isInteger(chainRuns) && chainRuns >= 0 ? chainRuns : def.chainRunsPerSlot,
-    tasks: Array.isArray(o.tasks) ? (o.tasks as ScheduleTask[]) : def.tasks,
+    tasks: isLegacyQueue ? def.tasks : (Array.isArray(o.tasks) ? (o.tasks as ScheduleTask[]) : def.tasks),
   };
-  if (industryType === "queue") {
-    return {
-      ...base,
-      queueDatabaseUrl: typeof o.queueDatabaseUrl === "string" ? o.queueDatabaseUrl : "",
-      senderAccountsDatabaseUrl: typeof o.senderAccountsDatabaseUrl === "string" ? o.senderAccountsDatabaseUrl : "",
-      batchSize: Number.isInteger(batchSizeVal) && batchSizeVal >= 1 && batchSizeVal <= 100 ? batchSizeVal : DEFAULT_BATCH_SIZE,
-    };
-  }
-  return base;
 }
 
 /**
@@ -353,14 +308,8 @@ export function mergeSchedule(partial: unknown): Schedule {
       const raw = o.queueThrottle;
       if (raw == null || typeof raw !== "object") return def.queueThrottle ?? { ...DEFAULT_QUEUE_THROTTLE };
       const r = raw as Record<string, unknown>;
-      const minSec = Number(r.minIntervalSec);
-      const maxSec = Number(r.maxIntervalSec);
-      const perHour = Number(r.maxPerHour);
       const perDay = Number(r.maxPerDay);
       return {
-        minIntervalSec: Number.isFinite(minSec) && minSec >= 0 ? minSec : DEFAULT_QUEUE_THROTTLE.minIntervalSec,
-        maxIntervalSec: Number.isFinite(maxSec) && maxSec >= 0 ? maxSec : DEFAULT_QUEUE_THROTTLE.maxIntervalSec,
-        maxPerHour: Number.isInteger(perHour) && perHour >= 1 ? perHour : DEFAULT_QUEUE_THROTTLE.maxPerHour,
         maxPerDay: Number.isInteger(perDay) && perDay >= 1 ? perDay : DEFAULT_QUEUE_THROTTLE.maxPerDay,
       };
     })(),

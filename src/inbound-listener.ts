@@ -17,6 +17,18 @@ import {
   type InboundClassification,
 } from "./notion-inbound.js";
 import { getGmailClientForRead, listInboxMessageIds, getMessageAndParse, type InboundMessageParsed } from "./gmail-read.js";
+import {
+  getZohoAccessToken,
+  getZohoAccountId,
+  getZohoInboxFolderId,
+  listZohoInboxMessageIds,
+  getZohoMessageAndParse,
+} from "./zoho-mail.js";
+import {
+  getM365AccessToken,
+  listM365InboxMessageIds,
+  getM365MessageAndParse,
+} from "./m365-mail.js";
 import { logger } from "./logger.js";
 
 const LIST_INBOX_MAX_RESULTS = 50;
@@ -261,6 +273,7 @@ async function processOneMessage(
   parsed: InboundMessageParsed,
   mailbox: string,
   listenerRunId: string,
+  provider: string,
 ): Promise<{ wroteIm: boolean; stopWritten: boolean; resolvedGroupIndex: number; touchpointFound: boolean }> {
   const { groupIndex, touchpointPageId, needsReview } = await routeToGroup(
     notion,
@@ -313,6 +326,7 @@ async function processOneMessage(
     touchpointPageId: touchpointPageId ?? undefined,
     classification: finalClassification,
     needsReview: needsReviewFinal,
+    provider: provider || "Gmail",
   });
 
   if (stopWritten) {
@@ -366,21 +380,66 @@ async function main(): Promise<void> {
       logger.warn(`Inbound Listener 未找到发件人凭据 mailbox=${mailbox}，跳过该邮箱`);
       continue;
     }
-    const { gmail, userId } = getGmailClientForRead(creds.password);
-    const messageList = await listInboxMessageIds(gmail, userId, LIST_INBOX_MAX_RESULTS);
-    for (const { id } of messageList) {
-      try {
-        const parsed = await getMessageAndParse(
-          gmail,
-          userId,
-          id,
-          config.body_plain_max_chars ?? 40000,
-        );
-        if (!parsed) continue;
-        await processOneMessage(notion, config, parsed, mailbox, listenerRunId);
-      } catch (e) {
-        logger.warn(`Inbound Listener 处理 message ${id} 失败`, e);
+    const provider = (creds.provider ?? "Gmail").trim() || "Gmail";
+    const bodyMax = config.body_plain_max_chars ?? 40000;
+
+    if (provider === "Gmail") {
+      const { gmail, userId } = getGmailClientForRead(creds.password);
+      const messageList = await listInboxMessageIds(gmail, userId, LIST_INBOX_MAX_RESULTS);
+      for (const { id } of messageList) {
+        try {
+          const parsed = await getMessageAndParse(gmail, userId, id, bodyMax);
+          if (!parsed) continue;
+          await processOneMessage(notion, config, parsed, mailbox, listenerRunId, provider);
+        } catch (e) {
+          logger.warn(`Inbound Listener 处理 message ${id} 失败`, e);
+        }
       }
+    } else if (provider === "Zoho") {
+      const accessToken = await getZohoAccessToken(creds.password);
+      const accountId = await getZohoAccountId(accessToken);
+      const folderId = await getZohoInboxFolderId(accessToken, accountId);
+      const messageList = await listZohoInboxMessageIds(
+        accessToken,
+        accountId,
+        folderId,
+        LIST_INBOX_MAX_RESULTS,
+      );
+      for (const item of messageList) {
+        try {
+          const parsed = await getZohoMessageAndParse(
+            accessToken,
+            accountId,
+            folderId,
+            item.id,
+            bodyMax,
+            item,
+          );
+          if (!parsed) continue;
+          await processOneMessage(notion, config, parsed, mailbox, listenerRunId, provider);
+        } catch (e) {
+          logger.warn(`Inbound Listener 处理 Zoho message ${item.id} 失败`, e);
+        }
+      }
+    } else if (provider === "Microsoft 365") {
+      const accessToken = await getM365AccessToken(creds.password);
+      const messageList = await listM365InboxMessageIds(accessToken, LIST_INBOX_MAX_RESULTS);
+      for (const item of messageList) {
+        try {
+          const parsed = await getM365MessageAndParse(
+            accessToken,
+            item.id,
+            bodyMax,
+            item,
+          );
+          if (!parsed) continue;
+          await processOneMessage(notion, config, parsed, mailbox, listenerRunId, provider);
+        } catch (e) {
+          logger.warn(`Inbound Listener 处理 M365 message ${item.id} 失败`, e);
+        }
+      }
+    } else {
+      logger.warn(`Inbound Listener 不支持的 Provider mailbox=${mailbox} provider=${provider}，跳过`);
     }
   }
 }

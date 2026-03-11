@@ -11,6 +11,12 @@ import {
   updateReplyTaskStatusDone,
 } from "./notion-reply-tasks.js";
 import { fetchSenderCredentials } from "./notion-queue.js";
+import {
+  getZohoAccessToken,
+  getZohoAccountId,
+  sendZohoReply,
+} from "./zoho-mail.js";
+import { getM365AccessToken, sendM365Reply } from "./m365-mail.js";
 import { loadReplyTasksConfigOrDefault } from "./reply-tasks-config.js";
 import { logger } from "./logger.js";
 
@@ -40,17 +46,46 @@ export async function sendOneReplyTask(
   }
   /** 空串视为未提供 body，使用 Suggested Reply 转 HTML；仅当传入非空 bodyHtml 时使用用户编辑内容 */
   const htmlBody = bodyHtml != null && bodyHtml !== "" ? bodyHtml : plainToHtml(ctx.suggestedReply);
-  const { gmail, userId } = getGmailClient(creds.password);
+  const provider = (ctx.provider ?? "Gmail").trim() || "Gmail";
+
   try {
-    await sendInThread(
-      gmail,
-      userId,
-      ctx.threadId,
-      creds.email,
-      ctx.to,
-      ctx.subject,
-      htmlBody,
-    );
+    if (provider === "Gmail") {
+      const { gmail, userId } = getGmailClient(creds.password);
+      await sendInThread(
+        gmail,
+        userId,
+        ctx.threadId,
+        creds.email,
+        ctx.to,
+        ctx.subject,
+        htmlBody,
+      );
+    } else if (provider === "Zoho") {
+      if (!ctx.messageId?.trim()) {
+        logger.warn(`[ReplyTasks] task=${taskPageId} Zoho 回复需要 IM 的 Message ID，当前为空`);
+        return { ok: false, taskPageId, error: "Zoho 回复需要 Inbound Message 的 Message ID" };
+      }
+      const accessToken = await getZohoAccessToken(creds.password);
+      const accountId = await getZohoAccountId(accessToken);
+      await sendZohoReply(
+        accessToken,
+        accountId,
+        ctx.messageId,
+        creds.email,
+        ctx.to,
+        ctx.subject,
+        htmlBody,
+      );
+    } else if (provider === "Microsoft 365") {
+      if (!ctx.messageId?.trim()) {
+        logger.warn(`[ReplyTasks] task=${taskPageId} M365 回复需要 IM 的 Message ID，当前为空`);
+        return { ok: false, taskPageId, error: "Microsoft 365 回复需要 Inbound Message 的 Message ID" };
+      }
+      const accessToken = await getM365AccessToken(creds.password);
+      await sendM365Reply(accessToken, ctx.messageId, htmlBody);
+    } else {
+      return { ok: false, taskPageId, error: `不支持的 Provider: ${provider}` };
+    }
     await updateReplyTaskStatusDone(notion, taskPageId);
     logger.info(`[ReplyTasks] task=${taskPageId} 发送成功并已标为 Done`);
     return { ok: true, taskPageId };

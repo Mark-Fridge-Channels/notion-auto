@@ -1,0 +1,10 @@
+{
+  "entries": [
+    {
+      "name": "主 Queue",
+      "queue_database_url": "https://www.notion.so/your-workspace/YOUR_QUEUE_DATABASE_ID",
+      "sender_accounts_database_url": "https://www.notion.so/your-workspace/YOUR_SENDER_ACCOUNTS_DATABASE_ID",
+      "batch_size": 20
+    }
+  ]
+}

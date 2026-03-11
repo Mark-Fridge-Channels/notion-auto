@@ -66,7 +66,7 @@ npm run run -- --help
 
 首次打开页面时脚本处于未运行状态，需点击「启动」才会执行。端口固定 9000，仅监听 localhost。
 
-**Queue Sender 与 NOTION_API_KEY**：出站发送依赖 Notion API 与 Gmail API。需配置环境变量 `NOTION_API_KEY`（Notion Integration Token，且 Integration 需加入 Queue 库与发件人库的 Collaborators）、`GMAIL_CLIENT_ID`、`GMAIL_CLIENT_SECRET`；发件人库中存各账号的 `Email` 与 `password`（作为 refresh_token 使用）。详见 issues/010 与 PLAN-014。
+**Queue Sender 与 NOTION_API_KEY**：出站发送依赖 Notion API 与 Gmail API。需配置环境变量 `NOTION_API_KEY`（Notion Integration Token，且 Integration 需加入 Queue 库与发件人库的 Collaborators）、`GMAIL_CLIENT_ID`、`GMAIL_CLIENT_SECRET`；发件人库中存各账号的 `Email` 与 `password`（作为 refresh_token 使用）。**多厂商（Zoho / Microsoft 365）**：发件人库与 📥 IM 表需在 Notion 中新增 **Provider** 列（Select），选项名须为 **Gmail**、**Zoho**、**Microsoft 365**（拼写与空格与 Notion 中一致）；发件人库每行选对应厂商，password 列仍存该厂商的 refresh_token；IM 表写入入站时会带 Provider，Reply 发信按 IM 的 Provider 选 API。Zoho/M365 需配置 env 见 `env.example`（ZOHO_*、M365_*）。详见 issues/030 与 PLAN-030。
 
 **Inbound Listener**：常驻进程，轮询 Gmail 入站（INBOX、排除 SENT），幂等写入 📥 RE Inbound Messages，按 Thread ID 路由到 📬 Touchpoints（与 Queue 表同一张），并对 Unsubscribe/Hard Bounce 写回 Touchpoints 止损。由 Dashboard「启动 Inbound Listener」启停。配置可在 **Dashboard 页面「Inbound Listener 配置」卡片**里填写并保存，会写入项目目录下的 `inbound-listener.json`。Gmail 需 **读邮件**（`gmail.readonly`）：若此前仅授权发信，须重新跑授权脚本并勾选「查看邮件」，再更新发件人库 password 列。**📥 RE Inbound Messages 表的 Classification 列需包含：Human Reply、Auto Reply、Unsubscribe、Bounce Hard、Bounce Soft、Other**（见 issues/019）。**具体配置步骤见下方「Inbound Listener 配置说明」**。详见 issues/014 与 PLAN-016。
 

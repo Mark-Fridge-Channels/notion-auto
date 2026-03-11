@@ -67,6 +67,7 @@ export async function findTouchpointsByThreadId(
 /**
  * 在 📥 IM 表创建一行。属性名与开发说明 3.1/3.2 一致。
  * touchpointPageId 可选；有则写 relation。needsReview 为 true 时写 Needs Review checkbox。
+ * provider 为入站所属厂商（Gmail / Zoho / Microsoft 365），用于 Reply 时选 API；IM 表需有 Provider 列（Select）。
  */
 export async function createInboundMessageRow(
   notion: Client,
@@ -85,10 +86,13 @@ export async function createInboundMessageRow(
     touchpointPageId?: string;
     classification?: InboundClassification;
     needsReview?: boolean;
+    /** 入站所属厂商，来自发件人库该行的 Provider */
+    provider: string;
   },
 ): Promise<string> {
   const dbId = toNotionDbId(inboundMessagesDbId);
   const bodyPlain = (params.bodyPlain ?? "").slice(0, 2000 * 10);
+  const providerName = (params.provider ?? "Gmail").trim() || "Gmail";
   const props: Record<string, unknown> = {
     "Message": { title: [{ type: "text", text: { content: params.messageTitle.slice(0, 2000) } }] },
     "Message ID": { rich_text: [{ type: "text", text: { content: params.gmailMessageId } }] },
@@ -103,6 +107,7 @@ export async function createInboundMessageRow(
     "Listener Run ID": { rich_text: [{ type: "text", text: { content: params.listenerRunId } }] },
     "Classification": { select: { name: params.classification ?? "Other" } },
     "Needs Review": { checkbox: params.needsReview === true },
+    "Provider": { select: { name: providerName } },
   };
   if (params.touchpointPageId) {
     (props as Record<string, unknown>)["Touchpoint"] = { relation: [{ id: params.touchpointPageId }] };
