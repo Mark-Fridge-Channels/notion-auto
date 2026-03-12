@@ -84,6 +84,29 @@ async function graphPost(
   return res.json();
 }
 
+async function graphPatch(
+  accessToken: string,
+  path: string,
+  body: Record<string, unknown>,
+): Promise<unknown> {
+  const url = path.startsWith("http") ? path : `${GRAPH_BASE}${path.startsWith("/") ? path : `/${path}`}`;
+  const res = await fetch(url, {
+    method: "PATCH",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok && res.status !== 200 && res.status !== 202 && res.status !== 204) {
+    const t = await res.text();
+    throw new Error(`Graph PATCH 失败: ${res.status} ${t}`);
+  }
+  if (res.status === 204 || res.status === 202) return {};
+  return res.json();
+}
+
 /** 发信结果：Graph sendMail 不返回 messageId；reply 也不返回。调用方用占位或仅 threadId。 */
 export interface M365SendResult {
   messageId: string;
@@ -125,6 +148,39 @@ export async function sendM365Reply(
   return { messageId, threadId: messageId };
 }
 
+export async function markM365MessageRead(accessToken: string, messageId: string): Promise<void> {
+  await graphPatch(accessToken, `/me/messages/${messageId}`, {
+    isRead: true,
+  });
+}
+
+export async function flagM365Message(accessToken: string, messageId: string): Promise<void> {
+  await graphPatch(accessToken, `/me/messages/${messageId}`, {
+    flag: {
+      flagStatus: "flagged",
+    },
+  });
+}
+
+export async function addM365Contact(
+  accessToken: string,
+  email: string,
+  displayName: string,
+): Promise<string> {
+  const parts = displayName.trim().split(/\s+/).filter(Boolean);
+  const givenName = parts[0] ?? email;
+  const surname = parts.slice(1).join(" ");
+  const raw = await graphPost(accessToken, "/me/contacts", {
+    givenName,
+    surname,
+    emailAddresses: [{ address: email, name: displayName || email }],
+  });
+  const data = raw as { id?: string };
+  const contactId = data.id?.trim();
+  if (!contactId) throw new Error("Graph Contacts 未返回 id");
+  return contactId;
+}
+
 /** 列表项：id、conversationId（作 threadId 用）及可选元数据 */
 export interface M365MessageListItem {
   id: string;
@@ -158,6 +214,21 @@ export async function listM365InboxMessageIds(
     receivedDateTime: typeof m.receivedDateTime === "string" ? m.receivedDateTime : undefined,
     bodyPreview: typeof m.bodyPreview === "string" ? m.bodyPreview : undefined,
   })).filter((x) => x.id);
+}
+
+export async function findLatestM365MessageIdByConversation(
+  accessToken: string,
+  conversationId: string,
+): Promise<string | null> {
+  const escapedConversationId = conversationId.replace(/'/g, "''");
+  const filter = encodeURIComponent(`conversationId eq '${escapedConversationId}'`);
+  const raw = await graphGet(
+    accessToken,
+    `/me/messages?$top=1&$orderby=receivedDateTime%20desc&$filter=${filter}&$select=id`,
+  );
+  const value = (raw as { value?: Array<{ id?: string }> }).value;
+  const messageId = value?.[0]?.id?.trim();
+  return messageId || null;
 }
 
 /**

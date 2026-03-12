@@ -1,7 +1,6 @@
 /**
- * Queue Sender 子进程管理：启动/停止 src/queue-sender.ts，采集 stdout/stderr，保留最近 10 次运行日志。
- * 无自动重启；由 Dashboard 启停。
- * 停止时使用 tree-kill 结束整棵进程树（npx → tsx/node），避免残留子进程。
+ * Warmup Executor 子进程管理：启动/停止 src/queue-sender.ts（兼容旧入口路径），
+ * 采集 stdout/stderr，保留最近 10 次运行日志。无自动重启；由 Dashboard 启停。
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
@@ -73,7 +72,7 @@ export function startQueueSender(): void {
     chunk.toString("utf-8").split("\n").forEach((line) => {
       if (line) {
         appendLine(line);
-        if (verbose) process.stderr.write(`[Queue Sender] ${line}\n`);
+        if (verbose) process.stderr.write(`[Warmup Executor] ${line}\n`);
       }
     });
   });
@@ -81,7 +80,7 @@ export function startQueueSender(): void {
     chunk.toString("utf-8").split("\n").forEach((line) => {
       if (line) {
         appendLine(line);
-        if (verbose) process.stderr.write(`[Queue Sender] ${line}\n`);
+        if (verbose) process.stderr.write(`[Warmup Executor] ${line}\n`);
       }
     });
   });
@@ -95,18 +94,18 @@ export function startQueueSender(): void {
     }
   });
   child.on("error", (err) => {
-    logger.warn("Queue Sender 子进程 error", err);
+    logger.warn("Warmup Executor 子进程 error", err);
   });
 }
 
-/** 停止 Queue Sender：结束进程树（npx 及其子进程 tsx/node），避免残留。 */
+/** 停止 Warmup Executor：结束进程树（npx 及其子进程 tsx/node），避免残留。 */
 export function stopQueueSender(): void {
   if (currentProcess == null) return;
   const pid = currentProcess.pid;
   currentProcess = null;
   if (pid != null) {
     treeKill(pid, "SIGTERM", (err) => {
-      if (err) logger.warn("Queue Sender 进程树结束时报错", err);
+      if (err) logger.warn("Warmup Executor 进程树结束时报错", err);
     });
   }
 }

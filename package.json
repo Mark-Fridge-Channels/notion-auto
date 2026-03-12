@@ -17,12 +17,15 @@
   "license": "MIT",
   "devDependencies": {
     "@types/node": "^22.10.0",
-    "tsx": "^4.19.2"
+    "@types/nodemailer": "^7.0.11",
+    "tsx": "^4.19.2",
+    "typescript": "^5.9.3"
   },
   "dependencies": {
     "@notionhq/client": "^2.2.15",
     "dotenv": "^17.2.4",
     "googleapis": "^144.0.0",
+    "imapflow": "^1.2.13",
     "nodemailer": "^6.9.16",
     "playwright": "^1.49.0",
     "tree-kill": "^1.2.2"

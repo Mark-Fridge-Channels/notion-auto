@@ -173,6 +173,30 @@ export async function getMessageAndParse(
   };
 }
 
+export async function getGmailMessageMetadata(
+  gmail: gmail_v1.Gmail,
+  userId: string,
+  messageId: string,
+): Promise<{ messageId: string; threadId: string; subject: string; from: string } | null> {
+  const res = await withRetry(() =>
+    gmail.users.messages.get({
+      userId,
+      id: messageId,
+      format: "metadata",
+      metadataHeaders: ["Subject", "From"],
+    }),
+  );
+  const msg = res.data;
+  if (!msg.id || !msg.threadId) return null;
+  const headers = (msg.payload?.headers ?? []) as Array<{ name?: string; value?: string }>;
+  return {
+    messageId: msg.id,
+    threadId: msg.threadId,
+    subject: getHeader(headers, "Subject") ?? "",
+    from: getHeader(headers, "From") ?? "",
+  };
+}
+
 function getHeader(headers: Array<{ name?: string; value?: string }>, name: string): string | null {
   const lower = name.toLowerCase();
   const h = headers.find((x) => (x.name ?? "").toLowerCase() === lower);

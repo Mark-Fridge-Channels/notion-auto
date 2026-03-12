@@ -1,9 +1,13 @@
 {
   "entries": [
     {
-      "name": "主 Queue",
-      "queue_database_url": "https://www.notion.so/your-workspace/YOUR_QUEUE_DATABASE_ID",
-      "sender_accounts_database_url": "https://www.notion.so/your-workspace/YOUR_SENDER_ACCOUNTS_DATABASE_ID",
+      "name": "主 Warmup",
+      "queue_database_url": "https://www.notion.so/your-workspace/YOUR_EMAIL_WARMUP_QUEUE_DATABASE_ID",
+      "credential_registry_database_url": "https://www.notion.so/your-workspace/YOUR_CREDENTIAL_REGISTRY_DATABASE_ID",
+      "execution_log_database_url": "https://www.notion.so/your-workspace/YOUR_EXECUTION_LOG_DATABASE_ID",
+      "conversation_event_log_database_url": "https://www.notion.so/your-workspace/YOUR_CONVERSATION_EVENT_LOG_DATABASE_ID",
+      "bandwidth_detail_database_url": "https://www.notion.so/your-workspace/YOUR_BANDWIDTH_DETAIL_DATABASE_ID",
+      "warmup_mailbox_pool_database_url": "https://www.notion.so/your-workspace/YOUR_WARMUP_MAILBOX_POOL_DATABASE_ID",
       "batch_size": 20
     }
   ]

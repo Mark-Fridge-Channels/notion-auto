@@ -22,6 +22,11 @@ function getZohoMailBaseUrl(region: string): string {
   return `https://mail.${domain}`;
 }
 
+function getZohoContactsBaseUrl(region: string): string {
+  const domain = region === "com.cn" ? "zoho.com.cn" : `zoho.${region}`;
+  return `https://contacts.${domain}`;
+}
+
 /**
  * 使用 refresh_token 换取 access_token。需 env：ZOHO_CLIENT_ID、ZOHO_CLIENT_SECRET；ZOHO_REDIRECT_URI 须与注册一致（可选，默认 https://localhost）。
  */
@@ -93,6 +98,30 @@ async function zohoApiPost(
   if (!res.ok) {
     const t = await res.text();
     throw new Error(`Zoho API POST 失败: ${res.status} ${t}`);
+  }
+  return res.json();
+}
+
+async function zohoApiPut(
+  accessToken: string,
+  path: string,
+  body: Record<string, unknown>,
+): Promise<unknown> {
+  const region = getZohoRegion();
+  const base = getZohoMailBaseUrl(region);
+  const url = path.startsWith("http") ? path : `${base}${path.startsWith("/") ? path : `/api${path}`}`;
+  const res = await fetch(url, {
+    method: "PUT",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      Authorization: `Zoho-oauthtoken ${accessToken}`,
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const t = await res.text();
+    throw new Error(`Zoho API PUT 失败: ${res.status} ${t}`);
   }
   return res.json();
 }
@@ -178,6 +207,77 @@ export async function sendZohoReply(
     mailFormat: "html",
   });
   return { messageId, threadId: messageId };
+}
+
+export async function markZohoMessageRead(
+  accessToken: string,
+  accountId: string,
+  messageId: string,
+): Promise<void> {
+  await zohoApiPut(accessToken, `/api/accounts/${accountId}/updatemessage`, {
+    mode: "markAsRead",
+    messageId: [messageId],
+  });
+}
+
+export async function markZohoThreadRead(
+  accessToken: string,
+  accountId: string,
+  threadId: string,
+): Promise<void> {
+  await zohoApiPut(accessToken, `/api/accounts/${accountId}/updatethread`, {
+    mode: "markAsRead",
+    threadId: [threadId],
+  });
+}
+
+export async function flagZohoThread(
+  accessToken: string,
+  accountId: string,
+  threadId: string,
+): Promise<void> {
+  await zohoApiPut(accessToken, `/api/accounts/${accountId}/updatethread`, {
+    mode: "setFlag",
+    flagId: "2",
+    threadId: [threadId],
+  });
+}
+
+export async function addZohoContact(
+  accessToken: string,
+  email: string,
+  displayName: string,
+): Promise<string> {
+  const region = getZohoRegion();
+  const url = `${getZohoContactsBaseUrl(region)}/api/v1/accounts/self/contacts?source=notion-auto`;
+  const parts = displayName.trim().split(/\s+/).filter(Boolean);
+  const firstName = parts[0] ?? email;
+  const lastName = parts.slice(1).join(" ");
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      Authorization: `Zoho-oauthtoken ${accessToken}`,
+    },
+    body: JSON.stringify({
+      contacts: [
+        {
+          first_name: firstName,
+          last_name: lastName,
+          emails: [{ is_primary: true, email_id: email }],
+        },
+      ],
+    }),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Zoho Contacts 创建失败: ${res.status} ${text}`);
+  }
+  const data = (await res.json()) as { contacts?: { contact_id?: string; email_id?: string } };
+  const contactId = data.contacts?.contact_id?.trim();
+  if (!contactId) throw new Error("Zoho Contacts 未返回 contact_id");
+  return contactId;
 }
 
 /** 列表项：id、threadId 及可选元数据（用于 getZohoMessageAndParse） */

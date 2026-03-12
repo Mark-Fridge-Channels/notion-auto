@@ -22,6 +22,21 @@ export function getGmailClient(refreshToken: string): { gmail: import("googleapi
   return { gmail, userId: "me" };
 }
 
+function getGoogleOAuthClient(refreshToken: string): import("googleapis").Auth.OAuth2Client {
+  const clientId = process.env.GMAIL_CLIENT_ID;
+  const clientSecret = process.env.GMAIL_CLIENT_SECRET;
+  if (!clientId || !clientSecret)
+    throw new Error("缺少 GMAIL_CLIENT_ID 或 GMAIL_CLIENT_SECRET 环境变量");
+  const oauth2 = new google.auth.OAuth2(clientId, clientSecret, "urn:ietf:wg:oauth:2.0:oob");
+  oauth2.setCredentials({ refresh_token: refreshToken });
+  return oauth2;
+}
+
+export function getGooglePeopleClient(refreshToken: string): import("googleapis").people_v1.People {
+  const auth = getGoogleOAuthClient(refreshToken);
+  return google.people({ version: "v1", auth });
+}
+
 /**
  * 纯文本转 HTML 正文：转义 & < >，换行 → <br>。
  * 用于以 text/html 发送时的正文，使 \n 在邮件客户端显示为换行。Queue Sender 与 Reply Tasks 共用。
@@ -149,4 +164,76 @@ export async function sendFollowup(
   const returnedThreadId = res.data.threadId;
   if (!messageId || !returnedThreadId) throw new Error("Gmail API 未返回 message id 或 threadId");
   return { messageId, threadId: returnedThreadId };
+}
+
+export async function markGmailMessageRead(
+  gmail: import("googleapis").gmail_v1.Gmail,
+  userId: string,
+  messageId: string,
+): Promise<void> {
+  await gmail.users.messages.modify({
+    userId,
+    id: messageId,
+    requestBody: {
+      removeLabelIds: ["UNREAD"],
+    },
+  });
+}
+
+export async function markGmailThreadRead(
+  gmail: import("googleapis").gmail_v1.Gmail,
+  userId: string,
+  threadId: string,
+): Promise<void> {
+  await gmail.users.threads.modify({
+    userId,
+    id: threadId,
+    requestBody: {
+      removeLabelIds: ["UNREAD"],
+    },
+  });
+}
+
+export async function starGmailMessage(
+  gmail: import("googleapis").gmail_v1.Gmail,
+  userId: string,
+  messageId: string,
+): Promise<void> {
+  await gmail.users.messages.modify({
+    userId,
+    id: messageId,
+    requestBody: {
+      addLabelIds: ["STARRED"],
+    },
+  });
+}
+
+export async function starGmailThread(
+  gmail: import("googleapis").gmail_v1.Gmail,
+  userId: string,
+  threadId: string,
+): Promise<void> {
+  await gmail.users.threads.modify({
+    userId,
+    id: threadId,
+    requestBody: {
+      addLabelIds: ["STARRED"],
+    },
+  });
+}
+
+export async function addGoogleContact(
+  people: import("googleapis").people_v1.People,
+  email: string,
+  displayName: string,
+): Promise<string> {
+  const result = await people.people.createContact({
+    requestBody: {
+      names: displayName ? [{ displayName }] : undefined,
+      emailAddresses: [{ value: email }],
+    },
+  });
+  const resourceName = result.data.resourceName?.trim();
+  if (!resourceName) throw new Error("Google People API 未返回 resourceName");
+  return resourceName;
 }

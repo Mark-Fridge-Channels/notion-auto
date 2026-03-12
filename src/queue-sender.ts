@@ -1,297 +1,313 @@
 /**
- * Queue Sender 常驻进程：从 queue-sender.json 读取多条 Queue 配置，每轮按顺序对每条拉取 Pending 并发送。
- * 由 Dashboard 启停；不再依赖 schedule 时段。
+ * Warmup Executor Dry Run：读取 queue-sender.json 中配置的 Warmup 数据层，消费通过审计的
+ * `Email Warmup Queue` 行，进行资格判断与状态推进，并回写 Queue / Execution Log /
+ * Warmup Conversation Event Log。V1 不真实发送邮件。
  */
 
 import "dotenv/config";
 import { Client } from "@notionhq/client";
-import {
-  parseDatabaseId,
-  queryQueuePending,
-  updateQueuePageSuccess,
-  updateQueuePageFailure,
-  fetchSenderCredentials,
-  type QueueItem,
-} from "./notion-queue.js";
-import { getGmailClient, plainToHtml, sendCold1, sendFollowup } from "./gmail-send.js";
-import {
-  getZohoAccessToken,
-  getZohoAccountId,
-  sendZohoCold1,
-  sendZohoReply,
-} from "./zoho-mail.js";
-import {
-  getM365AccessToken,
-  sendM365Cold1,
-  sendM365Reply,
-} from "./m365-mail.js";
+import type { WarmupExecutorEntry } from "./queue-sender-config.js";
 import { loadQueueSenderConfigOrDefault } from "./queue-sender-config.js";
-import type { QueueSenderEntry } from "./queue-sender-config.js";
+import {
+  buildContentExcerpt,
+  createConversationEventEntry,
+  createExecutionLogEntry,
+  evaluateBandwidthGuard,
+  findBandwidthRecordForAction,
+  getBandwidthRecordByPageId,
+  hasConversationEvent,
+  hasExecutionLogEvent,
+  logQueueSkip,
+  lookupDependencyStatus,
+  queryWarmupQueueCandidates,
+  resolveWarmupCredential,
+  updateWarmupQueuePage,
+  type WarmupQueueItem,
+} from "./notion-warmup.js";
 import { logger } from "./logger.js";
+import {
+  buildExecutionExternalEventId,
+  buildSyntheticMessageId,
+  getWarmupEventMapping,
+  isCredentialEligible,
+  WARMUP_PLATFORM_EMAIL,
+  WARMUP_STATUS_CANCELLED,
+  WARMUP_STATUS_FAILED,
+  WARMUP_STATUS_SENT,
+  type WarmupExecutionEventType,
+} from "./warmup-constants.js";
+import {
+  createWarmupProviderExecutionContext,
+  getWarmupActionDescriptor,
+  getWarmupProviderAdapter,
+  type WarmupActionExecutionResult,
+} from "./warmup-provider.js";
 
-const MAX_RETRIES = 3;
-/** 每轮固定间隔（分钟级轮询） */
 const ROUND_INTERVAL_MS = 60_000;
 
-/** Planned Send At 发送窗口：仅当计划时间落在 [now-5min, now] 内才发送 */
-const PLANNED_SEND_WINDOW_MS = 5 * 60 * 1000;
-
-/** 从 env 读取节流参数（仅每日上限）；按发送者独立生效 */
-function getThrottleConfig(): { maxPerDay: number } {
-  const maxPerDay = Math.max(1, parseInt(process.env.QUEUE_THROTTLE_MAX_PER_DAY ?? "50", 10)) || 50;
-  return { maxPerDay };
-}
-
-/** 单发送者节流状态：仅按自然日滚动，每日上限 */
-interface SenderThrottleState {
-  countThisDay: number;
-  dayStart: number;
-}
-
 function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** 给定时间的当日 0 点（本地）时间戳 */
-function startOfDay(now: Date): number {
-  const d = new Date(now);
-  d.setHours(0, 0, 0, 0);
-  return d.getTime();
+function generateExecutorRunId(): string {
+  const now = new Date();
+  const ts = now.toISOString().replace(/[-:.TZ]/g, "").slice(0, 14);
+  const rand = Math.random().toString(36).slice(2, 6);
+  return `exec-${ts}-${rand}`;
 }
 
-/**
- * 按自然日滚动：若已进入新日则重置计数，返回是否在每日限额内可发。
- */
-function rollAndCanSend(
-  state: SenderThrottleState,
-  now: Date,
-  maxPerDay: number,
-): { state: SenderThrottleState; canSend: boolean } {
-  const day0 = startOfDay(now);
-  let { countThisDay, dayStart } = state;
-  if (day0 > state.dayStart) {
-    countThisDay = 0;
-    dayStart = day0;
+function getFailureNextStepRule(): string {
+  return "manual_review_required";
+}
+
+function getSuccessNextStepRule(item: WarmupQueueItem): string {
+  return item.nextStepRule.trim() || "completed";
+}
+
+function getSuccessStep(item: WarmupQueueItem): string {
+  return `${item.plannedEventType.toLowerCase().replace(/\s+/g, "_")}_completed`;
+}
+
+async function failItem(
+  notion: Client,
+  item: WarmupQueueItem,
+  executorRunId: string,
+  currentStep: string,
+): Promise<void> {
+  await updateWarmupQueuePage(notion, item.pageId, {
+    status: WARMUP_STATUS_FAILED,
+    currentStep,
+    nextStepRule: getFailureNextStepRule(),
+    executorRunId,
+    lastExecutorSyncAt: new Date(),
+  });
+}
+
+async function maybeWriteLogs(
+  notion: Client,
+  entry: WarmupExecutorEntry,
+  item: WarmupQueueItem,
+  executorRunId: string,
+  policyVersion: string,
+  strategyVersion: string,
+  result: WarmupActionExecutionResult,
+): Promise<void> {
+  const mapping = getWarmupEventMapping(item.plannedEventType);
+  if (!mapping.executionEventType || !mapping.conversationEventType || !mapping.actionType) {
+    return;
   }
-  const canSend = countThisDay < maxPerDay;
-  return {
-    state: { ...state, countThisDay, dayStart },
-    canSend,
-  };
+  const eventType: WarmupExecutionEventType = mapping.executionEventType;
+  const externalEventId = buildExecutionExternalEventId(executorRunId, item.taskId, eventType);
+  const messageId = result.messageId || (
+    item.plannedEventType === "Send" || item.plannedEventType === "Reply"
+      ? buildSyntheticMessageId(item.taskId)
+      : undefined
+  );
+  const metadataJson = JSON.stringify({
+    dry_run: false,
+    planned_event_type: item.plannedEventType,
+    platform: WARMUP_PLATFORM_EMAIL,
+    provider: result.provider,
+    subject_present: Boolean(item.subject.trim()),
+    body_present: Boolean(item.body.trim()),
+    reply_to_message_id: item.replyToMessageId || null,
+    execution: result.metadata,
+  });
+  const contentExcerpt = buildContentExcerpt(item);
+
+  if (!(await hasExecutionLogEvent(notion, entry.execution_log_database_url, item.taskId, externalEventId))) {
+    await createExecutionLogEntry(notion, entry.execution_log_database_url, {
+      name: `${item.plannedEventType} ${item.taskId}`,
+      accountId: item.actorMailboxId || item.account,
+      actionType: mapping.actionType,
+      eventType,
+      result: "success",
+      queueTaskId: item.taskId,
+      taskId: item.taskId,
+      relationshipId: item.relationshipId,
+      threadId: result.threadId || item.threadId,
+      actorMailboxId: item.actorMailboxId || item.account,
+      counterpartyMailboxId: item.counterpartyMailboxId || item.target,
+      direction: mapping.direction,
+      executeTime: new Date(),
+      externalEventId,
+      messageId,
+      contentExcerpt,
+      eventMetadataJson: metadataJson,
+      policyVersion,
+      strategyVersion,
+    });
+  }
+
+  if (!(await hasConversationEvent(notion, entry.conversation_event_log_database_url, item.taskId, externalEventId))) {
+    await createConversationEventEntry(notion, entry.conversation_event_log_database_url, {
+      eventTitle: `${item.plannedEventType} ${item.taskId}`,
+      observedAt: new Date(),
+      eventType: mapping.conversationEventType,
+      direction: mapping.direction,
+      relationshipId: item.relationshipId,
+      threadId: result.threadId || item.threadId,
+      actorMailboxId: item.actorMailboxId || item.account,
+      counterpartyMailboxId: item.counterpartyMailboxId || item.target,
+      queueTaskId: item.taskId,
+      externalEventId,
+      eventMetadataJson: metadataJson,
+      contentExcerpt,
+    });
+  }
 }
 
-/** 处理单条：取凭据、发信、回写。 */
 async function processOne(
   notion: Client,
-  item: QueueItem,
-  senderAccountsDatabaseUrl: string,
+  entry: WarmupExecutorEntry,
+  item: WarmupQueueItem,
+  executorRunId: string,
 ): Promise<void> {
-  const senderUrl = senderAccountsDatabaseUrl.trim();
-  if (!senderUrl) {
-    await updateQueuePageFailure(notion, item.pageId, {
-      stopReason: "发件人库 URL 未配置",
-      needsReview: true,
-      emailStatusPending: true,
-    });
+  if (item.executorRunId.trim() || item.lastExecutorSyncAt) {
+    logQueueSkip(item, "already_synced");
     return;
   }
-  logger.info(`处理 page=${item.pageId} 正在取发件人凭据 senderAccount=${item.senderAccount}…`);
-  const creds = await fetchSenderCredentials(notion, senderUrl, item.senderAccount);
-  if (!creds) {
-    logger.warn(`page=${item.pageId} 未找到发件人凭据 Sender Account=${item.senderAccount}`);
-    await updateQueuePageFailure(notion, item.pageId, {
-      stopReason: `未找到发件人凭据: Sender Account=${item.senderAccount}`,
-      needsReview: true,
-      emailStatusPending: true,
-    });
-    return;
-  }
-  logger.info(`page=${item.pageId} 凭据已取到 provider=${creds.provider}，准备发信 to=${item.email}`);
-  const isFollowup = Boolean(item.threadId && item.threadId.trim());
-  if (isFollowup && !(item.messageIdLast && item.messageIdLast.trim())) {
-    await updateQueuePageFailure(notion, item.pageId, {
-      stopReason: "Missing Message ID Last for followup (References)",
-      needsReview: true,
-      emailStatusPending: true,
-    });
-    return;
-  }
-  const provider = (creds.provider ?? "Gmail").trim() || "Gmail";
-  let lastError: Error | null = null;
-  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-    try {
-      if (attempt > 1) logger.info(`page=${item.pageId} 重试发信 ${attempt}/${MAX_RETRIES}`);
-      let result: { messageId: string; threadId: string };
 
-      if (provider === "Gmail") {
-        const { gmail, userId } = getGmailClient(creds.password);
-        if (isFollowup && item.threadId && item.messageIdLast) {
-          result = await sendFollowup(
-            gmail,
-            userId,
-            item.threadId,
-            item.messageIdLast,
-            creds.email,
-            item.email,
-            item.emailSubject,
-            plainToHtml(item.emailBody),
-          );
-        } else {
-          result = await sendCold1(
-            gmail,
-            userId,
-            creds.email,
-            item.email,
-            item.emailSubject,
-            plainToHtml(item.emailBody),
-          );
-        }
-      } else if (provider === "Zoho") {
-        const accessToken = await getZohoAccessToken(creds.password);
-        const accountId = await getZohoAccountId(accessToken);
-        const htmlBody = plainToHtml(item.emailBody);
-        if (isFollowup && item.messageIdLast) {
-          result = await sendZohoReply(
-            accessToken,
-            accountId,
-            item.messageIdLast,
-            creds.email,
-            item.email,
-            item.emailSubject,
-            htmlBody,
-          );
-        } else {
-          result = await sendZohoCold1(
-            accessToken,
-            accountId,
-            creds.email,
-            item.email,
-            item.emailSubject,
-            htmlBody,
-          );
-        }
-      } else if (provider === "Microsoft 365") {
-        const accessToken = await getM365AccessToken(creds.password);
-        const htmlBody = plainToHtml(item.emailBody);
-        if (isFollowup && item.messageIdLast) {
-          result = await sendM365Reply(accessToken, item.messageIdLast, htmlBody);
-        } else {
-          result = await sendM365Cold1(
-            accessToken,
-            creds.email,
-            item.email,
-            item.emailSubject,
-            htmlBody,
-          );
-        }
-      } else {
-        await updateQueuePageFailure(notion, item.pageId, {
-          stopReason: `不支持的 Provider: ${provider}，仅支持 Gmail / Zoho / Microsoft 365`,
-          needsReview: true,
-          emailStatusPending: true,
-        });
-        return;
-      }
-
-      await updateQueuePageSuccess(notion, item.pageId, {
-        sentAt: new Date(),
-        threadId: result.threadId,
-        messageId: result.messageId || result.threadId,
-        subjectLast: item.emailSubject,
-      });
-      logger.info(`Queue 发送成功 page=${item.pageId} to=${item.email} messageId=${result.messageId}`);
+  if (item.dependsOnTaskId.trim()) {
+    const dependency = await lookupDependencyStatus(notion, entry.queue_database_url, item.dependsOnTaskId);
+    if (!dependency.found) {
+      await failItem(notion, item, executorRunId, "missing_dependency");
       return;
-    } catch (e) {
-      lastError = e instanceof Error ? e : new Error(String(e));
-      const msg = lastError.message || String(e);
-      const isTransient =
-        /timeout|ECONNRESET|429|5\d{2}/i.test(msg) || msg.includes("rate limit");
-      if (!isTransient || attempt === MAX_RETRIES) {
-        await updateQueuePageFailure(notion, item.pageId, {
-          stopReason: msg.slice(0, 2000),
-          needsReview: true,
-          emailStatusPending: true,
-          stopFlag: !isTransient,
-        });
-        logger.warn(`Queue 发送失败 page=${item.pageId} ${msg}`);
-        return;
-      }
-      logger.warn(`Queue 发送临时失败 page=${item.pageId} 重试 ${attempt}/${MAX_RETRIES} ${msg}`);
-      await sleep(2000 * attempt);
+    }
+    if (dependency.status === WARMUP_STATUS_CANCELLED) {
+      await failItem(notion, item, executorRunId, "blocked_by_cancelled_dependency");
+      return;
+    }
+    if (dependency.status === WARMUP_STATUS_FAILED) {
+      await failItem(notion, item, executorRunId, "blocked_by_failed_dependency");
+      return;
+    }
+    if (dependency.status !== WARMUP_STATUS_SENT) {
+      logQueueSkip(item, "dependency_not_ready");
+      return;
     }
   }
-  if (lastError) {
-    await updateQueuePageFailure(notion, item.pageId, {
-      stopReason: lastError.message.slice(0, 2000),
-      needsReview: true,
-      emailStatusPending: true,
-    });
+
+  const credential = await resolveWarmupCredential(
+    notion,
+    entry.credential_registry_database_url,
+    item.actorMailboxId || item.account,
+  );
+  if (!credential) {
+    await failItem(notion, item, executorRunId, "credential_not_found");
+    return;
   }
+  if (!isCredentialEligible(credential.executorEnabled, credential.credentialStatus)) {
+    await failItem(notion, item, executorRunId, "credential_not_eligible");
+    return;
+  }
+
+  const actionDescriptor = getWarmupActionDescriptor(item.plannedEventType);
+  if (actionDescriptor.requiresSubject && !item.subject.trim()) {
+    await failItem(notion, item, executorRunId, "missing_subject");
+    return;
+  }
+  if (actionDescriptor.requiresBody && !item.body.trim()) {
+    await failItem(notion, item, executorRunId, "missing_body");
+    return;
+  }
+  if (actionDescriptor.requiresReplyToMessageId && !item.replyToMessageId.trim()) {
+    await failItem(notion, item, executorRunId, "missing_reply_to_message_id");
+    return;
+  }
+
+  const providerContext = createWarmupProviderExecutionContext(item, credential);
+  const adapter = getWarmupProviderAdapter(providerContext.runtime.provider);
+  if (!adapter) {
+    await failItem(notion, item, executorRunId, "unsupported_provider");
+    return;
+  }
+  if (!adapter.supports(item.plannedEventType)) {
+    await failItem(notion, item, executorRunId, "unsupported_action");
+    return;
+  }
+
+  const mapping = getWarmupEventMapping(item.plannedEventType);
+  let bandwidth = credential.bandwidthDetailPageId
+    ? await getBandwidthRecordByPageId(notion, entry.bandwidth_detail_database_url, credential.bandwidthDetailPageId)
+    : null;
+
+  const requiresBandwidthLookup = item.plannedEventType === "Send" || item.plannedEventType === "Reply";
+  if (!bandwidth && requiresBandwidthLookup && mapping.actionType) {
+    bandwidth = await findBandwidthRecordForAction(
+      notion,
+      entry.bandwidth_detail_database_url,
+      item.actorMailboxId || item.account,
+      mapping.actionType,
+    );
+    if (!bandwidth) {
+      await failItem(notion, item, executorRunId, "missing_bandwidth_detail");
+      return;
+    }
+  }
+
+  const bandwidthReason = evaluateBandwidthGuard(bandwidth, new Date());
+  if (bandwidthReason) {
+    await failItem(notion, item, executorRunId, bandwidthReason);
+    return;
+  }
+
+  const executionResult = await adapter.execute(providerContext);
+
+  await updateWarmupQueuePage(notion, item.pageId, {
+    status: WARMUP_STATUS_SENT,
+    currentStep: getSuccessStep(item),
+    nextStepRule: getSuccessNextStepRule(item),
+    executorRunId,
+    lastExecutorSyncAt: new Date(),
+  });
+  await maybeWriteLogs(
+    notion,
+    entry,
+    item,
+    executorRunId,
+    bandwidth?.policyVersion ?? "",
+    bandwidth?.strategyVersion ?? "",
+    executionResult,
+  );
+  logger.info(
+    `Warmup 执行成功 task_id=${item.taskId} event=${item.plannedEventType} provider=${executionResult.provider}`,
+  );
 }
 
-/**
- * 按发送者分组，同一发送者内保持 Queued At 顺序（items 已按 Queued At 升序）。
- */
-function groupBySender(items: QueueItem[]): Map<string, QueueItem[]> {
-  const map = new Map<string, QueueItem[]>();
-  for (const item of items) {
-    const key = item.senderAccount.trim() || "(empty)";
-    const list = map.get(key);
-    if (list) list.push(item);
-    else map.set(key, [item]);
+async function runOneRound(notion: Client, entry: WarmupExecutorEntry): Promise<void> {
+  if (
+    !entry.queue_database_url.trim() ||
+    !entry.credential_registry_database_url.trim() ||
+    !entry.execution_log_database_url.trim() ||
+    !entry.conversation_event_log_database_url.trim() ||
+    !entry.bandwidth_detail_database_url.trim()
+  ) {
+    logger.warn(`Warmup Executor 配置不完整，已跳过 name=${entry.name}`);
+    return;
   }
-  return map;
-}
-
-/**
- * 对单条配置执行一轮：拉取该 Queue 库（5 分钟窗口）→ 按发送者分组 → 每发送者至多发 1 条（满足每日节流则 processOne）。
- * 共用 senderStates，同一发件人跨多条配置共享每日上限。
- */
-async function runOneRound(
-  notion: Client,
-  entry: QueueSenderEntry,
-  throttle: ReturnType<typeof getThrottleConfig>,
-  senderStates: Map<string, SenderThrottleState>,
-): Promise<void> {
-  const queueDbId = parseDatabaseId(entry.queue_database_url);
-  const batchSize = Math.min(100, Math.max(1, entry.batch_size ?? 20));
   const now = new Date();
-  const items = await queryQueuePending(notion, queueDbId, batchSize, now, {
-    plannedSendWindowMs: PLANNED_SEND_WINDOW_MS,
+  const executorRunId = generateExecutorRunId();
+  const items = await queryWarmupQueueCandidates(notion, entry.queue_database_url, {
+    now,
+    batchSize: Math.min(100, Math.max(1, entry.batch_size ?? 20)),
   });
   if (items.length === 0) return;
-  const bySender = groupBySender(items);
-  const senderUrl = entry.sender_accounts_database_url.trim();
-
-  for (const [senderKey, list] of bySender) {
-    if (list.length === 0) continue;
-    let state = senderStates.get(senderKey);
-    if (state == null) {
-      state = { countThisDay: 0, dayStart: startOfDay(now) };
-    }
-    const { state: rolled, canSend } = rollAndCanSend(state, now, throttle.maxPerDay);
-    senderStates.set(senderKey, rolled);
-    if (!canSend) continue;
-    const item = list[0];
+  for (const item of items) {
     try {
-      await processOne(notion, item, senderUrl);
-      senderStates.set(senderKey, {
-        ...rolled,
-        countThisDay: rolled.countThisDay + 1,
-      });
-    } catch (e) {
-      logger.warn(`处理 Queue 项失败 page=${item.pageId}`, e instanceof Error ? e.message : e);
+      await processOne(notion, entry, item, executorRunId);
+    } catch (error) {
+      logger.warn(
+        `Warmup Executor 处理失败 task_id=${item.taskId}`,
+        error instanceof Error ? error.message : error,
+      );
+      await failItem(notion, item, executorRunId, "executor_exception");
     }
   }
 }
 
-/** 主循环：每轮加载配置，对每条 entry 顺序执行一轮拉取+发送，然后固定 sleep 1 分钟。 */
 async function main(): Promise<void> {
-  const throttle = getThrottleConfig();
-  const senderStates = new Map<string, SenderThrottleState>();
-  logger.info(
-    "Queue Sender 已启动，配置来自 queue-sender.json；每轮跑所有 Queue，Planned Send At 5 分钟窗口、每分钟轮询；节流仅每日上限",
-  );
+  logger.info("Warmup Executor 已启动，配置来自 queue-sender.json；每分钟轮询真实库并执行真实动作");
   for (;;) {
     try {
       const config = await loadQueueSenderConfigOrDefault();
@@ -299,30 +315,24 @@ async function main(): Promise<void> {
         await sleep(ROUND_INTERVAL_MS);
         continue;
       }
-      const token = process.env.NOTION_API_KEY;
-      if (!token?.trim()) {
-        logger.warn("未配置 NOTION_API_KEY，跳过本轮");
+      const token = process.env.NOTION_API_KEY?.trim();
+      if (!token) {
+        logger.warn("未配置 NOTION_API_KEY，Warmup Executor 跳过本轮");
         await sleep(ROUND_INTERVAL_MS);
         continue;
       }
       const notion = new Client({ auth: token });
       for (const entry of config.entries) {
-        await runOneRound(notion, entry, throttle, senderStates);
+        await runOneRound(notion, entry);
       }
-      await sleep(ROUND_INTERVAL_MS);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      const isNetwork =
-        /socket disconnected|TLS|ECONNRESET|ETIMEDOUT|ENOTFOUND|network|ECONNREFUSED/i.test(msg);
-      if (isNetwork)
-        logger.warn(`Queue Sender 本轮异常：疑似网络连接问题，下轮将重试。原始错误: ${msg.slice(0, 120)}`);
-      else logger.warn("Queue Sender 本轮异常", e);
-      await sleep(ROUND_INTERVAL_MS);
+    } catch (error) {
+      logger.warn("Warmup Executor 本轮异常", error);
     }
+    await sleep(ROUND_INTERVAL_MS);
   }
 }
 
-main().catch((e) => {
-  logger.error("Queue Sender 退出", e);
+main().catch((error) => {
+  logger.error(`Warmup Executor 退出: ${error instanceof Error ? error.message : String(error)}`);
   process.exit(1);
 });

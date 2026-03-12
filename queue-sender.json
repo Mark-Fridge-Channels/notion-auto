@@ -1,15 +1,13 @@
 {
   "entries": [
     {
-      "name": "Real Estate",
-      "queue_database_url": "https://www.notion.so/ad4abefd380545e2b3c60358f79e5a68?v=7dd8d7077f534fd09c8acbaa11903c78&t=3159166fd9fd8018856400a9044aeac4",
-      "sender_accounts_database_url": "https://www.notion.so/3129166fd9fd805b9c8bff5ed3d361cc?v=3129166fd9fd8009890d000c93c7bdf8&t=3159166fd9fd8018856400a9044aeac4",
-      "batch_size": 20
-    },
-    {
-      "name": "Test",
-      "queue_database_url": "https://www.notion.so/3179166fd9fd8030ad28d9e21a0b353a?v=3179166fd9fd817abe10000ceb9a84a2&t=3179166fd9fd80b58b0f00a9f947c145",
-      "sender_accounts_database_url": "https://www.notion.so/3129166fd9fd805b9c8bff5ed3d361cc?v=3129166fd9fd8009890d000c93c7bdf8&t=3179166fd9fd80b58b0f00a9f947c145",
+      "name": "Warmup",
+      "queue_database_url": "https://www.notion.so/dedd58ac1814427b8c912d97e5624398",
+      "credential_registry_database_url": "https://www.notion.so/72e17612f7614edebc861ea1593cde3e",
+      "execution_log_database_url": "https://www.notion.so/1922516fc5cf4fc082f48e86c9fe43ce",
+      "conversation_event_log_database_url": "https://www.notion.so/1de181d9d7f94f7580cc400aa077c9ee",
+      "bandwidth_detail_database_url": "https://www.notion.so/266df2a7a9dd4c5281eb4b665fd9cd73",
+      "warmup_mailbox_pool_database_url": "https://www.notion.so/2a27f473a7214df18143c66d9efc18d3",
       "batch_size": 20
     }
   ]

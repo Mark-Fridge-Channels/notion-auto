@@ -1,7 +1,5 @@
 /**
- * Dashboard Web 服务：端口 9000，仅 localhost；API（状态/schedule/停止·启动/日志/拉取并重启）+ 单页 HTML。
- * 拉取并重启时 spawn 新进程并传 NOTION_AUTO_RESTART=1，新进程延迟 2 秒再 listen 以避免 EADDRINUSE。
- * 启动前加载 .env（dotenv），以便 NOTION_AUTO_NAME 等环境变量生效。
+ * Dashboard Web 服务：端口 9000，仅 localhost；提供主脚本与 Warmup Executor 的状态、配置、日志与拉取重启。
  */
 
 import "dotenv/config";
@@ -10,8 +8,6 @@ import { spawn } from "node:child_process";
 import { resolve, relative } from "node:path";
 import * as runner from "./dashboard-runner.js";
 import * as queueSenderRunner from "./dashboard-queue-sender-runner.js";
-import * as inboundListenerRunner from "./dashboard-inbound-listener-runner.js";
-import * as replyTasksAutoSendRunner from "./dashboard-reply-tasks-auto-sender-runner.js";
 import {
   loadSchedule,
   saveSchedule,
@@ -22,56 +18,29 @@ import {
   type QueueThrottle,
 } from "./schedule.js";
 import {
-  getInboundListenerConfigPath,
-  loadInboundListenerConfigOrDefault,
-  saveInboundListenerConfig,
-  validateInboundListenerConfig,
-} from "./inbound-listener-config.js";
-import {
-  loadReplyTasksConfigOrDefault,
-  saveReplyTasksConfig,
-  validateReplyTasksConfig,
-} from "./reply-tasks-config.js";
-import {
   loadQueueSenderConfigOrDefault,
   saveQueueSenderConfig,
   validateQueueSenderConfig,
 } from "./queue-sender-config.js";
-import { listReplyTasks, getReplyTaskSendContext } from "./notion-reply-tasks.js";
-import { sendOneReplyTask, sendBatchReplyTasks } from "./reply-tasks-send.js";
-import { Client as NotionClient } from "@notionhq/client";
 import { logger } from "./logger.js";
 
 const PORT = 9000;
 const HOST = "127.0.0.1";
+const DEFAULT_BATCH_SIZE = 20;
 
-/** 进程退出时先停止由 Dashboard 启动的子进程，避免残留 Queue Sender / Reply Tasks 自动发送 / Inbound Listener / Playwright 进程 */
 function shutdown(): void {
   queueSenderRunner.stopQueueSender();
-  replyTasksAutoSendRunner.stopReplyTasksAutoSend();
-  inboundListenerRunner.stopInboundListener();
   runner.stop();
   process.exit(0);
 }
+
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 
-/** 拉取并重启流程进行中时置为 true，防止重复点击 */
 let isPullRestartInProgress = false;
 
-/** 将 configPath 规范为项目目录下的路径，防止路径穿越；若非法则返回默认路径 */
 function resolveConfigPath(configured: string | undefined): string {
   const base = getSchedulePath();
-  if (configured == null || configured.trim() === "") return base;
-  const resolved = resolve(process.cwd(), configured.trim());
-  const rel = relative(process.cwd(), resolved);
-  if (rel.startsWith("..") || rel.includes("..")) return base;
-  return resolved;
-}
-
-/** Inbound Listener 配置路径：防路径穿越，非法则用默认路径 */
-function resolveInboundListenerConfigPath(configured: string | undefined): string {
-  const base = getInboundListenerConfigPath();
   if (configured == null || configured.trim() === "") return base;
   const resolved = resolve(process.cwd(), configured.trim());
   const rel = relative(process.cwd(), resolved);
@@ -92,24 +61,13 @@ function sendJson(res: import("node:http").ServerResponse, status: number, data:
   res.end(JSON.stringify(data));
 }
 
-/** Notion API 的「未找到」类错误（404 / object_not_found），用于 Reply Tasks API 返回 404 而非 500 */
-function isNotionNotFoundError(e: unknown): boolean {
-  const msg = e instanceof Error ? e.message : String(e);
-  const code = e && typeof e === "object" && "code" in e ? (e as { code: string }).code : "";
-  return /could not find|object_not_found|not found|404/i.test(msg) || code === "object_not_found";
-}
-
 function sendHtml(res: import("node:http").ServerResponse, html: string): void {
   res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
   res.end(html);
 }
 
-/**
- * 在指定目录执行 git pull，跨平台不依赖 shell。
- * @returns exitCode、stdout、stderr；exitCode 非 0 表示失败（冲突、无 git 等）。
- */
 function runGitPull(cwd: string): Promise<{ exitCode: number; stdout: string; stderr: string }> {
-  return new Promise((resolve) => {
+  return new Promise((resolveResult) => {
     const child = spawn("git", ["pull"], { cwd });
     let stdout = "";
     let stderr = "";
@@ -117,7 +75,7 @@ function runGitPull(cwd: string): Promise<{ exitCode: number; stdout: string; st
     function finish(exitCode: number, out: string, err: string) {
       if (settled) return;
       settled = true;
-      resolve({ exitCode, stdout: out, stderr: err });
+      resolveResult({ exitCode, stdout: out, stderr: err });
     }
     child.stdout?.on("data", (chunk: Buffer) => {
       stdout += chunk.toString("utf-8");
@@ -125,36 +83,25 @@ function runGitPull(cwd: string): Promise<{ exitCode: number; stdout: string; st
     child.stderr?.on("data", (chunk: Buffer) => {
       stderr += chunk.toString("utf-8");
     });
-    child.on("close", (code, signal) => {
-      finish(code ?? (signal ? 1 : 0), stdout, stderr);
-    });
-    child.on("error", (err) => {
-      stderr += (err?.message ?? String(err)) + "\n";
-      finish(1, stdout, stderr);
-    });
+    child.on("close", (code, signal) => finish(code ?? (signal ? 1 : 0), stdout, stderr));
+    child.on("error", (err) => finish(1, stdout, (err?.message ?? String(err)) + "\n"));
   });
 }
 
-/**
- * 在指定目录执行 npm i（安装依赖），跨平台；Windows 下使用 shell 以正确解析 npm。
- * @returns exitCode、stdout、stderr；exitCode 非 0 表示失败。
- */
 function runNpmInstall(cwd: string): Promise<{ exitCode: number; stdout: string; stderr: string }> {
-  return new Promise((resolve) => {
+  return new Promise((resolveResult) => {
     const cmd = process.platform === "win32" ? "npm i" : "npm";
     const args = process.platform === "win32" ? [] : ["i"];
     const opts: Parameters<typeof spawn>[2] = { cwd };
     if (process.platform === "win32") opts.shell = true;
-    const child = process.platform === "win32"
-      ? spawn(cmd, args, opts)
-      : spawn(cmd, args, opts);
+    const child = spawn(cmd, args, opts);
     let stdout = "";
     let stderr = "";
     let settled = false;
     function finish(exitCode: number, out: string, err: string) {
       if (settled) return;
       settled = true;
-      resolve({ exitCode, stdout: out, stderr: err });
+      resolveResult({ exitCode, stdout: out, stderr: err });
     }
     child.stdout?.on("data", (chunk: Buffer) => {
       stdout += chunk.toString("utf-8");
@@ -162,29 +109,17 @@ function runNpmInstall(cwd: string): Promise<{ exitCode: number; stdout: string;
     child.stderr?.on("data", (chunk: Buffer) => {
       stderr += chunk.toString("utf-8");
     });
-    child.on("close", (code, signal) => {
-      finish(code ?? (signal ? 1 : 0), stdout, stderr);
-    });
-    child.on("error", (err) => {
-      stderr += (err?.message ?? String(err)) + "\n";
-      finish(1, stdout, stderr);
-    });
+    child.on("close", (code, signal) => finish(code ?? (signal ? 1 : 0), stdout, stderr));
+    child.on("error", (err) => finish(1, stdout, (err?.message ?? String(err)) + "\n"));
   });
 }
 
-/**
- * 停止 runner 后 spawn 新 server 进程（带 NOTION_AUTO_RESTART=1，新进程会延迟 2s 再 listen），
- * 不 await 子进程；调用方应在返回 HTTP 响应后 process.exit(0)。
- * 跨平台：Windows 使用 shell + 单命令，与 dashboard-runner 一致。
- */
 function spawnNewServerAndExit(): void {
   queueSenderRunner.stopQueueSender();
-  inboundListenerRunner.stopInboundListener();
   runner.stop();
   const env = { ...process.env, NOTION_AUTO_RESTART: "1" };
-  const cwd = process.cwd();
   const opts = {
-    cwd,
+    cwd: process.cwd(),
     env,
     detached: true,
     stdio: "ignore" as const,
@@ -203,11 +138,10 @@ async function handleRequest(
   const url = req.url ?? "/";
   const method = req.method ?? "GET";
   const path = url.split("?")[0];
-  const query = path !== url ? new URLSearchParams(url.slice(url.indexOf("?") + 1)) : new URLSearchParams();
 
   try {
     if (path === "/" && method === "GET") {
-      sendHtml(res, getIndexHtml());
+      sendHtml(res, getDashboardHtml());
       return;
     }
     if (path === "/api/status" && method === "GET") {
@@ -215,22 +149,13 @@ async function handleRequest(
       return;
     }
     if (path === "/api/schedule" && method === "GET") {
-      const schedule = await loadSchedule(getSchedulePath());
-      sendJson(res, 200, schedule);
+      sendJson(res, 200, await loadSchedule(getSchedulePath()));
       return;
     }
     if (path === "/api/schedule" && method === "POST") {
-      const body = await readJsonBody(req);
-      const schedule = mergeSchedule(body);
+      const schedule = mergeSchedule(await readJsonBody(req));
       validateSchedule(schedule);
       await saveSchedule(getSchedulePath(), schedule);
-      res.writeHead(204);
-      res.end();
-      return;
-    }
-    if (path === "/api/stop" && method === "POST") {
-      runner.stop();
-      queueSenderRunner.stopQueueSender();
       res.writeHead(204);
       res.end();
       return;
@@ -242,36 +167,33 @@ async function handleRequest(
       }
       const body = (await readJsonBody(req)) as { configPath?: string } | undefined;
       const configPath = resolveConfigPath(body?.configPath);
-
       const schedule = await loadSchedule(getSchedulePath());
       const qt: QueueThrottle = schedule.queueThrottle ?? getDefaultSchedule().queueThrottle!;
       const prevDay = process.env.QUEUE_THROTTLE_MAX_PER_DAY;
       process.env.QUEUE_THROTTLE_MAX_PER_DAY = String(qt.maxPerDay ?? 50);
-
       if (queueSenderRunner.getQueueSenderStatus() !== "running") {
         queueSenderRunner.startQueueSender();
       }
       runner.start({ configPath });
-
       if (prevDay !== undefined) process.env.QUEUE_THROTTLE_MAX_PER_DAY = prevDay;
       else delete process.env.QUEUE_THROTTLE_MAX_PER_DAY;
-
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    if (path === "/api/stop" && method === "POST") {
+      runner.stop();
+      queueSenderRunner.stopQueueSender();
       res.writeHead(204);
       res.end();
       return;
     }
     if (path === "/api/logs" && method === "GET") {
       const u = new URL(req.url ?? "", `http://${req.headers.host}`);
-      const kindParam = u.searchParams.get("kind")?.toLowerCase().trim();
-      const kind =
-        kindParam === "queue-sender" || kindParam === "inbound-listener" ? kindParam : "playwright";
-      const n = 10;
-      const runs =
-        kind === "playwright"
-          ? runner.getRecentRunLogs(n).map((r) => ({ kind: "playwright" as const, ...r }))
-          : kind === "queue-sender"
-            ? queueSenderRunner.getQueueSenderRunLogs(n).map((r) => ({ kind: "queue-sender" as const, ...r }))
-            : inboundListenerRunner.getInboundListenerRunLogs(n).map((r) => ({ kind: "inbound-listener" as const, ...r }));
+      const kind = u.searchParams.get("kind")?.toLowerCase().trim() === "queue-sender" ? "queue-sender" : "playwright";
+      const runs = kind === "playwright"
+        ? runner.getRecentRunLogs(10).map((r) => ({ kind: "playwright" as const, ...r }))
+        : queueSenderRunner.getQueueSenderRunLogs(10).map((r) => ({ kind: "queue-sender" as const, ...r }));
       sendJson(res, 200, { runs });
       return;
     }
@@ -281,7 +203,7 @@ async function handleRequest(
     }
     if (path === "/api/queue-sender/start" && method === "POST") {
       if (queueSenderRunner.getQueueSenderStatus() === "running") {
-        sendJson(res, 400, { error: "Queue Sender 已在运行，请先停止" });
+        sendJson(res, 400, { error: "Warmup Executor 已在运行，请先停止" });
         return;
       }
       const schedule = await loadSchedule(getSchedulePath());
@@ -304,217 +226,15 @@ async function handleRequest(
       res.end();
       return;
     }
-    if (path === "/api/inbound-listener/config" && method === "GET") {
-      const config = await loadInboundListenerConfigOrDefault();
-      sendJson(res, 200, config);
-      return;
-    }
-    if (path === "/api/inbound-listener/config" && method === "POST") {
-      const body = await readJsonBody(req);
-      const config = validateInboundListenerConfig(body);
-      await saveInboundListenerConfig(config);
-      res.writeHead(204);
-      res.end();
-      return;
-    }
-    if (path === "/api/inbound-listener/status" && method === "GET") {
-      sendJson(res, 200, { status: inboundListenerRunner.getInboundListenerStatus() });
-      return;
-    }
-    if (path === "/api/inbound-listener/start" && method === "POST") {
-      if (inboundListenerRunner.getInboundListenerStatus() === "running") {
-        sendJson(res, 400, { error: "Inbound Listener 已在运行，请先停止" });
-        return;
-      }
-      const body = (await readJsonBody(req)) as { configPath?: string } | undefined;
-      const inboundConfigPath = resolveInboundListenerConfigPath(body?.configPath);
-      inboundListenerRunner.startInboundListener(inboundConfigPath);
-      res.writeHead(204);
-      res.end();
-      return;
-    }
-    if (path === "/api/inbound-listener/stop" && method === "POST") {
-      inboundListenerRunner.stopInboundListener();
-      res.writeHead(204);
-      res.end();
-      return;
-    }
-    if (path === "/api/inbound-listener/restart" && method === "POST") {
-      inboundListenerRunner.restartInboundListener(resolveInboundListenerConfigPath(undefined));
-      res.writeHead(204);
-      res.end();
-      return;
-    }
-    if (path === "/api/reply-tasks/config" && method === "GET") {
-      const config = await loadReplyTasksConfigOrDefault();
-      sendJson(res, 200, config);
-      return;
-    }
-    if (path === "/api/reply-tasks/config" && method === "POST") {
-      const body = await readJsonBody(req);
-      const config = validateReplyTasksConfig(body);
-      await saveReplyTasksConfig(config);
-      res.writeHead(204);
-      res.end();
-      return;
-    }
     if (path === "/api/queue-sender/config" && method === "GET") {
-      const config = await loadQueueSenderConfigOrDefault();
-      sendJson(res, 200, config);
+      sendJson(res, 200, await loadQueueSenderConfigOrDefault());
       return;
     }
     if (path === "/api/queue-sender/config" && method === "POST") {
-      const body = await readJsonBody(req);
-      const config = validateQueueSenderConfig(body);
+      const config = validateQueueSenderConfig(await readJsonBody(req));
       await saveQueueSenderConfig(config);
       res.writeHead(204);
       res.end();
-      return;
-    }
-    if (path === "/api/reply-tasks/list" && method === "GET") {
-      const config = await loadReplyTasksConfigOrDefault();
-      const idx = config.selected_index >= 0 ? config.selected_index : 0;
-      const entry = config.entries[idx];
-      if (!entry) {
-        sendJson(res, 200, []);
-        return;
-      }
-      const token = process.env.NOTION_API_KEY;
-      if (!token?.trim()) {
-        sendJson(res, 500, { error: "缺少 NOTION_API_KEY" });
-        return;
-      }
-      try {
-        const notion = new NotionClient({ auth: token });
-        const tasks = await listReplyTasks(notion, entry.reply_tasks_db_id);
-        sendJson(res, 200, tasks);
-      } catch (e) {
-        const message = e instanceof Error ? e.message : String(e);
-        const status = isNotionNotFoundError(e) ? 404 : 500;
-        sendJson(res, status, { error: message });
-      }
-      return;
-    }
-    if (path === "/api/reply-tasks/context" && method === "GET") {
-      const taskPageId = query.get("taskPageId")?.trim();
-      if (!taskPageId) {
-        sendJson(res, 400, { error: "缺少 taskPageId" });
-        return;
-      }
-      const config = await loadReplyTasksConfigOrDefault();
-      const idx = config.selected_index >= 0 ? config.selected_index : 0;
-      const entry = config.entries[idx];
-      if (!entry) {
-        sendJson(res, 400, { error: "未选择 Reply Tasks 配置项" });
-        return;
-      }
-      const token = process.env.NOTION_API_KEY;
-      if (!token?.trim()) {
-        sendJson(res, 500, { error: "缺少 NOTION_API_KEY" });
-        return;
-      }
-      try {
-        const notion = new NotionClient({ auth: token });
-        const ctx = await getReplyTaskSendContext(notion, taskPageId);
-        sendJson(res, 200, {
-          suggestedReply: ctx.suggestedReply,
-          lastInboundBodyPlain: ctx.lastInboundBodyPlain ?? "",
-          to: ctx.to,
-          subject: ctx.subject,
-        });
-      } catch (e) {
-        const message = e instanceof Error ? e.message : String(e);
-        const status = isNotionNotFoundError(e) ? 404 : 500;
-        sendJson(res, status, { error: message });
-      }
-      return;
-    }
-    if (path === "/api/reply-tasks/send" && method === "POST") {
-      const body = (await readJsonBody(req)) as { taskPageId: string; bodyHtml?: string } | undefined;
-      const taskPageId = body?.taskPageId?.trim();
-      if (!taskPageId) {
-        sendJson(res, 400, { error: "缺少 taskPageId" });
-        return;
-      }
-      const config = await loadReplyTasksConfigOrDefault();
-      const idx = config.selected_index >= 0 ? config.selected_index : 0;
-      const entry = config.entries[idx];
-      if (!entry) {
-        sendJson(res, 400, { error: "未选择 Reply Tasks 配置项" });
-        return;
-      }
-      const token = process.env.NOTION_API_KEY;
-      if (!token?.trim()) {
-        sendJson(res, 500, { error: "缺少 NOTION_API_KEY" });
-        return;
-      }
-      try {
-        const notion = new NotionClient({ auth: token });
-        const result = await sendOneReplyTask(
-          notion,
-          taskPageId,
-          entry.sender_accounts_database_url,
-          body?.bodyHtml,
-        );
-        sendJson(res, 200, result);
-      } catch (e) {
-        const message = e instanceof Error ? e.message : String(e);
-        const status = isNotionNotFoundError(e) ? 404 : 500;
-        sendJson(res, status, { error: message });
-      }
-      return;
-    }
-    if (path === "/api/reply-tasks/send-batch" && method === "POST") {
-      const token = process.env.NOTION_API_KEY;
-      if (!token?.trim()) {
-        sendJson(res, 500, { error: "缺少 NOTION_API_KEY" });
-        return;
-      }
-      try {
-        const notion = new NotionClient({ auth: token });
-        const batchResult = await sendBatchReplyTasks(notion);
-        sendJson(res, 200, batchResult);
-      } catch (e) {
-        const message = e instanceof Error ? e.message : String(e);
-        const status = isNotionNotFoundError(e) ? 404 : 500;
-        sendJson(res, status, { error: message });
-      }
-      return;
-    }
-    if (path === "/api/reply-tasks-auto-send/status" && method === "GET") {
-      sendJson(res, 200, { status: replyTasksAutoSendRunner.getReplyTasksAutoSendStatus() });
-      return;
-    }
-    if (path === "/api/reply-tasks-auto-send/start" && method === "POST") {
-      if (replyTasksAutoSendRunner.getReplyTasksAutoSendStatus() === "running") {
-        sendJson(res, 400, { error: "Reply Tasks 自动发送已在运行，请先停止" });
-        return;
-      }
-      const schedule = await loadSchedule(getSchedulePath());
-      const qt: QueueThrottle = schedule.queueThrottle ?? getDefaultSchedule().queueThrottle!;
-      const prevDay = process.env.QUEUE_THROTTLE_MAX_PER_DAY;
-      process.env.QUEUE_THROTTLE_MAX_PER_DAY = String(qt.maxPerDay ?? 50);
-      try {
-        replyTasksAutoSendRunner.startReplyTasksAutoSend();
-      } finally {
-        if (prevDay !== undefined) process.env.QUEUE_THROTTLE_MAX_PER_DAY = prevDay;
-        else delete process.env.QUEUE_THROTTLE_MAX_PER_DAY;
-      }
-      res.writeHead(204);
-      res.end();
-      return;
-    }
-    if (path === "/api/reply-tasks-auto-send/stop" && method === "POST") {
-      replyTasksAutoSendRunner.stopReplyTasksAutoSend();
-      res.writeHead(204);
-      res.end();
-      return;
-    }
-    if (path === "/api/reply-tasks-auto-send/logs" && method === "GET") {
-      const u = new URL(req.url ?? "", `http://${req.headers.host}`);
-      const n = Math.min(20, Math.max(1, parseInt(u.searchParams.get("n") ?? "10", 10)) || 10);
-      const runs = replyTasksAutoSendRunner.getReplyTasksAutoSendRunLogs(n);
-      sendJson(res, 200, { runs });
       return;
     }
     if (path === "/api/pull-and-restart" && method === "POST") {
@@ -545,16 +265,13 @@ async function handleRequest(
       }
       return;
     }
-
     res.writeHead(404);
     res.end();
-  } catch (e) {
-    const message = e instanceof Error ? e.message : String(e);
-    sendJson(res, 400, { error: message });
+  } catch (error) {
+    sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
   }
 }
 
-/** 从环境变量 NOTION_AUTO_NAME 读取名称，生成标题「notion-auto （Name）控制台」；未设置则「notion-auto 控制台」。已做 HTML 转义防 XSS。 */
 function getDashboardTitle(): string {
   const name = (process.env.NOTION_AUTO_NAME ?? "").trim();
   if (!name) return "notion-auto 控制台";
@@ -567,11 +284,6 @@ function getDashboardTitle(): string {
   return `${safe} 控制台`;
 }
 
-function getIndexHtml(): string {
-  return getDashboardHtml();
-}
-
-/** 生成 Dashboard 单页 HTML：全局设置 + 时间区间 + 行业任务链 + 日志 */
 function getDashboardHtml(): string {
   const pageTitle = getDashboardTitle();
   return `<!DOCTYPE html>
@@ -582,323 +294,189 @@ function getDashboardHtml(): string {
   <title>${pageTitle}</title>
   <style>
     * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
-    html { -webkit-text-size-adjust: 100%; }
-    body { font-family: system-ui, -apple-system, sans-serif; max-width: 960px; margin: 0 auto; padding: 1.25rem; padding-left: max(1.25rem, env(safe-area-inset-left)); padding-right: max(1.25rem, env(safe-area-inset-right)); padding-bottom: max(1.25rem, env(safe-area-inset-bottom)); background: #f5f5f5; color: #333; }
-    .header { display: flex; align-items: flex-start; justify-content: space-between; flex-wrap: wrap; gap: 1rem; margin-bottom: 1.5rem; padding: 1rem; padding-left: max(1rem, env(safe-area-inset-left)); padding-right: max(1rem, env(safe-area-inset-right)); background: #fff; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
-    .header h1 { margin: 0; font-size: 1.25rem; font-weight: 600; }
-    .status { padding: 0.4rem 0.9rem; border-radius: 6px; font-size: 0.875rem; font-weight: 500; }
+    body { font-family: system-ui, -apple-system, sans-serif; max-width: 960px; margin: 0 auto; padding: 1.25rem; background: #f5f5f5; color: #333; }
+    .header, .card { background: #fff; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+    .header { display: flex; justify-content: space-between; gap: 1rem; flex-wrap: wrap; margin-bottom: 1rem; padding: 1rem; }
+    .header h1 { margin: 0; font-size: 1.25rem; }
+    .status { display: inline-block; padding: 0.35rem 0.75rem; border-radius: 6px; font-size: 0.875rem; font-weight: 500; }
     .status.running { background: #d4edda; color: #155724; }
     .status.idle { background: #f8d7da; color: #721c24; }
-    .actions { display: flex; flex-wrap: wrap; gap: 0.5rem; }
-    .actions button { min-height: 44px; padding: 0.5rem 1rem; border-radius: 8px; border: 1px solid #ddd; background: #fff; cursor: pointer; font-size: 0.875rem; touch-action: manipulation; }
-    .actions button:hover:not(:disabled) { background: #f0f0f0; }
-    .actions button:disabled { opacity: 0.6; cursor: not-allowed; }
-    .actions button.primary { background: #0d6efd; color: #fff; border-color: #0d6efd; }
-    .actions button.primary:hover:not(:disabled) { background: #0b5ed7; }
-    .actions button.danger { border-color: #dc3545; color: #dc3545; }
-    .actions button.danger:hover:not(:disabled) { background: #fff5f5; }
-    .layout { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
-    .card { background: #fff; border-radius: 8px; padding: 1.25rem; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
-    .card h2 { margin: 0 0 1rem; font-size: 1rem; font-weight: 600; color: #555; }
-    .row { margin-bottom: 1rem; }
-    label { display: block; margin-bottom: 0.25rem; font-size: 0.875rem; font-weight: 500; }
-    .hint { font-weight: normal; color: #888; font-size: 0.8rem; }
+    .actions { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+    button { min-height: 40px; padding: 0.5rem 0.9rem; border-radius: 8px; border: 1px solid #ddd; background: #fff; cursor: pointer; }
+    button.primary { background: #0d6efd; color: #fff; border-color: #0d6efd; }
+    button.danger { color: #dc3545; border-color: #dc3545; }
+    .tabs { display: flex; gap: 0.5rem; margin-bottom: 1rem; }
+    .tabs button.active { background: #0d6efd; border-color: #0d6efd; color: #fff; }
+    .panel { display: none; }
+    .panel.active { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+    .card { padding: 1rem; }
+    .card h2 { margin-top: 0; font-size: 1rem; }
+    .row { margin-bottom: 0.9rem; }
+    label { display: block; margin-bottom: 0.25rem; font-size: 0.9rem; font-weight: 500; }
+    .hint { color: #666; font-size: 0.8rem; }
     input, textarea, select { width: 100%; padding: 0.5rem 0.65rem; border: 1px solid #ddd; border-radius: 6px; font-size: 16px; }
-    input:focus, textarea:focus, select:focus { outline: 2px solid #0d6efd; outline-offset: 2px; }
-    textarea { min-height: 48px; resize: vertical; }
-    .slot-row, .task-row { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-bottom: 0.75rem; }
-    .slot-row { padding: 0.6rem 0.75rem; background: #f8f9fa; border-radius: 6px; border: 1px solid #eee; }
-    .slot-row .slot-time-group { display: inline-flex; align-items: center; gap: 0.35rem; margin-right: 1rem; }
-    .slot-row .slot-time-group label { margin: 0; font-size: 0.8rem; color: #666; width: 1.5rem; flex-shrink: 0; }
-    .slot-row input[type="number"], .task-row input[type="number"] { width: 3.5rem; min-width: 3rem; padding: 0.4rem 0.5rem; }
-    .slot-row select { flex: 1; min-width: 12rem; max-width: 24rem; margin-right: 0.25rem; }
-    .industry-list { border: 1px solid #eee; border-radius: 6px; overflow: hidden; }
-    .industry-row { display: flex; align-items: center; flex-wrap: wrap; gap: 0.5rem 0.75rem; padding: 0.6rem 1rem; border-bottom: 1px solid #eee; background: #fff; }
-    .industry-row:last-child { border-bottom: none; }
-    .industry-row .id { font-weight: 600; min-width: 5rem; }
-    .industry-row .url { flex: 1; min-width: 0; color: #666; font-size: 0.85rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .industry-row .actions { display: flex; gap: 0.35rem; flex-shrink: 0; }
-    .industry-row.selected { background: #e8f4fd; border-left: 3px solid #0d6efd; }
-    .modal-overlay { display: none; position: fixed; inset: 0; padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); background: rgba(0,0,0,.4); z-index: 100; align-items: center; justify-content: center; overflow-y: auto; }
-    .modal-overlay.visible { display: flex; }
-    .modal-box { background: #fff; border-radius: 8px; padding: 1.25rem; min-width: 280px; max-width: min(90vw, 360px); max-height: 85vh; overflow-y: auto; box-shadow: 0 4px 20px rgba(0,0,0,.15); margin: auto; }
-    .modal-box h3 { margin: 0 0 1rem; font-size: 1rem; }
-    .modal-box .form-actions { margin-top: 1rem; display: flex; gap: 0.5rem; flex-wrap: wrap; }
-    .modal-box .form-actions button { min-height: 44px; }
-    .modal-box--wide { max-width: min(90vw, 720px); }
-    .reply-tasks-detail-text, .reply-tasks-detail-pre, .reply-tasks-inbound-pre { margin: 0; padding: 0.5rem; background: #f8f9fa; border: 1px solid #eee; border-radius: 6px; font-size: 0.875rem; white-space: pre-wrap; word-break: break-word; max-height: 200px; overflow-y: auto; }
-    .reply-tasks-detail-pre, .reply-tasks-inbound-pre { font-family: ui-monospace, monospace; }
-    .task-row textarea { flex: 1; min-width: 0; }
-    .logs-card { grid-column: 1 / -1; }
-    .logs { background: #1e1e1e; color: #d4d4d4; padding: 1rem; border-radius: 6px; font-family: ui-monospace, monospace; font-size: 12px; white-space: pre-wrap; max-height: 380px; overflow-y: auto; -webkit-overflow-scrolling: touch; }
-    .log-tabs { margin-bottom: 0.5rem; display: flex; flex-wrap: wrap; gap: 0.35rem; }
-    .log-tabs button { min-height: 36px; padding: 0.35rem 0.65rem; border-radius: 4px; border: 1px solid #ddd; background: #fff; cursor: pointer; font-size: 0.8rem; touch-action: manipulation; }
-    .log-tabs button.active { background: #0d6efd; color: #fff; border-color: #0d6efd; }
-    /* Dashboard 三 Tab：导航与 panel 显隐 */
-    .tab-nav { display: flex; flex-wrap: wrap; gap: 0.35rem; margin-bottom: 1rem; }
-    .tab-nav button { min-height: 36px; padding: 0.35rem 0.75rem; border-radius: 6px; border: 1px solid #ddd; background: #fff; cursor: pointer; font-size: 0.875rem; touch-action: manipulation; }
-    .tab-nav button:hover { background: #f0f0f0; }
-    .tab-nav button.active { background: #0d6efd; color: #fff; border-color: #0d6efd; }
-    .tab-panel { display: none; }
-    .tab-panel.active { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
-    #msg { margin-top: 0.5rem; font-size: 0.875rem; min-height: 1.25em; word-break: break-word; }
+    textarea { min-height: 56px; resize: vertical; }
+    .slot-row, .task-row, .list-row { display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center; padding: 0.6rem; border: 1px solid #eee; border-radius: 6px; margin-bottom: 0.6rem; background: #fafafa; }
+    .list-row .title { font-weight: 600; min-width: 5rem; }
+    .list-row .url { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #666; }
+    .slot-row input[type="number"], .task-row input[type="number"] { width: 5rem; }
+    .logs { background: #1e1e1e; color: #d4d4d4; padding: 1rem; border-radius: 6px; font-family: ui-monospace, monospace; font-size: 12px; white-space: pre-wrap; max-height: 360px; overflow-y: auto; }
+    .log-tabs { display: flex; gap: 0.35rem; flex-wrap: wrap; margin-bottom: 0.5rem; }
+    .log-tabs button.active { background: #0d6efd; border-color: #0d6efd; color: #fff; }
+    .full { grid-column: 1 / -1; }
+    .modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.4); align-items: center; justify-content: center; padding: 1rem; }
+    .modal.visible { display: flex; }
+    .modal-box { width: min(90vw, 720px); max-height: 85vh; overflow-y: auto; background: #fff; border-radius: 8px; padding: 1rem; }
+    .form-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-top: 1rem; }
+    #msg { margin-top: 0.5rem; min-height: 1.2rem; font-size: 0.9rem; word-break: break-word; }
     @media (max-width: 768px) {
       body { padding: 0.75rem; }
-      .header { padding: 0.75rem; flex-direction: column; align-items: stretch; }
-      .header .actions { width: 100%; }
-      .header .actions button { flex: 1; min-width: 0; }
-      .layout { grid-template-columns: 1fr; gap: 1rem; }
-      .tab-panel.active { grid-template-columns: 1fr; gap: 1rem; }
-      .card { padding: 1rem; }
-      .slot-row { flex-wrap: wrap; }
-      .slot-row select { max-width: none; }
-      .industry-row .type { min-width: 4.5rem; font-size: 0.875em; color: #666; }
-      .industry-row .id { min-width: 4rem; }
-      .modal-box { min-width: 0; width: 100%; max-width: calc(100vw - 1.5rem); margin: 1rem; }
-    }
-    @media (max-width: 480px) {
-      .header .actions { flex-direction: column; }
-      .header .actions button { width: 100%; }
-      .industry-row { flex-direction: column; align-items: stretch; gap: 0.5rem; }
-      .industry-row .url { white-space: normal; }
+      .panel.active { grid-template-columns: 1fr; }
+      .header { flex-direction: column; }
+      .actions { width: 100%; }
+      .actions button { flex: 1; }
     }
   </style>
-  <link href="https://cdn.quilljs.com/1.3.7/quill.snow.css" rel="stylesheet">
 </head>
 <body>
   <header class="header">
     <div>
       <h1>${pageTitle}</h1>
       <div id="statusEl" class="status" style="margin-top:0.5rem">加载中…</div>
-      <div id="queueSenderStatusEl" class="status" style="margin-top:0.25rem;font-size:0.9em">Queue Sender：—</div>
-      <div id="inboundListenerStatusEl" class="status" style="margin-top:0.25rem;font-size:0.9em">Inbound Listener：—</div>
+      <div id="warmupStatusEl" class="status" style="margin-top:0.25rem">Warmup Executor：—</div>
     </div>
     <div>
       <div class="actions">
-        <button type="button" id="btnStart" class="primary">启动</button>
-        <button type="button" id="btnStop" class="danger">停止</button>
-        <button type="button" id="btnInboundListenerRestart" class="primary">手动重启 Inbound Listener</button>
-        <button type="button" id="btnSave">保存配置</button>
-        <button type="button" id="btnPullRestart">拉取并重启</button>
+        <button id="btnStart" class="primary" type="button">启动</button>
+        <button id="btnStop" class="danger" type="button">停止</button>
+        <button id="btnSave" type="button">保存配置</button>
+        <button id="btnPullRestart" type="button">拉取并重启</button>
       </div>
       <div id="msg"></div>
     </div>
   </header>
 
-  <nav class="tab-nav" id="dashboardTabNav" aria-label="Dashboard 分区">
-    <button type="button" class="active" data-tab="main">主视图</button>
-    <button type="button" data-tab="reply-tasks">Reply Tasks</button>
-    <button type="button" data-tab="queue-sender">Queue 发信配置</button>
-    <button type="button" data-tab="inbound">Inbound Listener</button>
+  <nav class="tabs" id="tabNav">
+    <button class="active" data-tab="main" type="button">主视图</button>
+    <button data-tab="warmup" type="button">Warmup Executor 配置</button>
   </nav>
 
-  <div id="tab-main" class="tab-panel active">
+  <section id="panel-main" class="panel active">
     <div class="card">
       <h2>全局设置</h2>
       <div class="row">
-        <label>每隔多少秒 check 一次是否对话结束（区间，每次发送后随机）<span class="hint">最小～最大，默认 120～120</span></label>
-        <span><input id="intervalSecondsMin" type="number" min="1" placeholder="120" style="width:5rem"> ～ <input id="intervalSecondsMax" type="number" min="1" placeholder="120" style="width:5rem"> 秒</span>
+        <label>每隔多少秒检查一次对话结束 <span class="hint">最小～最大，默认 120～120</span></label>
+        <div style="display:flex;gap:0.5rem;align-items:center;">
+          <input id="intervalSecondsMin" type="number" min="1" placeholder="120">
+          <span>～</span>
+          <input id="intervalSecondsMax" type="number" min="1" placeholder="120">
+        </div>
       </div>
       <div class="row">
-        <label>如果没有登录账号，首次等待多少秒进行手动登录操作 <span class="hint">默认 60</span></label>
+        <label>首次登录等待秒数 <span class="hint">默认 60</span></label>
         <input id="loginWaitSeconds" type="number" min="0" placeholder="60">
       </div>
       <div class="row">
-        <label>最大重试次数 <span class="hint">打开 Notion AI、点击新建对话、输入发送等单步失败时最多尝试次数，默认 3</span></label>
+        <label>最大重试次数 <span class="hint">默认 3</span></label>
         <input id="maxRetries" type="number" min="1" placeholder="3">
       </div>
-      <h3 style="margin-top:1rem;font-size:1rem">Queue 发信节流（按每个发件人单独限制）</h3>
-      <p class="hint" style="margin-bottom:0.5rem">每个发件人每天最多发几封，作为保底上限。保存后，下次点击「启动」时生效。</p>
       <div class="row">
-        <label>每个发件人每天最多发几封<span class="hint">默认 50</span></label>
-        <input id="queueThrottleMaxPerDay" type="number" min="1" placeholder="50" style="width:5rem">
+        <label>Warmup 启动时兼容注入的每日上限 <span class="hint">默认 50</span></label>
+        <input id="queueThrottleMaxPerDay" type="number" min="1" placeholder="50">
       </div>
       <div class="row">
-        <label>等待输出期间自动点击的按钮 <span class="hint">将按列表顺序依次检测并点击出现的按钮。填写按钮上显示的文字，精确匹配。</span></label>
-      </div>
-      <div id="autoClickButtonsContainer"></div>
-      <button type="button" id="btnAddAutoClickButton" class="primary" style="margin-top:0.25rem">添加一项</button>
-    </div>
-    <div class="card">
-      <h2>时间区间 <span class="hint">左闭右开，本地时区</span></h2>
-      <div id="timeSlotsContainer"></div>
-      <button type="button" id="btnAddSlot" class="primary" style="margin-top:0.5rem">添加时间区间</button>
-    </div>
-    <div class="card" style="grid-column: 1 / -1;">
-      <h2>行业与任务链</h2>
-      <div id="industriesContainer" class="industry-list"></div>
-      <button type="button" id="btnAddIndustry" class="primary" style="margin-top:0.5rem">添加行业</button>
-    </div>
-    <div class="card logs-card" style="grid-column: 1 / -1;">
-      <h2>最近运行日志</h2>
-      <div class="log-tabs" id="logTabs"></div>
-      <div id="logContent" class="logs">（选择一次运行查看）</div>
-    </div>
-  </div>
-  <div id="tab-queue-sender" class="tab-panel">
-    <div class="card" style="grid-column: 1 / -1;">
-      <h2>Queue 发信配置 <span class="hint">写入 queue-sender.json，每轮跑所有条目，与 schedule 时段无关</span></h2>
-      <p class="hint" style="margin-bottom:0.5rem">显示名用于区分；Queue 数据库 URL 与发件人库 URL 必填；每批条数可选，默认 20（1–100）。</p>
-      <div id="queueSenderEntriesContainer" class="industry-list"></div>
-      <button type="button" id="btnAddQueueSenderEntry" class="primary" style="margin-top:0.5rem">添加一条</button>
-      <button type="button" id="btnSaveQueueSenderConfig" class="primary" style="margin-left:0.5rem">保存 Queue 发信配置</button>
-      <h3 style="margin-top:1rem;font-size:1rem">最近运行日志</h3>
-      <div class="log-tabs" id="queueSenderLogTabs"></div>
-      <div id="queueSenderLogContent" class="logs" style="max-height:280px">（选择一次运行查看）</div>
-    </div>
-  </div>
-  <div id="tab-inbound" class="tab-panel">
-    <div class="card" style="grid-column: 1 / -1;">
-      <h2>Inbound Listener 配置 <span class="hint">写入 inbound-listener.json，无文件时保存即创建</span></h2>
-      <div class="row">
-        <label>轮询间隔（秒）<span class="hint">默认 120，不小于 10</span></label>
-        <input id="inboundPollInterval" type="number" min="10" placeholder="120" style="width:6rem">
-      </div>
-      <div class="row">
-        <label>Body Plain 最大字符数 <span class="hint">超长保留开头+结尾，默认 40000</span></label>
-        <input id="inboundBodyPlainMaxChars" type="number" min="1000" placeholder="40000" style="width:8rem">
-      </div>
-      <h3 style="margin-top:1rem;font-size:1rem">监听组</h3>
-      <div id="inboundListenerGroupsContainer" class="industry-list"></div>
-      <button type="button" id="btnAddInboundGroup" class="primary" style="margin-top:0.5rem">添加一组</button>
-      <button type="button" id="btnSaveInboundConfig" class="primary" style="margin-left:0.5rem">保存 Inbound Listener 配置</button>
-      <h3 style="margin-top:1rem;font-size:1rem">最近运行日志</h3>
-      <div class="log-tabs" id="inboundLogTabs"></div>
-      <div id="inboundLogContent" class="logs" style="max-height:280px">（选择一次运行查看）</div>
-    </div>
-  </div>
-  <div id="tab-reply-tasks" class="tab-panel">
-    <div class="card" style="grid-column: 1 / -1;">
-      <h2>Reply Tasks 配置 <span class="hint">写入 reply-tasks.json，切换后加载 Task 列表</span></h2>
-      <div id="replyTasksEntriesContainer" class="industry-list"></div>
-      <button type="button" id="btnAddReplyTasksEntry" class="primary" style="margin-top:0.5rem">添加一条</button>
-      <button type="button" id="btnSaveReplyTasksConfig" class="primary" style="margin-left:0.5rem">保存 Reply Tasks 配置</button>
-      <h3 style="margin-top:1rem;font-size:1rem">当前库 Task 列表</h3>
-      <button type="button" id="btnLoadReplyTasksList" class="primary" style="margin-bottom:0.5rem">加载 Task 列表</button>
-      <button type="button" id="btnSendBatchReplyTasks" style="margin-left:0.5rem">批量发送未完成</button>
-      <div id="replyTasksListContainer" class="industry-list" style="max-height:320px;overflow-y:auto"></div>
-      <h3 style="margin-top:1rem;font-size:1rem">自动发送</h3>
-      <div style="margin-bottom:0.5rem">
-        <span id="replyTasksAutoSendStatusEl" class="status" style="font-size:0.9em">自动发送：已停止</span>
-        <button type="button" id="btnReplyTasksAutoSendStart" class="primary" style="margin-left:0.5rem">开启自动发送</button>
-        <button type="button" id="btnReplyTasksAutoSendStop" style="margin-left:0.35rem">停止自动发送</button>
-      </div>
-      <h3 style="margin-top:1rem;font-size:1rem">Reply Tasks 自动发送 · 最近运行日志</h3>
-      <div class="log-tabs" id="replyTasksAutoSendLogTabs"></div>
-      <div id="replyTasksAutoSendLogContent" class="logs" style="max-height:280px">（选择一次运行查看）</div>
-    </div>
-  </div>
-  <div id="inboundListenerGroupModal" class="modal-overlay">
-      <div class="modal-box">
-        <h3>编辑监听组</h3>
-        <div class="row"><label>📥 Inbound Messages 数据库 ID 或 URL</label><input type="text" id="modalInboundImDbId" placeholder="32位hex或Notion URL"></div>
-        <div class="row"><label>📬 Touchpoints 数据库 ID 或 URL</label><input type="text" id="modalInboundTouchpointsDbId" placeholder="与 Queue 表同一张"></div>
-        <div class="row"><label>发件人库 URL</label><input type="url" id="modalInboundSenderAccountsUrl" placeholder="https://www.notion.so/..."></div>
-        <div class="row"><label>Mailboxes（发件人库 Email，每行一个）</label><textarea id="modalInboundMailboxes" rows="4" placeholder="sender1@example.com"></textarea></div>
-        <div class="form-actions">
-          <button type="button" id="modalInboundGroupSave" class="primary">保存</button>
-          <button type="button" id="modalInboundGroupCancel">取消</button>
-        </div>
-      </div>
-    </div>
-  <div id="replyTasksEntryModal" class="modal-overlay">
-      <div class="modal-box">
-        <h3>编辑 Reply Tasks 配置</h3>
-        <div class="row"><label>Reply Tasks 数据库 ID 或 URL</label><input type="text" id="modalReplyTasksDbId" placeholder="32位hex或Notion URL"></div>
-        <div class="row"><label>发件人库 URL</label><input type="url" id="modalReplyTasksSenderUrl" placeholder="https://www.notion.so/..."></div>
-        <div class="form-actions">
-          <button type="button" id="modalReplyTasksEntrySave" class="primary">保存</button>
-          <button type="button" id="modalReplyTasksEntryCancel">取消</button>
-        </div>
-      </div>
-    </div>
-  <div id="queueSenderEntryModal" class="modal-overlay">
-    <div class="modal-box">
-      <h3>编辑 Queue 发信条目</h3>
-      <div class="row"><label>显示名 <span class="hint">用于列表中区分，例如「主 Queue」</span></label><input type="text" id="modalQueueSenderName" placeholder="主 Queue"></div>
-      <div class="row"><label>Queue 数据库 URL <span class="hint">待发送队列的 Notion 数据库 URL 或 database_id</span></label><input type="url" id="modalQueueSenderQueueUrl" placeholder="https://www.notion.so/..."></div>
-      <div class="row"><label>发件人库 URL <span class="hint">按发件人取凭据的 Notion 数据库 URL</span></label><input type="url" id="modalQueueSenderSenderUrl" placeholder="https://www.notion.so/..."></div>
-      <div class="row"><label>每批条数 <span class="hint">1–100，默认 20</span></label><input type="number" id="modalQueueSenderBatchSize" min="1" max="100" value="20" style="width:5rem"></div>
-      <div class="form-actions">
-        <button type="button" id="modalQueueSenderEntrySave" class="primary">保存</button>
-        <button type="button" id="modalQueueSenderEntryCancel">取消</button>
-      </div>
-    </div>
-  </div>
-    <div id="replyTasksDetailModal" class="modal-overlay">
-      <div class="modal-box">
-        <h3>Task 详情</h3>
-        <div class="row"><label>Task Summary</label><div id="replyTasksDetailSummary" class="reply-tasks-detail-text"></div></div>
-        <div class="row"><label>Status</label><span id="replyTasksDetailStatus" class="hint"></span></div>
-        <div class="row"><label>Suggested Reply</label><pre id="replyTasksDetailSuggestedReply" class="reply-tasks-detail-pre"></pre></div>
-        <div class="form-actions"><button type="button" id="replyTasksDetailClose" class="primary">关闭</button></div>
-      </div>
-    </div>
-    <div id="replyTasksSendModal" class="modal-overlay">
-      <div class="modal-box modal-box--wide">
-        <h3>发送回复（可编辑正文）</h3>
-        <div class="row"><label>对方上一条回复</label><pre id="replyTasksLastInboundEl" class="reply-tasks-inbound-pre"></pre></div>
-        <div class="row"><label>正文（富文本）</label><div id="replyTasksBodyEditor" style="min-height:200px;background:#fff"></div></div>
-        <div class="form-actions">
-          <button type="button" id="modalReplyTasksSendConfirm" class="primary">发送</button>
-          <button type="button" id="modalReplyTasksSendCancel">取消</button>
-        </div>
-      </div>
-    </div>
-    <div id="industryModal" class="modal-overlay">
-      <div class="modal-box">
-        <h3 id="industryModalTitle">编辑行业</h3>
-        <div class="row"><label>行业 id（名称）</label><input type="text" id="modalIndustryId" placeholder="id"></div>
-        <div class="row"><label>Notion Portal URL</label><input type="url" id="modalNotionUrl" placeholder="https://..."></div>
-        <div class="row"><label>每 N 次开启新会话（区间内随机次数）</label><span><input type="number" id="modalNewChatEveryRunsMin" min="0" value="1" style="width:4rem"> ～ <input type="number" id="modalNewChatEveryRunsMax" min="0" value="1" style="width:4rem"></span></div>
-        <div class="row"><label>每 M 次换模型（区间，0=不换）</label><span><input type="number" id="modalModelSwitchIntervalMin" min="0" value="0" style="width:4rem"> ～ <input type="number" id="modalModelSwitchIntervalMax" min="0" value="0" style="width:4rem"></span></div>
-        <div class="row"><label>时段内跑几轮任务链（0=一直跑）</label><input type="number" id="modalChainRunsPerSlot" min="0" value="0" style="width:4rem" placeholder="0"></div>
-        <div class="row"><label>任务链</label><div id="modalTasksContainer"></div><button type="button" id="modalAddTask">添加任务</button></div>
-        <div class="form-actions">
-          <button type="button" id="modalSave" class="primary">保存</button>
-          <button type="button" id="modalCancel">取消</button>
-        </div>
+        <label>等待输出期间自动点击按钮 <span class="hint">精确匹配按钮文案</span></label>
+        <div id="autoClickButtonsContainer"></div>
+        <button id="btnAddAutoClickButton" class="primary" type="button" style="margin-top:0.4rem;">添加一项</button>
       </div>
     </div>
 
-  <script src="https://cdn.quilljs.com/1.3.7/quill.min.js"></script>
+    <div class="card">
+      <h2>时间区间 <span class="hint">左闭右开，本地时区</span></h2>
+      <div id="timeSlotsContainer"></div>
+      <button id="btnAddSlot" class="primary" type="button">添加时间区间</button>
+    </div>
+
+    <div class="card full">
+      <h2>行业与任务链</h2>
+      <div id="industriesContainer"></div>
+      <button id="btnAddIndustry" class="primary" type="button">添加行业</button>
+    </div>
+
+    <div class="card full">
+      <h2>Playwright 最近运行日志</h2>
+      <div id="playwrightLogTabs" class="log-tabs"></div>
+      <div id="playwrightLogContent" class="logs">（选择一次运行查看）</div>
+    </div>
+  </section>
+
+  <section id="panel-warmup" class="panel">
+    <div class="card full">
+      <h2>Warmup Executor 配置 <span class="hint">写入 queue-sender.json</span></h2>
+      <p class="hint">每条配置对应一套 Warmup 数据层：Queue、Credential Registry、Execution Log、Conversation Event Log、BandWidth Detail、Warmup Mailbox Pool。</p>
+      <div id="warmupEntriesContainer"></div>
+      <button id="btnAddWarmupEntry" class="primary" type="button">添加一条</button>
+      <button id="btnSaveWarmupConfig" class="primary" type="button">保存 Warmup 配置</button>
+    </div>
+
+    <div class="card full">
+      <h2>Warmup Executor 最近运行日志</h2>
+      <div id="warmupLogTabs" class="log-tabs"></div>
+      <div id="warmupLogContent" class="logs">（选择一次运行查看）</div>
+    </div>
+  </section>
+
+  <div id="industryModal" class="modal">
+    <div class="modal-box">
+      <h3 id="industryModalTitle">编辑行业</h3>
+      <div class="row"><label>行业 id</label><input id="modalIndustryId" type="text" placeholder="id"></div>
+      <div class="row"><label>Notion Portal URL</label><input id="modalNotionUrl" type="url" placeholder="https://..."></div>
+      <div class="row"><label>每 N 次开启新会话</label><div style="display:flex;gap:0.5rem;align-items:center;"><input id="modalNewChatEveryRunsMin" type="number" min="0"><span>～</span><input id="modalNewChatEveryRunsMax" type="number" min="0"></div></div>
+      <div class="row"><label>每 M 次换模型（0=不换）</label><div style="display:flex;gap:0.5rem;align-items:center;"><input id="modalModelSwitchIntervalMin" type="number" min="0"><span>～</span><input id="modalModelSwitchIntervalMax" type="number" min="0"></div></div>
+      <div class="row"><label>时段内跑几轮任务链（0=一直跑）</label><input id="modalChainRunsPerSlot" type="number" min="0"></div>
+      <div class="row"><label>任务链</label><div id="modalTasksContainer"></div><button id="modalAddTask" type="button">添加任务</button></div>
+      <div class="form-actions">
+        <button id="modalSaveIndustry" class="primary" type="button">保存</button>
+        <button id="modalCancelIndustry" type="button">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="warmupModal" class="modal">
+    <div class="modal-box">
+      <h3>编辑 Warmup 条目</h3>
+      <div class="row"><label>显示名</label><input id="modalWarmupName" type="text" placeholder="主 Warmup"></div>
+      <div class="row"><label>Email Warmup Queue URL</label><input id="modalWarmupQueueUrl" type="url" placeholder="https://www.notion.so/..."></div>
+      <div class="row"><label>Credential Registry URL</label><input id="modalWarmupCredentialUrl" type="url" placeholder="https://www.notion.so/..."></div>
+      <div class="row"><label>Execution Log URL</label><input id="modalWarmupExecutionLogUrl" type="url" placeholder="https://www.notion.so/..."></div>
+      <div class="row"><label>Conversation Event Log URL</label><input id="modalWarmupConversationLogUrl" type="url" placeholder="https://www.notion.so/..."></div>
+      <div class="row"><label>BandWidth Detail URL</label><input id="modalWarmupBandwidthUrl" type="url" placeholder="https://www.notion.so/..."></div>
+      <div class="row"><label>Warmup Mailbox Pool URL</label><input id="modalWarmupMailboxPoolUrl" type="url" placeholder="https://www.notion.so/..."></div>
+      <div class="row"><label>每批条数</label><input id="modalWarmupBatchSize" type="number" min="1" max="100" value="${DEFAULT_BATCH_SIZE}"></div>
+      <div class="form-actions">
+        <button id="modalSaveWarmup" class="primary" type="button">保存</button>
+        <button id="modalCancelWarmup" type="button">取消</button>
+      </div>
+    </div>
+  </div>
+
   <script>
+    const NEW_INDUSTRY_VALUE = '__new__';
+    const DEFAULT_BATCH_SIZE = ${DEFAULT_BATCH_SIZE};
+    let currentSchedule = null;
+    let currentWarmupConfig = null;
+    let editingIndustryIndex = -1;
+    let editingWarmupIndex = -1;
+    let playwrightRuns = [];
+    let warmupRuns = [];
+
     const statusEl = document.getElementById('statusEl');
+    const warmupStatusEl = document.getElementById('warmupStatusEl');
     const msgEl = document.getElementById('msg');
     const timeSlotsContainer = document.getElementById('timeSlotsContainer');
     const industriesContainer = document.getElementById('industriesContainer');
     const autoClickButtonsContainer = document.getElementById('autoClickButtonsContainer');
-    const logTabs = document.getElementById('logTabs');
-    const logContent = document.getElementById('logContent');
-
-    /** Dashboard 三 Tab 切换：仅显隐 panel，不重绑事件 */
-    (function initDashboardTabs() {
-      const nav = document.getElementById('dashboardTabNav');
-      const panels = document.querySelectorAll('.tab-panel');
-      if (!nav || !panels.length) return;
-      nav.querySelectorAll('button[data-tab]').forEach(function (btn) {
-        btn.addEventListener('click', function () {
-          const tab = btn.getAttribute('data-tab');
-          if (!tab) return;
-          nav.querySelectorAll('button[data-tab]').forEach(function (b) { b.classList.remove('active'); });
-          panels.forEach(function (p) { p.classList.remove('active'); });
-          btn.classList.add('active');
-          const panel = document.getElementById('tab-' + tab);
-          if (panel) panel.classList.add('active');
-        });
-      });
-    })();
-
-    /** 当前页使用的 schedule，行业数据以内存为准，列表仅展示 */
-    let currentSchedule = null;
-    /** Inbound Listener 配置，以内存为准 */
-    let currentInboundConfig = null;
-    /** Reply Tasks 配置，以内存为准 */
-    let currentReplyTasksConfig = null;
-    /** Queue 发信配置，以内存为准 */
-    let currentQueueSenderConfig = null;
-    /** 单条发送时暂存的 taskPageId */
-    let replyTasksSendTaskPageId = null;
+    const warmupEntriesContainer = document.getElementById('warmupEntriesContainer');
 
     function showMsg(text, isError) {
       msgEl.textContent = text || '';
@@ -908,22 +486,300 @@ function getDashboardHtml(): string {
       if (s == null) return '';
       return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
     }
-    function escapeAttr(s) {
-      return escapeHtml(s);
-    }
-    /** 截断 URL 用于列表展示，最多约 40 字符 */
+    function escapeAttr(s) { return escapeHtml(s); }
     function truncateUrl(url) {
-      if (!url || !url.trim()) return '—';
+      if (!url || !String(url).trim()) return '—';
       const s = String(url).trim();
-      return s.length <= 42 ? s : s.slice(0, 39) + '...';
+      return s.length <= 48 ? s : s.slice(0, 45) + '...';
     }
-
     async function api(path, opts) {
       const res = await fetch(path, opts);
       if (res.status === 204) return;
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || res.statusText);
       return data;
+    }
+
+    (function initTabs() {
+      const nav = document.getElementById('tabNav');
+      nav.querySelectorAll('button[data-tab]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          nav.querySelectorAll('button[data-tab]').forEach((b) => b.classList.remove('active'));
+          document.querySelectorAll('.panel').forEach((panel) => panel.classList.remove('active'));
+          btn.classList.add('active');
+          document.getElementById('panel-' + btn.getAttribute('data-tab')).classList.add('active');
+        });
+      });
+    })();
+
+    function appendAutoClickRow(value) {
+      const row = document.createElement('div');
+      row.className = 'list-row';
+      row.innerHTML = '<input type="text" data-key="name" value="' + escapeAttr(value || '') + '" placeholder="按钮名称">' +
+        '<button type="button" class="danger" data-remove>删除</button>';
+      row.querySelector('[data-remove]').onclick = () => row.remove();
+      autoClickButtonsContainer.appendChild(row);
+    }
+
+    function fillSchedule(schedule) {
+      document.getElementById('intervalSecondsMin').value = Math.round((schedule.intervalMinMs ?? 120000) / 1000);
+      document.getElementById('intervalSecondsMax').value = Math.round((schedule.intervalMaxMs ?? 120000) / 1000);
+      document.getElementById('loginWaitSeconds').value = Math.round((schedule.loginWaitMs ?? 60000) / 1000);
+      document.getElementById('maxRetries').value = schedule.maxRetries ?? 3;
+      document.getElementById('queueThrottleMaxPerDay').value = (schedule.queueThrottle && schedule.queueThrottle.maxPerDay) || 50;
+      autoClickButtonsContainer.innerHTML = '';
+      (schedule.autoClickDuringOutputWait || []).forEach((name) => appendAutoClickRow(name));
+    }
+
+    function syncTimeSlotsFromDom() {
+      if (!currentSchedule) return;
+      const rows = timeSlotsContainer.querySelectorAll('.slot-row');
+      rows.forEach((row, idx) => {
+        if (idx >= currentSchedule.timeSlots.length) return;
+        const slot = currentSchedule.timeSlots[idx];
+        const startHour = Number(row.querySelector('[data-key="startHour"]').value);
+        const startMinute = Number(row.querySelector('[data-key="startMinute"]').value);
+        const endHour = Number(row.querySelector('[data-key="endHour"]').value);
+        const endMinute = Number(row.querySelector('[data-key="endMinute"]').value);
+        const industryId = row.querySelector('[data-key="industryId"]').value;
+        slot.startHour = Number.isInteger(startHour) ? Math.max(0, Math.min(23, startHour)) : 0;
+        slot.startMinute = Number.isInteger(startMinute) ? Math.max(0, Math.min(59, startMinute)) : 0;
+        slot.endHour = Number.isInteger(endHour) ? Math.max(0, Math.min(23, endHour)) : 23;
+        slot.endMinute = Number.isInteger(endMinute) ? Math.max(0, Math.min(59, endMinute)) : 59;
+        if (industryId && industryId !== NEW_INDUSTRY_VALUE) slot.industryId = industryId;
+      });
+    }
+
+    function renderTimeSlots() {
+      if (!currentSchedule) return;
+      syncTimeSlotsFromDom();
+      const industryIds = currentSchedule.industries.map((ind) => ind.id);
+      timeSlotsContainer.innerHTML = '';
+      currentSchedule.timeSlots.forEach((slot, idx) => {
+        const row = document.createElement('div');
+        row.className = 'slot-row';
+        const selectHtml = (industryIds.length
+          ? industryIds.map((id) => '<option value="' + escapeAttr(id) + '"' + (slot.industryId === id ? ' selected' : '') + '>' + escapeHtml(id) + '</option>').join('')
+          : '<option value="">（先添加行业）</option>') +
+          '<option value="' + NEW_INDUSTRY_VALUE + '">+ 新建行业</option>';
+        row.innerHTML =
+          '<label>起</label><input data-key="startHour" type="number" min="0" max="23" value="' + slot.startHour + '">' +
+          '<input data-key="startMinute" type="number" min="0" max="59" value="' + slot.startMinute + '">' +
+          '<label>止</label><input data-key="endHour" type="number" min="0" max="23" value="' + slot.endHour + '">' +
+          '<input data-key="endMinute" type="number" min="0" max="59" value="' + slot.endMinute + '">' +
+          '<select data-key="industryId">' + selectHtml + '</select>' +
+          '<button type="button" class="danger" data-remove>删除</button>';
+        row.querySelector('[data-key="industryId"]').onchange = (event) => {
+          const value = event.target.value;
+          if (value !== NEW_INDUSTRY_VALUE) return;
+          const newIndustry = {
+            id: 'new_' + Date.now(),
+            type: 'playwright',
+            notionUrl: '',
+            newChatEveryRunsMin: 1,
+            newChatEveryRunsMax: 1,
+            modelSwitchIntervalMin: 0,
+            modelSwitchIntervalMax: 0,
+            chainRunsPerSlot: 0,
+            tasks: [{ content: '', runCount: 1 }]
+          };
+          currentSchedule.industries.push(newIndustry);
+          currentSchedule.timeSlots[idx].industryId = newIndustry.id;
+          renderTimeSlots();
+          renderIndustries();
+          openIndustryModal(currentSchedule.industries.length - 1);
+        };
+        row.querySelector('[data-remove]').onclick = () => {
+          currentSchedule.timeSlots.splice(idx, 1);
+          renderTimeSlots();
+        };
+        timeSlotsContainer.appendChild(row);
+      });
+    }
+
+    function renderIndustries() {
+      if (!currentSchedule) return;
+      industriesContainer.innerHTML = '';
+      currentSchedule.industries.forEach((industry, idx) => {
+        const row = document.createElement('div');
+        row.className = 'list-row';
+        row.innerHTML = '<span class="title">' + escapeHtml(industry.id) + '</span>' +
+          '<span class="url" title="' + escapeAttr(industry.notionUrl || '') + '">' + escapeHtml(truncateUrl(industry.notionUrl || '')) + '</span>' +
+          '<button type="button" data-edit>编辑</button>' +
+          '<button type="button" class="danger" data-remove>删除</button>';
+        row.querySelector('[data-edit]').onclick = () => openIndustryModal(idx);
+        row.querySelector('[data-remove]').onclick = () => {
+          const removed = currentSchedule.industries[idx];
+          currentSchedule.industries.splice(idx, 1);
+          const fallback = currentSchedule.industries[0] ? currentSchedule.industries[0].id : '';
+          currentSchedule.timeSlots.forEach((slot) => {
+            if (slot.industryId === removed.id) slot.industryId = fallback;
+          });
+          renderIndustries();
+          renderTimeSlots();
+        };
+        industriesContainer.appendChild(row);
+      });
+    }
+
+    function openIndustryModal(index) {
+      if (!currentSchedule) return;
+      editingIndustryIndex = index;
+      const industry = currentSchedule.industries[index];
+      document.getElementById('industryModalTitle').textContent = industry.id ? '编辑行业: ' + industry.id : '新建行业';
+      document.getElementById('modalIndustryId').value = industry.id || '';
+      document.getElementById('modalNotionUrl').value = industry.notionUrl || '';
+      document.getElementById('modalNewChatEveryRunsMin').value = industry.newChatEveryRunsMin ?? 1;
+      document.getElementById('modalNewChatEveryRunsMax').value = industry.newChatEveryRunsMax ?? 1;
+      document.getElementById('modalModelSwitchIntervalMin').value = industry.modelSwitchIntervalMin ?? 0;
+      document.getElementById('modalModelSwitchIntervalMax').value = industry.modelSwitchIntervalMax ?? 0;
+      document.getElementById('modalChainRunsPerSlot').value = industry.chainRunsPerSlot ?? 0;
+      const tasksContainer = document.getElementById('modalTasksContainer');
+      tasksContainer.innerHTML = '';
+      function appendTask(task) {
+        const row = document.createElement('div');
+        row.className = 'task-row';
+        row.innerHTML = '<textarea data-key="content" placeholder="任务内容">' + escapeHtml(task.content || '') + '</textarea>' +
+          '<input data-key="runCount" type="number" min="1" value="' + (task.runCount || 1) + '">' +
+          '<button type="button" class="danger" data-remove>删</button>';
+        row.querySelector('[data-remove]').onclick = () => row.remove();
+        tasksContainer.appendChild(row);
+      }
+      (industry.tasks || []).forEach((task) => appendTask(task));
+      document.getElementById('modalAddTask').onclick = () => appendTask({ content: '', runCount: 1 });
+      document.getElementById('industryModal').classList.add('visible');
+    }
+
+    function closeIndustryModal() {
+      editingIndustryIndex = -1;
+      document.getElementById('industryModal').classList.remove('visible');
+    }
+
+    function saveIndustryModal() {
+      if (!currentSchedule || editingIndustryIndex < 0) return closeIndustryModal();
+      const industry = currentSchedule.industries[editingIndustryIndex];
+      const oldId = industry.id;
+      const newId = document.getElementById('modalIndustryId').value.trim() || 'unnamed';
+      industry.id = newId;
+      industry.notionUrl = document.getElementById('modalNotionUrl').value.trim();
+      const nMin = Number(document.getElementById('modalNewChatEveryRunsMin').value);
+      const nMax = Number(document.getElementById('modalNewChatEveryRunsMax').value);
+      const mMin = Number(document.getElementById('modalModelSwitchIntervalMin').value);
+      const mMax = Number(document.getElementById('modalModelSwitchIntervalMax').value);
+      const chainRuns = Number(document.getElementById('modalChainRunsPerSlot').value);
+      industry.newChatEveryRunsMin = Number.isInteger(nMin) ? Math.max(0, Math.min(nMin, nMax || nMin)) : 1;
+      industry.newChatEveryRunsMax = Number.isInteger(nMax) ? Math.max(industry.newChatEveryRunsMin, nMax) : industry.newChatEveryRunsMin;
+      industry.modelSwitchIntervalMin = Number.isInteger(mMin) ? Math.max(0, Math.min(mMin, mMax || mMin)) : 0;
+      industry.modelSwitchIntervalMax = Number.isInteger(mMax) ? Math.max(industry.modelSwitchIntervalMin, mMax) : industry.modelSwitchIntervalMin;
+      industry.chainRunsPerSlot = Number.isInteger(chainRuns) && chainRuns >= 0 ? chainRuns : 0;
+      industry.tasks = Array.from(document.querySelectorAll('#modalTasksContainer .task-row')).map((row) => ({
+        content: row.querySelector('[data-key="content"]').value || '',
+        runCount: Number(row.querySelector('[data-key="runCount"]').value) || 1,
+      }));
+      currentSchedule.timeSlots.forEach((slot) => {
+        if (slot.industryId === oldId) slot.industryId = newId;
+      });
+      closeIndustryModal();
+      renderIndustries();
+      renderTimeSlots();
+    }
+
+    function renderWarmupEntries() {
+      if (!currentWarmupConfig) return;
+      warmupEntriesContainer.innerHTML = '';
+      currentWarmupConfig.entries.forEach((entry, idx) => {
+        const row = document.createElement('div');
+        row.className = 'list-row';
+        row.innerHTML = '<span class="title">' + escapeHtml(entry.name || '—') + '</span>' +
+          '<span class="url" title="' + escapeAttr(entry.queue_database_url || '') + '">' + escapeHtml(truncateUrl(entry.queue_database_url || '')) + '</span>' +
+          '<span class="url" title="' + escapeAttr(entry.credential_registry_database_url || '') + '">' + escapeHtml(truncateUrl(entry.credential_registry_database_url || '')) + '</span>' +
+          '<span class="hint">' + ((entry.batch_size != null ? entry.batch_size : DEFAULT_BATCH_SIZE) + ' 条/批') + '</span>' +
+          '<button type="button" data-edit>编辑</button>' +
+          '<button type="button" class="danger" data-remove>删除</button>';
+        row.querySelector('[data-edit]').onclick = () => openWarmupModal(idx);
+        row.querySelector('[data-remove]').onclick = () => {
+          currentWarmupConfig.entries.splice(idx, 1);
+          renderWarmupEntries();
+        };
+        warmupEntriesContainer.appendChild(row);
+      });
+    }
+
+    function openWarmupModal(index) {
+      editingWarmupIndex = index;
+      const entry = currentWarmupConfig.entries[index] || {};
+      document.getElementById('modalWarmupName').value = entry.name || '';
+      document.getElementById('modalWarmupQueueUrl').value = entry.queue_database_url || '';
+      document.getElementById('modalWarmupCredentialUrl').value = entry.credential_registry_database_url || '';
+      document.getElementById('modalWarmupExecutionLogUrl').value = entry.execution_log_database_url || '';
+      document.getElementById('modalWarmupConversationLogUrl').value = entry.conversation_event_log_database_url || '';
+      document.getElementById('modalWarmupBandwidthUrl').value = entry.bandwidth_detail_database_url || '';
+      document.getElementById('modalWarmupMailboxPoolUrl').value = entry.warmup_mailbox_pool_database_url || '';
+      document.getElementById('modalWarmupBatchSize').value = entry.batch_size != null ? entry.batch_size : DEFAULT_BATCH_SIZE;
+      document.getElementById('warmupModal').classList.add('visible');
+    }
+
+    function closeWarmupModal() {
+      editingWarmupIndex = -1;
+      document.getElementById('warmupModal').classList.remove('visible');
+    }
+
+    function saveWarmupModal() {
+      if (!currentWarmupConfig || editingWarmupIndex < 0) return closeWarmupModal();
+      const entry = currentWarmupConfig.entries[editingWarmupIndex];
+      entry.name = document.getElementById('modalWarmupName').value.trim() || '未命名';
+      entry.queue_database_url = document.getElementById('modalWarmupQueueUrl').value.trim();
+      entry.credential_registry_database_url = document.getElementById('modalWarmupCredentialUrl').value.trim();
+      entry.execution_log_database_url = document.getElementById('modalWarmupExecutionLogUrl').value.trim();
+      entry.conversation_event_log_database_url = document.getElementById('modalWarmupConversationLogUrl').value.trim();
+      entry.bandwidth_detail_database_url = document.getElementById('modalWarmupBandwidthUrl').value.trim();
+      entry.warmup_mailbox_pool_database_url = document.getElementById('modalWarmupMailboxPoolUrl').value.trim();
+      const batchSize = Number(document.getElementById('modalWarmupBatchSize').value);
+      entry.batch_size = Number.isInteger(batchSize) && batchSize >= 1 && batchSize <= 100 ? batchSize : DEFAULT_BATCH_SIZE;
+      closeWarmupModal();
+      renderWarmupEntries();
+    }
+
+    function collectSchedule() {
+      syncTimeSlotsFromDom();
+      const secMin = Number(document.getElementById('intervalSecondsMin').value) || 120;
+      const secMax = Number(document.getElementById('intervalSecondsMax').value) || 120;
+      const loginWaitMs = (Number(document.getElementById('loginWaitSeconds').value) || 60) * 1000;
+      const maxRetries = Number(document.getElementById('maxRetries').value) || 3;
+      const throttlePerDay = Number(document.getElementById('queueThrottleMaxPerDay').value);
+      const autoClickDuringOutputWait = Array.from(autoClickButtonsContainer.querySelectorAll('[data-key="name"]'))
+        .map((input) => input.value.trim())
+        .filter(Boolean);
+      return {
+        intervalMinMs: Math.min(secMin, secMax) * 1000,
+        intervalMaxMs: Math.max(secMin, secMax) * 1000,
+        loginWaitMs,
+        maxRetries,
+        storagePath: '.notion-auth.json',
+        timeSlots: currentSchedule.timeSlots,
+        industries: currentSchedule.industries,
+        autoClickDuringOutputWait,
+        queueThrottle: {
+          maxPerDay: Number.isInteger(throttlePerDay) && throttlePerDay >= 1 ? throttlePerDay : 50,
+        },
+      };
+    }
+
+    function renderRunTabs(targetTabs, targetContent, runs) {
+      targetTabs.innerHTML = '';
+      runs.forEach((run, idx) => {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.textContent = run.endTime ? ('#' + run.id + ' ' + new Date(run.startTime).toLocaleTimeString()) : ('#' + run.id + ' 运行中');
+        btn.onclick = () => {
+          targetTabs.querySelectorAll('button').forEach((item) => item.classList.remove('active'));
+          btn.classList.add('active');
+          targetContent.textContent = (run.lines || []).join('\\n') || '（无输出）';
+        };
+        targetTabs.appendChild(btn);
+        if (idx === 0) btn.click();
+      });
+      if (runs.length === 0) targetContent.textContent = '（暂无运行记录）';
     }
 
     async function refreshStatus() {
@@ -933,796 +789,171 @@ function getDashboardHtml(): string {
       document.getElementById('btnStart').disabled = status === 'running';
       document.getElementById('btnStop').disabled = status === 'idle';
     }
-    async function refreshQueueSenderStatus() {
-      try {
-        const { status } = await api('/api/queue-sender/status');
-        const el = document.getElementById('queueSenderStatusEl');
-        el.textContent = status === 'running' ? 'Queue Sender：运行中' : 'Queue Sender：已停止';
-        el.className = 'status ' + status;
-      } catch (_) {}
-    }
-    async function refreshInboundListenerStatus() {
-      try {
-        const { status } = await api('/api/inbound-listener/status');
-        const el = document.getElementById('inboundListenerStatusEl');
-        el.textContent = status === 'running' ? 'Inbound Listener：运行中' : 'Inbound Listener：已停止';
-        el.className = 'status ' + status;
-      } catch (_) {}
+
+    async function refreshWarmupStatus() {
+      const { status } = await api('/api/queue-sender/status');
+      warmupStatusEl.textContent = status === 'running' ? 'Warmup Executor：运行中' : 'Warmup Executor：已停止';
+      warmupStatusEl.className = 'status ' + status;
     }
 
-    let editingInboundGroupIndex = -1;
-    async function loadInboundListenerConfig() {
-      const c = await api('/api/inbound-listener/config');
-      currentInboundConfig = c;
-      document.getElementById('inboundPollInterval').value = c.poll_interval_seconds ?? 120;
-      document.getElementById('inboundBodyPlainMaxChars').value = c.body_plain_max_chars ?? 40000;
-      renderInboundListenerGroups();
+    async function refreshLogs() {
+      const play = await api('/api/logs?kind=playwright');
+      const warm = await api('/api/logs?kind=queue-sender');
+      playwrightRuns = play.runs || [];
+      warmupRuns = warm.runs || [];
+      renderRunTabs(document.getElementById('playwrightLogTabs'), document.getElementById('playwrightLogContent'), playwrightRuns);
+      renderRunTabs(document.getElementById('warmupLogTabs'), document.getElementById('warmupLogContent'), warmupRuns);
     }
-    function renderInboundListenerGroups() {
-      if (!currentInboundConfig || !currentInboundConfig.groups) return;
-      const container = document.getElementById('inboundListenerGroupsContainer');
-      container.innerHTML = '';
-      currentInboundConfig.groups.forEach((g, idx) => {
-        const row = document.createElement('div');
-        row.className = 'industry-row';
-        const mailboxesPreview = (g.mailboxes || []).length ? (g.mailboxes.length + ' 个邮箱') : '—';
-        row.innerHTML = '<span class="url" title="' + escapeAttr(g.inbound_messages_db_id || '') + '">' + escapeHtml(truncateUrl(g.inbound_messages_db_id)) + '</span>' +
-          '<span class="hint">' + mailboxesPreview + '</span>' +
-          '<span class="actions"><button type="button" data-edit-inbound-group>编辑</button><button type="button" class="danger" data-remove-inbound-group>删除</button></span>';
-        row.querySelector('[data-edit-inbound-group]').onclick = () => openInboundGroupModal(idx);
-        row.querySelector('[data-remove-inbound-group]').onclick = () => { currentInboundConfig.groups.splice(idx, 1); renderInboundListenerGroups(); };
-        container.appendChild(row);
-      });
-      document.getElementById('btnAddInboundGroup').onclick = () => {
-        currentInboundConfig.groups.push({ inbound_messages_db_id: '', touchpoints_db_id: '', sender_accounts_database_url: '', mailboxes: [] });
-        openInboundGroupModal(currentInboundConfig.groups.length - 1);
-      };
+
+    async function loadScheduleState() {
+      currentSchedule = await api('/api/schedule');
+      fillSchedule(currentSchedule);
+      renderTimeSlots();
+      renderIndustries();
     }
-    function openInboundGroupModal(idx) {
-      editingInboundGroupIndex = idx;
-      const g = currentInboundConfig.groups[idx] || {};
-      document.getElementById('modalInboundImDbId').value = g.inbound_messages_db_id || '';
-      document.getElementById('modalInboundTouchpointsDbId').value = g.touchpoints_db_id || '';
-      document.getElementById('modalInboundSenderAccountsUrl').value = g.sender_accounts_database_url || '';
-      document.getElementById('modalInboundMailboxes').value = (g.mailboxes || []).join('\\n');
-      document.getElementById('inboundListenerGroupModal').classList.add('visible');
+
+    async function loadWarmupConfig() {
+      currentWarmupConfig = await api('/api/queue-sender/config');
+      renderWarmupEntries();
     }
-    function closeInboundGroupModal() {
-      document.getElementById('inboundListenerGroupModal').classList.remove('visible');
-      editingInboundGroupIndex = -1;
-    }
-    document.getElementById('modalInboundGroupCancel').onclick = closeInboundGroupModal;
-    document.getElementById('modalInboundGroupSave').onclick = () => {
-      const g = currentInboundConfig.groups[editingInboundGroupIndex];
-      g.inbound_messages_db_id = document.getElementById('modalInboundImDbId').value.trim();
-      g.touchpoints_db_id = document.getElementById('modalInboundTouchpointsDbId').value.trim();
-      g.sender_accounts_database_url = document.getElementById('modalInboundSenderAccountsUrl').value.trim();
-      g.mailboxes = document.getElementById('modalInboundMailboxes').value.split(new RegExp('[\\n,]')).map((s) => s.trim()).filter(Boolean);
-      closeInboundGroupModal();
-      renderInboundListenerGroups();
+
+    document.getElementById('btnAddAutoClickButton').onclick = () => appendAutoClickRow('');
+    document.getElementById('btnAddSlot').onclick = () => {
+      const firstIndustryId = currentSchedule && currentSchedule.industries[0] ? currentSchedule.industries[0].id : '';
+      currentSchedule.timeSlots.push({ startHour: 0, startMinute: 0, endHour: 1, endMinute: 0, industryId: firstIndustryId });
+      renderTimeSlots();
     };
-    document.getElementById('btnSaveInboundConfig').onclick = async () => {
+    document.getElementById('btnAddIndustry').onclick = () => {
+      currentSchedule.industries.push({
+        id: 'new_' + Date.now(),
+        type: 'playwright',
+        notionUrl: '',
+        newChatEveryRunsMin: 1,
+        newChatEveryRunsMax: 1,
+        modelSwitchIntervalMin: 0,
+        modelSwitchIntervalMax: 0,
+        chainRunsPerSlot: 0,
+        tasks: [{ content: '', runCount: 1 }],
+      });
+      renderIndustries();
+      renderTimeSlots();
+      openIndustryModal(currentSchedule.industries.length - 1);
+    };
+    document.getElementById('modalSaveIndustry').onclick = saveIndustryModal;
+    document.getElementById('modalCancelIndustry').onclick = closeIndustryModal;
+    document.getElementById('btnAddWarmupEntry').onclick = () => {
+      currentWarmupConfig.entries.push({
+        name: '',
+        queue_database_url: '',
+        credential_registry_database_url: '',
+        execution_log_database_url: '',
+        conversation_event_log_database_url: '',
+        bandwidth_detail_database_url: '',
+        warmup_mailbox_pool_database_url: '',
+        batch_size: DEFAULT_BATCH_SIZE,
+      });
+      openWarmupModal(currentWarmupConfig.entries.length - 1);
+    };
+    document.getElementById('modalSaveWarmup').onclick = saveWarmupModal;
+    document.getElementById('modalCancelWarmup').onclick = closeWarmupModal;
+
+    document.getElementById('btnSave').onclick = async () => {
       showMsg('');
       try {
-        const pollSec = parseInt(document.getElementById('inboundPollInterval').value, 10);
-        const bodyMax = parseInt(document.getElementById('inboundBodyPlainMaxChars').value, 10);
-        const config = {
-          groups: currentInboundConfig.groups,
-          poll_interval_seconds: Number.isInteger(pollSec) && pollSec >= 10 ? pollSec : 120,
-          body_plain_max_chars: Number.isInteger(bodyMax) && bodyMax >= 1000 ? bodyMax : 40000
-        };
-        await api('/api/inbound-listener/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(config) });
-        showMsg('Inbound Listener 配置已保存', false);
-        setTimeout(() => showMsg(''), 2000);
-      } catch (e) { showMsg(e instanceof Error ? e.message : String(e), true); }
-    };
-
-    let editingReplyTasksEntryIndex = -1;
-    async function loadReplyTasksConfig() {
-      const c = await api('/api/reply-tasks/config');
-      currentReplyTasksConfig = c;
-      renderReplyTasksEntries();
-    }
-    function renderReplyTasksEntries() {
-      if (!currentReplyTasksConfig || !currentReplyTasksConfig.entries) return;
-      const container = document.getElementById('replyTasksEntriesContainer');
-      container.innerHTML = '';
-      currentReplyTasksConfig.entries.forEach((e, idx) => {
-        const row = document.createElement('div');
-        row.className = 'industry-row';
-        if (currentReplyTasksConfig.selected_index === idx) row.classList.add('selected');
-        const curLabel = currentReplyTasksConfig.selected_index === idx ? ' [当前]' : '';
-        row.innerHTML = '<span class="url" title="' + escapeAttr(e.reply_tasks_db_id || '') + '">' + escapeHtml(truncateUrl(e.reply_tasks_db_id)) + curLabel + '</span>' +
-          '<span class="hint">' + escapeHtml(truncateUrl(e.sender_accounts_database_url || '')) + '</span>' +
-          '<span class="actions">' +
-          '<button type="button" data-reply-tasks-select>选中</button>' +
-          '<button type="button" data-edit-reply-tasks-entry>编辑</button>' +
-          '<button type="button" class="danger" data-remove-reply-tasks-entry>删除</button></span>';
-        row.querySelector('[data-reply-tasks-select]').onclick = () => { currentReplyTasksConfig.selected_index = idx; renderReplyTasksEntries(); };
-        row.querySelector('[data-edit-reply-tasks-entry]').onclick = () => openReplyTasksEntryModal(idx);
-        row.querySelector('[data-remove-reply-tasks-entry]').onclick = () => {
-          currentReplyTasksConfig.entries.splice(idx, 1);
-          if (currentReplyTasksConfig.selected_index >= currentReplyTasksConfig.entries.length)
-            currentReplyTasksConfig.selected_index = currentReplyTasksConfig.entries.length - 1;
-          renderReplyTasksEntries();
-        };
-        container.appendChild(row);
-      });
-      document.getElementById('btnAddReplyTasksEntry').onclick = () => {
-        currentReplyTasksConfig.entries.push({ reply_tasks_db_id: '', sender_accounts_database_url: '' });
-        openReplyTasksEntryModal(currentReplyTasksConfig.entries.length - 1);
-      };
-    }
-    function openReplyTasksEntryModal(idx) {
-      editingReplyTasksEntryIndex = idx;
-      const e = currentReplyTasksConfig.entries[idx] || {};
-      document.getElementById('modalReplyTasksDbId').value = e.reply_tasks_db_id || '';
-      document.getElementById('modalReplyTasksSenderUrl').value = e.sender_accounts_database_url || '';
-      document.getElementById('replyTasksEntryModal').classList.add('visible');
-    }
-    function closeReplyTasksEntryModal() {
-      document.getElementById('replyTasksEntryModal').classList.remove('visible');
-      editingReplyTasksEntryIndex = -1;
-    }
-    document.getElementById('modalReplyTasksEntryCancel').onclick = closeReplyTasksEntryModal;
-    document.getElementById('modalReplyTasksEntrySave').onclick = () => {
-      if (editingReplyTasksEntryIndex < 0 || !currentReplyTasksConfig.entries || editingReplyTasksEntryIndex >= currentReplyTasksConfig.entries.length) {
-        closeReplyTasksEntryModal();
-        return;
-      }
-      const e = currentReplyTasksConfig.entries[editingReplyTasksEntryIndex];
-      e.reply_tasks_db_id = document.getElementById('modalReplyTasksDbId').value.trim();
-      e.sender_accounts_database_url = document.getElementById('modalReplyTasksSenderUrl').value.trim();
-      closeReplyTasksEntryModal();
-      renderReplyTasksEntries();
-    };
-    document.getElementById('btnSaveReplyTasksConfig').onclick = async () => {
-      showMsg('');
-      try {
-        await api('/api/reply-tasks/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(currentReplyTasksConfig) });
-        showMsg('Reply Tasks 配置已保存', false);
-        setTimeout(() => showMsg(''), 2000);
-      } catch (err) { showMsg(err instanceof Error ? err.message : String(err), true); }
-    };
-
-    let editingQueueSenderEntryIndex = -1;
-    const DEFAULT_QUEUE_SENDER_BATCH_SIZE = 20;
-    async function loadQueueSenderConfig() {
-      const c = await api('/api/queue-sender/config');
-      currentQueueSenderConfig = c;
-      renderQueueSenderEntries();
-    }
-    function renderQueueSenderEntries() {
-      if (!currentQueueSenderConfig || !currentQueueSenderConfig.entries) return;
-      const container = document.getElementById('queueSenderEntriesContainer');
-      container.innerHTML = '';
-      currentQueueSenderConfig.entries.forEach((e, idx) => {
-        const row = document.createElement('div');
-        row.className = 'industry-row';
-        row.innerHTML = '<span class="id">' + escapeHtml(e.name || '—') + '</span>' +
-          '<span class="url" title="' + escapeAttr(e.queue_database_url || '') + '">' + escapeHtml(truncateUrl(e.queue_database_url)) + '</span>' +
-          '<span class="hint" title="' + escapeAttr(e.sender_accounts_database_url || '') + '">' + escapeHtml(truncateUrl(e.sender_accounts_database_url)) + '</span>' +
-          '<span class="hint">' + (e.batch_size != null ? e.batch_size : DEFAULT_QUEUE_SENDER_BATCH_SIZE) + ' 条/批</span>' +
-          '<span class="actions"><button type="button" data-edit-queue-sender-entry>编辑</button><button type="button" class="danger" data-remove-queue-sender-entry>删除</button></span>';
-        row.querySelector('[data-edit-queue-sender-entry]').onclick = () => openQueueSenderEntryModal(idx);
-        row.querySelector('[data-remove-queue-sender-entry]').onclick = () => {
-          currentQueueSenderConfig.entries.splice(idx, 1);
-          renderQueueSenderEntries();
-        };
-        container.appendChild(row);
-      });
-      document.getElementById('btnAddQueueSenderEntry').onclick = () => {
-        currentQueueSenderConfig.entries.push({ name: '', queue_database_url: '', sender_accounts_database_url: '', batch_size: DEFAULT_QUEUE_SENDER_BATCH_SIZE });
-        openQueueSenderEntryModal(currentQueueSenderConfig.entries.length - 1);
-      };
-    }
-    function openQueueSenderEntryModal(idx) {
-      editingQueueSenderEntryIndex = idx;
-      const e = currentQueueSenderConfig.entries[idx] || {};
-      document.getElementById('modalQueueSenderName').value = e.name || '';
-      document.getElementById('modalQueueSenderQueueUrl').value = e.queue_database_url || '';
-      document.getElementById('modalQueueSenderSenderUrl').value = e.sender_accounts_database_url || '';
-      document.getElementById('modalQueueSenderBatchSize').value = (e.batch_size != null ? e.batch_size : DEFAULT_QUEUE_SENDER_BATCH_SIZE);
-      document.getElementById('queueSenderEntryModal').classList.add('visible');
-    }
-    function closeQueueSenderEntryModal() {
-      document.getElementById('queueSenderEntryModal').classList.remove('visible');
-      editingQueueSenderEntryIndex = -1;
-    }
-    document.getElementById('modalQueueSenderEntryCancel').onclick = closeQueueSenderEntryModal;
-    document.getElementById('modalQueueSenderEntrySave').onclick = () => {
-      if (editingQueueSenderEntryIndex < 0 || !currentQueueSenderConfig.entries || editingQueueSenderEntryIndex >= currentQueueSenderConfig.entries.length) {
-        closeQueueSenderEntryModal();
-        return;
-      }
-      const e = currentQueueSenderConfig.entries[editingQueueSenderEntryIndex];
-      e.name = document.getElementById('modalQueueSenderName').value.trim() || '未命名';
-      e.queue_database_url = document.getElementById('modalQueueSenderQueueUrl').value.trim();
-      e.sender_accounts_database_url = document.getElementById('modalQueueSenderSenderUrl').value.trim();
-      const batchVal = Number(document.getElementById('modalQueueSenderBatchSize').value);
-      e.batch_size = (Number.isInteger(batchVal) && batchVal >= 1 && batchVal <= 100) ? batchVal : DEFAULT_QUEUE_SENDER_BATCH_SIZE;
-      closeQueueSenderEntryModal();
-      renderQueueSenderEntries();
-    };
-    document.getElementById('btnSaveQueueSenderConfig').onclick = async () => {
-      showMsg('');
-      try {
-        await api('/api/queue-sender/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(currentQueueSenderConfig) });
-        showMsg('Queue 发信配置已保存', false);
-        setTimeout(() => showMsg(''), 2000);
-      } catch (err) { showMsg(err instanceof Error ? err.message : String(err), true); }
-    };
-
-    let replyTasksList = [];
-    document.getElementById('btnLoadReplyTasksList').onclick = async () => {
-      showMsg('');
-      try {
-        replyTasksList = await api('/api/reply-tasks/list') || [];
-        renderReplyTasksList();
-      } catch (err) { showMsg(err instanceof Error ? err.message : String(err), true); }
-    };
-    function renderReplyTasksList() {
-      const container = document.getElementById('replyTasksListContainer');
-      container.innerHTML = '';
-      replyTasksList.forEach((t) => {
-        const row = document.createElement('div');
-        row.className = 'industry-row';
-        const summary = (t.taskSummary || '').slice(0, 50) + ((t.taskSummary || '').length > 50 ? '…' : '');
-        const status = t.status || '—';
-        const snippet = (t.suggestedReply || '').slice(0, 80) + ((t.suggestedReply || '').length > 80 ? '…' : '');
-        const isDone = t.status === 'Done';
-        const sendBtnHtml = isDone ? '' : '<button type="button" data-reply-tasks-send-one>发送</button>';
-        row.innerHTML = '<span class="url" title="' + escapeAttr(t.taskSummary || '') + '">' + escapeHtml(summary) + '</span>' +
-          '<span class="hint">' + escapeHtml(status) + '</span>' +
-          '<span class="hint" style="max-width:12rem" title="' + escapeAttr(t.suggestedReply || '') + '">' + escapeHtml(snippet) + '</span>' +
-          '<span class="actions">' + sendBtnHtml + '<button type="button" data-reply-tasks-detail>详情</button></span>';
-        const sendBtn = row.querySelector('[data-reply-tasks-send-one]');
-        if (sendBtn) sendBtn.onclick = () => openReplyTasksSendModal(t);
-        row.querySelector('[data-reply-tasks-detail]').onclick = () => openReplyTasksDetailModal(t);
-        container.appendChild(row);
-      });
-      if (replyTasksList.length === 0) container.innerHTML = '<p class="hint">（无任务或请先选择配置并加载列表）</p>';
-    }
-    function openReplyTasksDetailModal(task) {
-      document.getElementById('replyTasksDetailSummary').textContent = task.taskSummary || '—';
-      document.getElementById('replyTasksDetailStatus').textContent = task.status || '—';
-      document.getElementById('replyTasksDetailSuggestedReply').textContent = task.suggestedReply || '';
-      document.getElementById('replyTasksDetailModal').classList.add('visible');
-    }
-    document.getElementById('replyTasksDetailClose').onclick = () => document.getElementById('replyTasksDetailModal').classList.remove('visible');
-    let replyTasksQuill = null;
-    async function openReplyTasksSendModal(task) {
-      replyTasksSendTaskPageId = task.pageId;
-      const lastInboundEl = document.getElementById('replyTasksLastInboundEl');
-      lastInboundEl.textContent = '加载中…';
-      document.getElementById('replyTasksSendModal').classList.add('visible');
-      try {
-        const ctx = await api('/api/reply-tasks/context?taskPageId=' + encodeURIComponent(task.pageId));
-        lastInboundEl.textContent = (ctx.lastInboundBodyPlain || '') || '（无）';
-        if (!replyTasksQuill) {
-          replyTasksQuill = new Quill('#replyTasksBodyEditor', { theme: 'snow', placeholder: '编辑回复正文…' });
-        }
-        replyTasksQuill.root.innerHTML = (ctx.suggestedReply || '').replace(new RegExp('\\n', 'g'), '<br>');
-      } catch (err) {
-        lastInboundEl.textContent = '加载失败: ' + (err instanceof Error ? err.message : String(err));
-        if (!replyTasksQuill) {
-          replyTasksQuill = new Quill('#replyTasksBodyEditor', { theme: 'snow', placeholder: '编辑回复正文…' });
-        }
-        replyTasksQuill.root.innerHTML = (task.suggestedReply || '').replace(new RegExp('\\n', 'g'), '<br>');
-      }
-    }
-    function closeReplyTasksSendModal() {
-      document.getElementById('replyTasksSendModal').classList.remove('visible');
-      replyTasksSendTaskPageId = null;
-    }
-    document.getElementById('modalReplyTasksSendCancel').onclick = closeReplyTasksSendModal;
-    document.getElementById('modalReplyTasksSendConfirm').onclick = async () => {
-      if (!replyTasksSendTaskPageId) return;
-      showMsg('');
-      try {
-        const bodyHtml = replyTasksQuill ? replyTasksQuill.root.innerHTML : '';
-        const body = { taskPageId: replyTasksSendTaskPageId, bodyHtml: bodyHtml || undefined };
-        const result = await api('/api/reply-tasks/send', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-        closeReplyTasksSendModal();
-        if (result.ok) { showMsg('发送成功并已标为 Done', false); document.getElementById('btnLoadReplyTasksList').click(); }
-        else { showMsg(result.error || '发送失败', true); }
-      } catch (err) { showMsg(err instanceof Error ? err.message : String(err), true); }
-    };
-    document.getElementById('btnSendBatchReplyTasks').onclick = async () => {
-      showMsg('');
-      try {
-        const result = await api('/api/reply-tasks/send-batch', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
-        showMsg('批量发送: 共 ' + result.total + '，成功 ' + result.ok + '，失败 ' + result.failed, result.failed > 0);
-        document.getElementById('btnLoadReplyTasksList').click();
-      } catch (err) { showMsg(err instanceof Error ? err.message : String(err), true); }
-    };
-
-    /** Reply Tasks 自动发送：状态与运行日志 */
-    let replyTasksAutoSendRuns = [];
-    const replyTasksAutoSendLogTabs = document.getElementById('replyTasksAutoSendLogTabs');
-    const replyTasksAutoSendLogContent = document.getElementById('replyTasksAutoSendLogContent');
-    function renderReplyTasksAutoSendLogTabs() {
-      replyTasksAutoSendLogTabs.innerHTML = '';
-      replyTasksAutoSendRuns.forEach((r, i) => {
-        const label = r.endTime ? '#' + r.id + ' ' + new Date(r.startTime).toLocaleTimeString() : '#' + r.id + ' 运行中';
-        const btn = document.createElement('button');
-        btn.textContent = label;
-        btn.onclick = () => {
-          replyTasksAutoSendLogContent.textContent = (r.lines || []).join('\\n') || '（无输出）';
-          replyTasksAutoSendLogTabs.querySelectorAll('button').forEach(b => b.classList.remove('active'));
-          btn.classList.add('active');
-        };
-        replyTasksAutoSendLogTabs.appendChild(btn);
-        if (i === 0) { btn.click(); btn.classList.add('active'); }
-      });
-      if (replyTasksAutoSendRuns.length === 0) replyTasksAutoSendLogContent.textContent = '（暂无运行记录）';
-    }
-    async function refreshReplyTasksAutoSendLogs() {
-      try {
-        const { runs: list } = await api('/api/reply-tasks-auto-send/logs?n=10');
-        replyTasksAutoSendRuns = list || [];
-        renderReplyTasksAutoSendLogTabs();
-      } catch (_) {}
-    }
-    async function refreshReplyTasksAutoSendStatus() {
-      try {
-        const { status } = await api('/api/reply-tasks-auto-send/status');
-        const el = document.getElementById('replyTasksAutoSendStatusEl');
-        el.textContent = status === 'running' ? '自动发送：运行中' : '自动发送：已停止';
-        el.className = 'status ' + status;
-        document.getElementById('btnReplyTasksAutoSendStart').disabled = status === 'running';
-        document.getElementById('btnReplyTasksAutoSendStop').disabled = status === 'idle';
-      } catch (_) {}
-    }
-    document.getElementById('btnReplyTasksAutoSendStart').onclick = async () => {
-      showMsg('');
-      try {
-        await api('/api/reply-tasks-auto-send/start', { method: 'POST' });
-        await refreshReplyTasksAutoSendStatus();
-        await refreshReplyTasksAutoSendLogs();
-        showMsg('已开启自动发送', false);
-        setTimeout(() => showMsg(''), 2000);
-      } catch (e) { showMsg(e instanceof Error ? e.message : String(e), true); }
-    };
-    document.getElementById('btnReplyTasksAutoSendStop').onclick = async () => {
-      showMsg('');
-      try {
-        await api('/api/reply-tasks-auto-send/stop', { method: 'POST' });
-        await refreshReplyTasksAutoSendStatus();
-        await refreshReplyTasksAutoSendLogs();
-        showMsg('已停止自动发送', false);
-        setTimeout(() => showMsg(''), 2000);
-      } catch (e) { showMsg(e instanceof Error ? e.message : String(e), true); }
-    };
-
-    /** 重绘时间区间与行业列表，保持数据一致 */
-    function syncScheduleUI() {
-      if (!currentSchedule) return;
-      renderTimeSlots(currentSchedule);
-      renderIndustries(currentSchedule);
-    }
-
-    const NEW_INDUSTRY_VALUE = '__new__';
-
-    /** 将当前 DOM 中时间区间行的输入值写回 currentSchedule.timeSlots，避免重绘时丢失未保存编辑。小时 0–23，分 0–59。 */
-    function syncTimeSlotsFromDOM() {
-      if (!currentSchedule || !currentSchedule.timeSlots) return;
-      const rows = timeSlotsContainer.querySelectorAll('.slot-row');
-      rows.forEach((row, idx) => {
-        if (idx >= currentSchedule.timeSlots.length) return;
-        const slot = currentSchedule.timeSlots[idx];
-        const startH = Number(row.querySelector('[data-key="startHour"]')?.value ?? 0);
-        const startM = Number(row.querySelector('[data-key="startMinute"]')?.value ?? 0);
-        const endH = Number(row.querySelector('[data-key="endHour"]')?.value ?? 23);
-        const endM = Number(row.querySelector('[data-key="endMinute"]')?.value ?? 59);
-        slot.startHour = (Number.isFinite(startH) && startH >= 0 && startH <= 23) ? startH | 0 : 0;
-        slot.startMinute = (Number.isFinite(startM) && startM >= 0 && startM <= 59) ? startM | 0 : 0;
-        slot.endHour = (Number.isFinite(endH) && endH >= 0 && endH <= 23) ? endH | 0 : 23;
-        slot.endMinute = (Number.isFinite(endM) && endM >= 0 && endM <= 59) ? endM | 0 : 59;
-        const industrySelect = row.querySelector('[data-key="industryId"]');
-        if (industrySelect && industrySelect.value !== NEW_INDUSTRY_VALUE) slot.industryId = industrySelect.value;
-      });
-    }
-
-    function renderTimeSlots(schedule) {
-      syncTimeSlotsFromDOM();
-      const slots = schedule.timeSlots || [];
-      const industryIds = (schedule.industries || []).map(i => i.id);
-      timeSlotsContainer.innerHTML = '';
-      slots.forEach((slot, idx) => {
-        const row = document.createElement('div');
-        row.className = 'slot-row';
-        let optHtml = industryIds.length
-          ? industryIds.map(id => '<option value="' + escapeAttr(id) + '"' + (slot.industryId === id ? ' selected' : '') + '>' + escapeHtml(id) + '</option>').join('') + '<option value="' + NEW_INDUSTRY_VALUE + '">+ 新建行业</option>'
-          : '<option value="">（先添加行业）</option><option value="' + NEW_INDUSTRY_VALUE + '">+ 新建行业</option>';
-        row.innerHTML =
-          '<span class="slot-time-group"><label>起</label><input type="number" min="0" max="23" data-key="startHour" placeholder="时" value="' + (slot.startHour ?? 0) + '" title="时" aria-label="起始小时">' +
-          '<input type="number" min="0" max="59" data-key="startMinute" placeholder="分" value="' + (slot.startMinute ?? 0) + '" title="分" aria-label="起始分钟"></span>' +
-          '<span class="slot-time-group"><label>止</label><input type="number" min="0" max="23" data-key="endHour" placeholder="时" value="' + (slot.endHour ?? 23) + '" title="时" aria-label="结束小时">' +
-          '<input type="number" min="0" max="59" data-key="endMinute" placeholder="分" value="' + (slot.endMinute ?? 59) + '" title="分" aria-label="结束分钟"></span>' +
-          '<select data-key="industryId" data-slot-index="' + idx + '">' + optHtml + '</select>' +
-          '<button type="button" class="danger" data-remove-slot>删除</button>';
-        const selectEl = row.querySelector('[data-key="industryId"]');
-        selectEl.onchange = function() {
-          if (selectEl.value !== NEW_INDUSTRY_VALUE) return;
-          const newId = 'new_' + Date.now();
-          const newInd = { id: newId, type: 'playwright', notionUrl: '', newChatEveryRunsMin: 1, newChatEveryRunsMax: 1, modelSwitchIntervalMin: 0, modelSwitchIntervalMax: 0, chainRunsPerSlot: 0, tasks: [{ content: '', runCount: 1 }] };
-          schedule.industries.push(newInd);
-          slot.industryId = newId;
-          syncScheduleUI();
-          openEditModal(schedule.industries.length - 1);
-        };
-        row.querySelector('[data-remove-slot]').onclick = () => { slots.splice(idx, 1); syncScheduleUI(); };
-        timeSlotsContainer.appendChild(row);
-      });
-      document.getElementById('btnAddSlot').onclick = () => {
-        slots.push({ startHour: 0, startMinute: 0, endHour: 1, endMinute: 0, industryId: industryIds[0] || '' });
-        syncScheduleUI();
-      };
-    }
-
-    /** 行业主视图：id + Notion URL 截断 + 编辑、删除（仅 Playwright 任务链） */
-    function renderIndustries(schedule) {
-      const industries = schedule.industries || [];
-      industriesContainer.innerHTML = '';
-      industries.forEach((ind, indIdx) => {
-        const mainUrl = ind.notionUrl || '';
-        const row = document.createElement('div');
-        row.className = 'industry-row';
-        row.innerHTML = '<span class="type">Playwright</span><span class="id">' + escapeHtml(ind.id || '') + '</span>' +
-          '<span class="url" title="' + escapeAttr(mainUrl) + '">' + escapeHtml(truncateUrl(mainUrl)) + '</span>' +
-          '<span class="actions"><button type="button" data-edit-industry>编辑</button><button type="button" class="danger" data-remove-industry>删除</button></span>';
-        row.querySelector('[data-edit-industry]').onclick = () => openEditModal(indIdx);
-        row.querySelector('[data-remove-industry]').onclick = () => removeIndustry(schedule, indIdx);
-        industriesContainer.appendChild(row);
-      });
-      document.getElementById('btnAddIndustry').onclick = () => {
-        industries.push({ id: 'new_' + Date.now(), type: 'playwright', notionUrl: '', newChatEveryRunsMin: 1, newChatEveryRunsMax: 1, modelSwitchIntervalMin: 0, modelSwitchIntervalMax: 0, chainRunsPerSlot: 0, tasks: [{ content: '', runCount: 1 }] });
-        syncScheduleUI();
-        openEditModal(industries.length - 1);
-      };
-    }
-
-    /** 删除行业：从列表移除，并将引用该 id 的 timeSlot 改为剩余行业第一项 */
-    function removeIndustry(schedule, indIdx) {
-      const industries = schedule.industries || [];
-      const removed = industries[indIdx];
-      if (!removed) return;
-      const oldId = removed.id;
-      industries.splice(indIdx, 1);
-      const firstId = industries.length ? industries[0].id : '';
-      (schedule.timeSlots || []).forEach(slot => {
-        if (slot.industryId === oldId) slot.industryId = firstId;
-      });
-      syncScheduleUI();
-    }
-
-    /** 当前编辑的行业在 schedule.industries 中的下标，-1 表示未打开 */
-    let editingIndustryIndex = -1;
-
-    function openEditModal(indIdx) {
-      if (!currentSchedule || indIdx < 0 || indIdx >= (currentSchedule.industries || []).length) return;
-      editingIndustryIndex = indIdx;
-      const ind = currentSchedule.industries[indIdx];
-      document.getElementById('industryModalTitle').textContent = ind.id ? ('编辑行业: ' + ind.id) : '新建行业';
-      document.getElementById('modalIndustryId').value = ind.id || '';
-      document.getElementById('modalNotionUrl').value = ind.notionUrl || '';
-      document.getElementById('modalNewChatEveryRunsMin').value = ind.newChatEveryRunsMin ?? 1;
-      document.getElementById('modalNewChatEveryRunsMax').value = ind.newChatEveryRunsMax ?? 1;
-      document.getElementById('modalModelSwitchIntervalMin').value = ind.modelSwitchIntervalMin ?? 0;
-      document.getElementById('modalModelSwitchIntervalMax').value = ind.modelSwitchIntervalMax ?? 0;
-      const modalChainRunsEl = document.getElementById('modalChainRunsPerSlot');
-      if (modalChainRunsEl) modalChainRunsEl.value = (ind.chainRunsPerSlot ?? 0);
-      const tasksContainer = document.getElementById('modalTasksContainer');
-      tasksContainer.innerHTML = '';
-      function removeTaskRow(row) {
-        const rows = tasksContainer.querySelectorAll('.task-row');
-        const idx = Array.from(rows).indexOf(row);
-        if (idx >= 0 && ind.tasks) ind.tasks.splice(idx, 1);
-        row.remove();
-      }
-      function appendTaskRow(task) {
-        const tr = document.createElement('div');
-        tr.className = 'task-row';
-        tr.innerHTML = '<textarea data-key="content" placeholder="输入内容" rows="1">' + escapeHtml(task.content || '') + '</textarea>' +
-          '<input type="number" data-key="runCount" min="1" placeholder="次数" value="' + (task.runCount ?? 1) + '" style="width:4rem">' +
-          '<button type="button" class="danger" data-remove-task>删</button>';
-        tr.querySelector('[data-remove-task]').onclick = () => removeTaskRow(tr);
-        tasksContainer.appendChild(tr);
-      }
-      (ind.tasks || []).forEach((task) => appendTaskRow(task));
-      document.getElementById('modalAddTask').onclick = () => {
-        if (!ind.tasks) ind.tasks = [];
-        ind.tasks.push({ content: '', runCount: 1 });
-        appendTaskRow({ content: '', runCount: 1 });
-      };
-      document.getElementById('industryModal').classList.add('visible');
-    }
-
-    function closeEditModal() {
-      editingIndustryIndex = -1;
-      document.getElementById('industryModal').classList.remove('visible');
-    }
-
-    function saveEditModal() {
-      if (!currentSchedule || editingIndustryIndex < 0) { closeEditModal(); return; }
-      const ind = currentSchedule.industries[editingIndustryIndex];
-      const oldId = (ind && ind.id) || '';
-      const newId = document.getElementById('modalIndustryId').value.trim() || 'unnamed';
-      ind.id = newId;
-      const notionUrl = document.getElementById('modalNotionUrl').value.trim() || '';
-      const newChatEveryRunsMin = Number(document.getElementById('modalNewChatEveryRunsMin').value);
-      const newChatEveryRunsMax = Number(document.getElementById('modalNewChatEveryRunsMax').value);
-      const modelSwitchIntervalMin = Number(document.getElementById('modalModelSwitchIntervalMin').value);
-      const modelSwitchIntervalMax = Number(document.getElementById('modalModelSwitchIntervalMax').value);
-      const chainRunsPerSlotVal = Number(document.getElementById('modalChainRunsPerSlot')?.value ?? 0);
-      const tasks = [];
-      document.querySelectorAll('#modalTasksContainer .task-row').forEach(tr => {
-        const content = (tr.querySelector('[data-key="content"]') && tr.querySelector('[data-key="content"]').value) || '';
-        const runCount = Number(tr.querySelector('[data-key="runCount"]') && tr.querySelector('[data-key="runCount"]').value) || 1;
-        tasks.push({ content, runCount });
-      });
-      ind.notionUrl = notionUrl;
-      const nMin = Number.isInteger(newChatEveryRunsMin) && newChatEveryRunsMin >= 0 ? newChatEveryRunsMin : 1;
-      const nMax = Number.isInteger(newChatEveryRunsMax) && newChatEveryRunsMax >= 0 ? newChatEveryRunsMax : 1;
-      ind.newChatEveryRunsMin = Math.min(nMin, nMax);
-      ind.newChatEveryRunsMax = Math.max(nMin, nMax);
-      const mMin = Number.isInteger(modelSwitchIntervalMin) && modelSwitchIntervalMin >= 0 ? modelSwitchIntervalMin : 0;
-      const mMax = Number.isInteger(modelSwitchIntervalMax) && modelSwitchIntervalMax >= 0 ? modelSwitchIntervalMax : 0;
-      ind.modelSwitchIntervalMin = Math.min(mMin, mMax);
-      ind.modelSwitchIntervalMax = Math.max(mMin, mMax);
-      const cr = Number.isInteger(chainRunsPerSlotVal) && chainRunsPerSlotVal >= 0 ? chainRunsPerSlotVal : 0;
-      ind.chainRunsPerSlot = cr;
-      ind.tasks = tasks;
-      if (oldId !== newId) {
-        (currentSchedule.timeSlots || []).forEach(slot => {
-          if (slot.industryId === oldId) slot.industryId = newId;
+        await api('/api/schedule', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(collectSchedule()),
         });
+        showMsg('已保存', false);
+        setTimeout(() => showMsg(''), 2000);
+      } catch (error) {
+        showMsg(error instanceof Error ? error.message : String(error), true);
       }
-      closeEditModal();
-      syncScheduleUI();
-    }
-
-    document.getElementById('modalSave').onclick = saveEditModal;
-    document.getElementById('modalCancel').onclick = closeEditModal;
-    /* 弹窗仅通过「保存」或「取消」关闭，点击遮罩不关闭 */
-
-    function fillGlobal(schedule) {
-      document.getElementById('intervalSecondsMin').value = schedule.intervalMinMs != null ? Math.round(schedule.intervalMinMs / 1000) : 120;
-      document.getElementById('intervalSecondsMax').value = schedule.intervalMaxMs != null ? Math.round(schedule.intervalMaxMs / 1000) : 120;
-      document.getElementById('loginWaitSeconds').value = schedule.loginWaitMs != null ? Math.round(schedule.loginWaitMs / 1000) : 60;
-      document.getElementById('maxRetries').value = schedule.maxRetries ?? 3;
-      const qt = schedule.queueThrottle || {};
-      document.getElementById('queueThrottleMaxPerDay').value = qt.maxPerDay != null ? qt.maxPerDay : 50;
-      const names = schedule.autoClickDuringOutputWait || [];
-      autoClickButtonsContainer.innerHTML = '';
-      names.forEach(function (name) {
-        appendAutoClickRow(name);
-      });
-    }
-    /** 在「自动点击按钮」列表末尾追加一行；value 为输入框初始值 */
-    function appendAutoClickRow(value) {
-      const row = document.createElement('div');
-      row.className = 'row auto-click-row';
-      row.innerHTML = '<input type="text" data-key="name" placeholder="例如 Delete pages" value="' + escapeAttr(value || '') + '" style="flex:1; max-width:20rem">' +
-        '<button type="button" class="danger" data-remove-auto-click>删除</button>';
-      row.querySelector('[data-remove-auto-click]').onclick = function () { row.remove(); };
-      autoClickButtonsContainer.appendChild(row);
-    }
-
-    /** 从 DOM 收集时间区间，行业数据以内存 currentSchedule.industries 为准 */
-    function collectSchedule() {
-      const secMin = Number(document.getElementById('intervalSecondsMin').value) || 120;
-      const secMax = Number(document.getElementById('intervalSecondsMax').value) || 120;
-      const intervalMinMs = Math.min(secMin, secMax) * 1000;
-      const intervalMaxMs = Math.max(secMin, secMax) * 1000;
-      const loginWaitMs = (Number(document.getElementById('loginWaitSeconds').value) || 60) * 1000;
-      const maxRetries = Number(document.getElementById('maxRetries').value) || 3;
-      const throttlePerDay = Number(document.getElementById('queueThrottleMaxPerDay').value);
-      const queueThrottle = {
-        maxPerDay: Number.isInteger(throttlePerDay) && throttlePerDay >= 1 ? throttlePerDay : 50
-      };
-      const slots = [];
-      timeSlotsContainer.querySelectorAll('.slot-row').forEach(row => {
-        const startHour = (Number(row.querySelector('[data-key="startHour"]')?.value) | 0);
-        const startMinute = (Number(row.querySelector('[data-key="startMinute"]')?.value) | 0);
-        const endHour = (Number(row.querySelector('[data-key="endHour"]')?.value) | 0);
-        const endMinute = (Number(row.querySelector('[data-key="endMinute"]')?.value) | 0);
-        const sh = (startHour >= 0 && startHour <= 23) ? startHour : 0;
-        const sm = (startMinute >= 0 && startMinute <= 59) ? startMinute : 0;
-        const eh = (endHour >= 0 && endHour <= 23) ? endHour : 23;
-        const em = (endMinute >= 0 && endMinute <= 59) ? endMinute : 59;
-        const industryId = (row.querySelector('[data-key="industryId"]') && row.querySelector('[data-key="industryId"]').value) || '';
-        if (industryId === NEW_INDUSTRY_VALUE) return;
-        slots.push({ startHour: sh, startMinute: sm, endHour: eh, endMinute: em, industryId });
-      });
-      const industries = (currentSchedule && currentSchedule.industries) ? currentSchedule.industries : [];
-      const autoClickDuringOutputWait = [];
-      autoClickButtonsContainer.querySelectorAll('.auto-click-row').forEach(function (row) {
-        const input = row.querySelector('[data-key="name"]');
-        const val = (input && input.value && input.value.trim()) || '';
-        if (val) autoClickDuringOutputWait.push(val);
-      });
-      return { intervalMinMs, intervalMaxMs, loginWaitMs, maxRetries, storagePath: '.notion-auth.json', timeSlots: slots, industries, autoClickDuringOutputWait, queueThrottle };
-    }
-
-    document.getElementById('btnAddAutoClickButton').onclick = function () { appendAutoClickRow(''); };
-
-    async function loadSchedule() {
-      const s = await api('/api/schedule');
-      currentSchedule = s;
-      fillGlobal(s);
-      renderTimeSlots(s);
-      renderIndustries(s);
-    }
+    };
 
     document.getElementById('btnStart').onclick = async () => {
       showMsg('');
       try {
-        const schedule = collectSchedule();
-        await api('/api/schedule', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(schedule) });
+        await api('/api/schedule', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(collectSchedule()),
+        });
         await api('/api/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
         await refreshStatus();
-        await refreshQueueSenderStatus();
-        await refreshInboundListenerStatus();
+        await refreshWarmupStatus();
         await refreshLogs();
-      } catch (e) { showMsg(e instanceof Error ? e.message : String(e), true); }
+      } catch (error) {
+        showMsg(error instanceof Error ? error.message : String(error), true);
+      }
     };
+
     document.getElementById('btnStop').onclick = async () => {
       showMsg('');
       try {
         await api('/api/stop', { method: 'POST' });
         await refreshStatus();
-        await refreshQueueSenderStatus();
-        await refreshInboundListenerStatus();
+        await refreshWarmupStatus();
         await refreshLogs();
-      } catch (e) { showMsg(e instanceof Error ? e.message : String(e), true); }
+      } catch (error) {
+        showMsg(error instanceof Error ? error.message : String(error), true);
+      }
     };
-    document.getElementById('btnInboundListenerRestart').onclick = async () => {
+
+    document.getElementById('btnSaveWarmupConfig').onclick = async () => {
       showMsg('');
       try {
-        await api('/api/inbound-listener/restart', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
-        await refreshInboundListenerStatus();
-        await refreshLogs();
-        showMsg('Inbound Listener 已重启', false);
-        setTimeout(function () { showMsg(''); }, 2000);
-      } catch (e) { showMsg(e instanceof Error ? e.message : String(e), true); }
-    };
-    document.getElementById('btnSave').onclick = async () => {
-      showMsg('');
-      try {
-        const schedule = collectSchedule();
-        await api('/api/schedule', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(schedule) });
-        showMsg('已保存', false);
+        await api('/api/queue-sender/config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(currentWarmupConfig),
+        });
+        showMsg('Warmup Executor 配置已保存', false);
         setTimeout(() => showMsg(''), 2000);
-      } catch (e) { showMsg(e instanceof Error ? e.message : String(e), true); }
+      } catch (error) {
+        showMsg(error instanceof Error ? error.message : String(error), true);
+      }
     };
 
     document.getElementById('btnPullRestart').onclick = async () => {
-      const btn = document.getElementById('btnPullRestart');
+      const button = document.getElementById('btnPullRestart');
       showMsg('');
-      btn.disabled = true;
+      button.disabled = true;
       try {
-        const res = await fetch('/api/pull-and-restart', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
-        const data = await res.json();
+        const response = await fetch('/api/pull-and-restart', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: '{}',
+        });
+        const data = await response.json();
         if (data.ok === true) {
           showMsg('即将重启，请稍后刷新', false);
         } else {
-          const parts = [data.error || res.statusText];
+          const parts = [data.error || response.statusText];
           if (data.stdout && data.stdout.trim()) parts.push('stdout: ' + data.stdout.trim());
           if (data.stderr && data.stderr.trim()) parts.push('stderr: ' + data.stderr.trim());
           showMsg(parts.join('\\n'), true);
         }
-      } catch (e) {
-        showMsg(e instanceof Error ? e.message : String(e), true);
+      } catch (error) {
+        showMsg(error instanceof Error ? error.message : String(error), true);
       } finally {
-        btn.disabled = false;
+        button.disabled = false;
       }
     };
 
-    let runs = [];
-    function renderLogTabs() {
-      logTabs.innerHTML = '';
-      runs.forEach((r, i) => {
-        const label = r.endTime ? '#' + r.id + ' ' + new Date(r.startTime).toLocaleTimeString() : '#' + r.id + ' 运行中';
-        const btn = document.createElement('button');
-        btn.textContent = label;
-        btn.onclick = () => { logContent.textContent = (r.lines || []).join('\\n') || '（无输出）'; logTabs.querySelectorAll('button').forEach(b => b.classList.remove('active')); btn.classList.add('active'); };
-        logTabs.appendChild(btn);
-        if (i === 0) { btn.click(); btn.classList.add('active'); }
-      });
-      if (runs.length === 0) logContent.textContent = '（暂无运行记录）';
-    }
-    async function refreshLogs() {
-      try {
-        const { runs: list } = await api('/api/logs?kind=playwright');
-        runs = list || [];
-        renderLogTabs();
-      } catch (_) {}
-    }
-
-    let queueSenderRuns = [];
-    const queueSenderLogTabsEl = document.getElementById('queueSenderLogTabs');
-    const queueSenderLogContentEl = document.getElementById('queueSenderLogContent');
-    function renderQueueSenderLogTabs() {
-      if (!queueSenderLogTabsEl || !queueSenderLogContentEl) return;
-      queueSenderLogTabsEl.innerHTML = '';
-      queueSenderRuns.forEach((r, i) => {
-        const label = r.endTime ? '#' + r.id + ' ' + new Date(r.startTime).toLocaleTimeString() : '#' + r.id + ' 运行中';
-        const btn = document.createElement('button');
-        btn.textContent = label;
-        btn.onclick = () => {
-          queueSenderLogContentEl.textContent = (r.lines || []).join('\\n') || '（无输出）';
-          queueSenderLogTabsEl.querySelectorAll('button').forEach(b => b.classList.remove('active'));
-          btn.classList.add('active');
-        };
-        queueSenderLogTabsEl.appendChild(btn);
-        if (i === 0) { btn.click(); btn.classList.add('active'); }
-      });
-      if (queueSenderRuns.length === 0) queueSenderLogContentEl.textContent = '（暂无运行记录）';
-    }
-    async function refreshQueueSenderLogs() {
-      try {
-        const { runs: list } = await api('/api/logs?kind=queue-sender');
-        queueSenderRuns = list || [];
-        renderQueueSenderLogTabs();
-      } catch (_) {}
-    }
-
-    let inboundRuns = [];
-    const inboundLogTabsEl = document.getElementById('inboundLogTabs');
-    const inboundLogContentEl = document.getElementById('inboundLogContent');
-    function renderInboundLogTabs() {
-      if (!inboundLogTabsEl || !inboundLogContentEl) return;
-      inboundLogTabsEl.innerHTML = '';
-      inboundRuns.forEach((r, i) => {
-        const label = r.endTime ? '#' + r.id + ' ' + new Date(r.startTime).toLocaleTimeString() : '#' + r.id + ' 运行中';
-        const btn = document.createElement('button');
-        btn.textContent = label;
-        btn.onclick = () => {
-          inboundLogContentEl.textContent = (r.lines || []).join('\\n') || '（无输出）';
-          inboundLogTabsEl.querySelectorAll('button').forEach(b => b.classList.remove('active'));
-          btn.classList.add('active');
-        };
-        inboundLogTabsEl.appendChild(btn);
-        if (i === 0) { btn.click(); btn.classList.add('active'); }
-      });
-      if (inboundRuns.length === 0) inboundLogContentEl.textContent = '（暂无运行记录）';
-    }
-    async function refreshInboundLogs() {
-      try {
-        const { runs: list } = await api('/api/logs?kind=inbound-listener');
-        inboundRuns = list || [];
-        renderInboundLogTabs();
-      } catch (_) {}
-    }
-
     (async () => {
       try {
-        await loadSchedule();
-        await loadInboundListenerConfig();
-        await loadReplyTasksConfig();
-        await loadQueueSenderConfig();
+        await loadScheduleState();
+        await loadWarmupConfig();
         await refreshStatus();
-        await refreshQueueSenderStatus();
-        await refreshInboundListenerStatus();
-        await refreshReplyTasksAutoSendStatus();
-        await refreshReplyTasksAutoSendLogs();
+        await refreshWarmupStatus();
         await refreshLogs();
-        await refreshQueueSenderLogs();
-        await refreshInboundLogs();
         setInterval(refreshStatus, 3000);
-        setInterval(refreshQueueSenderStatus, 3000);
-        setInterval(refreshInboundListenerStatus, 3000);
-        setInterval(refreshReplyTasksAutoSendStatus, 3000);
-        setInterval(refreshReplyTasksAutoSendLogs, 5000);
+        setInterval(refreshWarmupStatus, 3000);
         setInterval(refreshLogs, 5000);
-        setInterval(refreshQueueSenderLogs, 5000);
-        setInterval(refreshInboundLogs, 5000);
-      } catch (e) {
-        var errMsg = e instanceof Error ? e.message : String(e);
-        if (msgEl) msgEl.textContent = '初始化失败: ' + errMsg + ' — 若持续出现，请用无痕模式或禁用本页的浏览器扩展后刷新';
-        if (msgEl) msgEl.style.color = '#dc3545';
+      } catch (error) {
+        showMsg('初始化失败: ' + (error instanceof Error ? error.message : String(error)), true);
       }
     })();
   </script>
@@ -1732,47 +963,39 @@ function getDashboardHtml(): string {
 
 const server = createServer(handleRequest);
 
-/** 方案 B：若为拉取并重启拉起的新进程，先延迟 2 秒再 listen，确保旧进程已 exit 释放端口 */
 async function startListening(): Promise<void> {
   if (process.env.NOTION_AUTO_RESTART === "1") {
-    await new Promise<void>((r) => setTimeout(r, 2000));
+    await new Promise((resolveWait) => setTimeout(resolveWait, 2000));
   }
   server.listen(PORT, HOST, () => {
     logger.info(`Dashboard: http://${HOST}:${PORT}`);
-    if (inboundListenerRunner.getInboundListenerStatus() !== "running") {
-      inboundListenerRunner.startInboundListener(resolveInboundListenerConfigPath(undefined));
-    }
-    setInterval(() => {
-      if (inboundListenerRunner.getInboundListenerStatus() === "idle") {
-        inboundListenerRunner.startInboundListener(resolveInboundListenerConfigPath(undefined));
-      }
-    }, 60_000);
     if (queueSenderRunner.getQueueSenderStatus() !== "running") {
       loadSchedule(getSchedulePath())
-        .then((s) => {
-          const qt = s.queueThrottle ?? getDefaultSchedule().queueThrottle!;
+        .then((schedule) => {
+          const qt = schedule.queueThrottle ?? getDefaultSchedule().queueThrottle!;
           const prev = process.env.QUEUE_THROTTLE_MAX_PER_DAY;
           process.env.QUEUE_THROTTLE_MAX_PER_DAY = String(qt.maxPerDay ?? 50);
           queueSenderRunner.startQueueSender();
           if (prev !== undefined) process.env.QUEUE_THROTTLE_MAX_PER_DAY = prev;
           else delete process.env.QUEUE_THROTTLE_MAX_PER_DAY;
         })
-        .catch((err) => logger.warn("Queue Sender 启动时加载 schedule 失败", err));
+        .catch((error) => logger.warn("Warmup Executor 启动时加载 schedule 失败", error));
     }
     setInterval(() => {
       if (queueSenderRunner.getQueueSenderStatus() === "idle") {
         loadSchedule(getSchedulePath())
-          .then((s) => {
-            const qt = s.queueThrottle ?? getDefaultSchedule().queueThrottle!;
+          .then((schedule) => {
+            const qt = schedule.queueThrottle ?? getDefaultSchedule().queueThrottle!;
             const prev = process.env.QUEUE_THROTTLE_MAX_PER_DAY;
             process.env.QUEUE_THROTTLE_MAX_PER_DAY = String(qt.maxPerDay ?? 50);
             queueSenderRunner.startQueueSender();
             if (prev !== undefined) process.env.QUEUE_THROTTLE_MAX_PER_DAY = prev;
             else delete process.env.QUEUE_THROTTLE_MAX_PER_DAY;
           })
-          .catch((err) => logger.warn("Queue Sender watcher 加载 schedule 失败", err));
+          .catch((error) => logger.warn("Warmup Executor watcher 加载 schedule 失败", error));
       }
     }, 60_000);
   });
 }
+
 startListening();
