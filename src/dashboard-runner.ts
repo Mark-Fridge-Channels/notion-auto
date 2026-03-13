@@ -67,14 +67,19 @@ function escapeArgForWindowsCmd(arg: string): string {
   return '"' + arg.replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
 }
 
+const STOP_GRACE_MS = 3000;
+
 function spawnChild(configPath: string, isAutoResume: boolean): void {
   const args = ["--config", configPath, "--storage", ".notion-auth.json"];
   const env = { ...process.env };
   if (isAutoResume) env.NOTION_AUTO_RESUME = "1";
 
+  // Windows 需 pipe stdin，以便 stop() 发 "stop" 让子进程先关浏览器再退出
+  const stdio: ["pipe" | "ignore", "pipe", "pipe"] =
+    process.platform === "win32" ? ["pipe", "pipe", "pipe"] : ["ignore", "pipe", "pipe"];
   const opts: Parameters<typeof spawn>[2] = {
     cwd: process.cwd(),
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio,
     env,
   };
 
@@ -149,14 +154,37 @@ async function maybeAutoRestart(exitCode?: number): Promise<void> {
 
 /**
  * 停止当前脚本子进程（若有）；并标记用户不再希望运行，exit 时不再自动重启。
+ * Windows：先向 stdin 发 "stop" 让子进程关浏览器再退出，超时未退则 taskkill 杀进程树（方案 2+3）。
  */
 export function stop(): void {
   userWantsRunning = false;
   if (currentProcess == null) return;
-  // Windows 下 SIGTERM 可能无法触发子进程 handler，改用 SIGINT 让子进程有机会先关浏览器
-  const signal = process.platform === "win32" ? "SIGINT" : "SIGTERM";
-  currentProcess.kill(signal);
-  currentProcess = null;
+
+  if (process.platform === "win32") {
+    const child = currentProcess;
+    const pid = child.pid;
+    if (pid != null && child.stdin) {
+      child.stdin.write("stop\n");
+      child.stdin.end();
+      const timeout = setTimeout(() => {
+        if (currentProcess !== null && currentProcess.pid === pid) {
+          logger.warn("子进程未在限定时间内退出，使用 taskkill 结束进程树");
+          spawn("taskkill", ["/pid", String(pid), "/f", "/t"], {
+            shell: true,
+            stdio: "ignore",
+            windowsHide: true,
+          });
+        }
+      }, STOP_GRACE_MS);
+      child.once("exit", () => clearTimeout(timeout));
+    } else {
+      child.kill("SIGINT");
+      currentProcess = null;
+    }
+  } else {
+    currentProcess.kill("SIGTERM");
+    currentProcess = null;
+  }
 }
 
 export function getRunStatus(): RunStatus {

@@ -76,6 +76,20 @@ function handleStopSignal(exitCode: number): void {
 process.on("SIGTERM", () => handleStopSignal(143));
 process.on("SIGINT", () => handleStopSignal(130));
 
+/** Windows 上 Dashboard 通过 stdin 发 "stop" 让子进程先关浏览器再退出（方案 2） */
+if (process.stdin && !process.stdin.isTTY && typeof process.stdin.on === "function") {
+  process.stdin.setEncoding("utf8");
+  process.stdin.on("data", (data: string | Buffer) => {
+    const lines = String(data).split(/\r?\n/);
+    for (const line of lines) {
+      if (line.trim().toLowerCase() === "stop") {
+        handleStopSignal(130);
+        return;
+      }
+    }
+  });
+}
+
 /** 闭区间 [min, max] 内随机整数（含两端），用于间隔与 N/M 区间 */
 function randomIntInclusive(min: number, max: number): number {
   const lo = Math.min(min, max);
