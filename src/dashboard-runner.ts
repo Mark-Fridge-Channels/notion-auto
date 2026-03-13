@@ -153,7 +153,9 @@ async function maybeAutoRestart(exitCode?: number): Promise<void> {
 export function stop(): void {
   userWantsRunning = false;
   if (currentProcess == null) return;
-  currentProcess.kill("SIGTERM");
+  // Windows 下 SIGTERM 可能无法触发子进程 handler，改用 SIGINT 让子进程有机会先关浏览器
+  const signal = process.platform === "win32" ? "SIGINT" : "SIGTERM";
+  currentProcess.kill(signal);
   currentProcess = null;
 }
 

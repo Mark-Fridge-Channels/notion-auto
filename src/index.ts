@@ -57,20 +57,24 @@ async function closeBrowserAndExit(code: number): Promise<never> {
   process.exit(code);
 }
 
-/** Dashboard 点击停止时发送 SIGTERM；关闭浏览器后再退出，避免残留进程 */
-process.on("SIGTERM", () => {
+/** 关闭浏览器后退出，供 SIGTERM/SIGINT 共用；exitCode: 143=SIGTERM, 130=SIGINT */
+function handleStopSignal(exitCode: number): void {
   if (currentBrowser) {
     currentBrowser
       .close()
-      .then(() => process.exit(143))
+      .then(() => process.exit(exitCode))
       .catch((e) => {
         logger.warn("关闭浏览器失败", e);
-        process.exit(143);
+        process.exit(exitCode);
       });
   } else {
-    process.exit(143);
+    process.exit(exitCode);
   }
-});
+}
+
+/** Dashboard 点击停止时发送 SIGTERM（Unix）或 SIGINT（Windows）；关闭浏览器后再退出 */
+process.on("SIGTERM", () => handleStopSignal(143));
+process.on("SIGINT", () => handleStopSignal(130));
 
 /** 闭区间 [min, max] 内随机整数（含两端），用于间隔与 N/M 区间 */
 function randomIntInclusive(min: number, max: number): number {
