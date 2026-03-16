@@ -28,6 +28,12 @@ import { switchToNextModel } from "./model-picker.js";
 import { logger } from "./logger.js";
 import { saveProgress } from "./progress.js";
 import { EXIT_RECOVERY_RESTART } from "./exit-codes.js";
+import {
+  fetchOneQueuedTask,
+  markTaskDone,
+  markTaskFailed,
+  isQueueAvailable,
+} from "./notion-queue.js";
 import type { ScheduleIndustry } from "./schedule.js";
 import type { Browser } from "playwright";
 
@@ -200,6 +206,72 @@ async function main(): Promise<void> {
         // 再次落入同一行业（如次日同一时段），视为新区段，重置本时段已跑轮数
         chainRunsInSlot = 0;
         leftCurrentSlot = false;
+      }
+
+      // Notion 队列模式：到点只跑完当前任务即停，不再取新任务
+      if (
+        currentIndustry.taskSource === "notionQueue" &&
+        isQueueAvailable(schedule.notionQueue)
+      ) {
+        const queueConfig = schedule.notionQueue!;
+        for (;;) {
+          const industryNow = getIndustryForNow(schedule);
+          if (industryNow == null || industryNow.id !== currentIndustry.id) {
+            logger.info("队列模式：已离开当前时段，停止取新任务");
+            break;
+          }
+          const task = await fetchOneQueuedTask(queueConfig);
+          if (!task) {
+            logger.info("队列暂无待执行任务，60 秒后重试…");
+            await sleep(60_000);
+            continue;
+          }
+          logger.info(`队列任务: ${task.actionName.slice(0, 40)}… → ${task.fileUrl.slice(0, 50)}…`);
+          try {
+            await page.goto(task.fileUrl, { waitUntil: "domcontentloaded" });
+            await sleep(500);
+            const img = page.locator(AI_FACE_IMG).first();
+            await img.waitFor({ state: "visible" });
+            await img.locator("xpath=..").click();
+            await sleep(MODAL_WAIT_MS);
+            await dismissPersonalizeDialogIfPresent(page);
+          } catch (e) {
+            logger.warn("打开队列任务页面失败", e);
+            try {
+              await markTaskFailed(queueConfig, task.pageId);
+            } catch (err) {
+              logger.warn("标记任务失败状态时出错", err);
+            }
+            const intervalMs = randomIntInclusive(schedule.intervalMinMs, schedule.intervalMaxMs);
+            await sleep(intervalMs);
+            continue;
+          }
+          const prompt = "@" + (task.actionName || "").trim();
+          const ok = await tryTypeAndSend(
+            page,
+            prompt,
+            schedule.maxRetries,
+            schedule.autoClickDuringOutputWait ?? [],
+          );
+          try {
+            if (ok) {
+              await markTaskDone(queueConfig, task.pageId);
+            } else {
+              await markTaskFailed(queueConfig, task.pageId);
+            }
+          } catch (err) {
+            logger.warn("更新队列任务状态时出错", err);
+          }
+          const intervalMs = randomIntInclusive(schedule.intervalMinMs, schedule.intervalMaxMs);
+          logger.info(`等待 ${intervalMs / 1000} 秒后取下一条…`);
+          await sleep(intervalMs);
+          const afterNow = getIndustryForNow(schedule);
+          if (afterNow == null || afterNow.id !== currentIndustry.id) {
+            logger.info("队列模式：本任务完成后已离开当前时段，停止取新任务");
+            break;
+          }
+        }
+        continue;
       }
 
       // 执行一轮任务链

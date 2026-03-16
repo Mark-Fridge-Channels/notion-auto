@@ -24,11 +24,20 @@ npx playwright install chromium
 运行前需在项目目录下准备 **schedule.json**（或通过 `--config <path>` 指定）。结构示例见 **schedule.example.json**：
 
 - **timeSlots**：时间区间列表，左闭右开、本地时区；每项含 `startHour`、`startMinute`、`endHour`、`endMinute`（小时 0–23，分钟 0–59）、`industryId`（绑定行业）。止 23:59 表示到当日结束；缺省分钟视为 0。
-- **industries**：行业列表，每项含 `id`、`notionUrl`、`newChatEveryRunsMin`/`newChatEveryRunsMax`（每 N 次新会话的区间，开新会话时随机取 N；0=本会话不主动新建）、`modelSwitchIntervalMin`/`modelSwitchIntervalMax`（每 M 次换模型的区间，0=不换）、`tasks`（任务链）。
+- **industries**：行业列表，每项含 `id`、`notionUrl`、`newChatEveryRunsMin`/`newChatEveryRunsMax`（每 N 次新会话的区间，开新会话时随机取 N；0=本会话不主动新建）、`modelSwitchIntervalMin`/`modelSwitchIntervalMax`（每 M 次换模型的区间，0=不换）、`taskSource`（可选，`"schedule"` 或 `"notionQueue"`，默认任务链）、`tasks`（任务链；当 `taskSource` 为 `notionQueue` 时可为空）。
 - **tasks**：每任务 `content`（输入文案）、`runCount`（本轮执行次数）。
-- 顶层：`intervalMinMs`/`intervalMaxMs`（每次发送完成后等待的毫秒数区间，每次随机取）、`loginWaitMs`、`maxRetries`、`storagePath`。
+- 顶层：`intervalMinMs`/`intervalMaxMs`（每次发送完成后等待的毫秒数区间，每次随机取）、`loginWaitMs`、`maxRetries`、`storagePath`、**notionQueue**（可选，见下）。
 
 未配置的时间段不跑（脚本会等待直至落入某区间）。时间区间列表为空会报错退出。
+
+## Notion 任务队列（可选）
+
+当某行业的 **taskSource** 设为 `"notionQueue"` 时，该时段内不再使用手动编辑的任务链，而是从 **Notion 数据库** 中拉取待执行任务（Status = 待执行状态），用 Playwright 打开每条任务的 **File URL** 页面并输入 **"@" + Action Name** 执行，执行完成后按配置更新状态或删除记录。
+
+- **环境变量**：需在 `.env` 或环境中配置 **NOTION_API_KEY**（Notion Integration Token）。未配置则仅运行任务链模式。
+- **配置**：在 Dashboard 的「Notion 任务队列」区块中填写：数据库 URL、列名（Action Name / File URL / Status）、待执行状态值（默认 `Queued`）、完成后状态值（默认 `Done`）、失败后状态值（默认 `Failed`）、成功后「更新状态」或「删除记录」。
+- **数据库**：Notion 数据库需包含至少三列（类型与列名与配置一致）：Action Name（Text）、File URL（URL）、Status（Select，如 Queued/Done/Failed）。数据库需分享给该 Integration。
+- **到点停止**：使用 Notion 队列时，**时间一到（离开当前时间区间）只跑完当前正在执行的那条任务即停**，不再从队列取新任务；与手动任务链「跑满 N 轮再等离开时段」不同。
 
 ## 运行命令
 
@@ -59,7 +68,7 @@ npm run run -- --help
 运行 `npm run dashboard` 启动本地 Web 服务（**http://127.0.0.1:9000**，仅本机访问）。在浏览器打开后可：
 
 - 查看运行状态（运行中 / 已停止）
-- 编辑**全局设置**（每轮间隔、登录等待、重试）、**时间区间**（起止小时、绑定行业）、**行业与任务链**（URL、N/M、任务输入内容与执行次数），保存到 **schedule.json**
+- 编辑**全局设置**（每轮间隔、登录等待、重试）、**Notion 任务队列**（可选：数据库 URL、列名、状态值）、**时间区间**（起止小时、绑定行业）、**行业与任务链**（URL、任务来源「任务链」或「Notion 队列」、N/M、任务输入内容与执行次数），保存到 **schedule.json**
 - 点击「启动」或「停止」控制脚本子进程（启动前会先保存当前配置）
 - 查看最近 10 次运行的日志（仅内存，不落盘）
 

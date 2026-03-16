@@ -14,6 +14,26 @@ export interface ScheduleTask {
   runCount: number;
 }
 
+/** Notion 任务队列全局配置：数据库 URL、列名映射、状态值、成功后行为 */
+export interface NotionQueueConfig {
+  /** Notion 数据库页面 URL（用于解析 database_id） */
+  databaseUrl: string;
+  /** 列名：Action Name（Text，执行时输入 "@" + 该值） */
+  columnActionName: string;
+  /** 列名：File URL（URL，Playwright 打开的页面） */
+  columnFileUrl: string;
+  /** 列名：Status（Select：Queued/Done/Failed） */
+  columnStatus: string;
+  /** 待执行状态值，默认 Queued */
+  statusQueued: string;
+  /** 成功完成后状态值，默认 Done */
+  statusDone: string;
+  /** 执行失败后状态值，默认 Failed */
+  statusFailed: string;
+  /** 成功后：更新为 statusDone，或删除该记录 */
+  onSuccess: "update" | "delete";
+}
+
 /** 行业：Notion Portal URL + 任务链 + 行业级每 N 次新会话、每 M 次换模型（区间，开新会话时随机） */
 export interface ScheduleIndustry {
   /** 行业唯一标识，时间区间通过此 id 引用行业 */
@@ -28,7 +48,9 @@ export interface ScheduleIndustry {
   modelSwitchIntervalMax: number;
   /** 本时段内跑几轮完整任务链：0 = 一直跑，1 = 跑 1 轮后等待到下一时段，2 = 跑 2 轮后等待，以此类推 */
   chainRunsPerSlot: number;
-  /** 任务链，按顺序执行 */
+  /** 任务来源：schedule = 使用下方任务链，notionQueue = 使用全局 Notion 任务队列 */
+  taskSource?: "schedule" | "notionQueue";
+  /** 任务链，按顺序执行；taskSource 为 notionQueue 时可为空 */
   tasks: ScheduleTask[];
 }
 
@@ -65,6 +87,8 @@ export interface Schedule {
   industries: ScheduleIndustry[];
   /** 等待 AI 输出结束期间若出现这些按钮（role=button，name 精确匹配）则自动点击；仅填按钮名称 */
   autoClickDuringOutputWait?: string[];
+  /** Notion 任务队列全局配置；使用队列的行业共用此配置 */
+  notionQueue?: NotionQueueConfig;
 }
 
 const DEFAULT_STORAGE_PATH = ".notion-auth.json";
@@ -105,6 +129,24 @@ function validateTask(t: unknown, index: number): asserts t is ScheduleTask {
   if (!Number.isInteger(rc) || rc < 1) throw new Error(`任务[${index}].runCount 必须为正整数`);
 }
 
+function validateNotionQueue(q: unknown): void {
+  if (q == null || typeof q !== "object") return;
+  const o = q as Record<string, unknown>;
+  if (typeof o.databaseUrl !== "string" || !o.databaseUrl.trim())
+    throw new Error("notionQueue.databaseUrl 必须为非空字符串");
+  if (typeof o.columnActionName !== "string" || !o.columnActionName.trim())
+    throw new Error("notionQueue.columnActionName 必须为非空字符串");
+  if (typeof o.columnFileUrl !== "string" || !o.columnFileUrl.trim())
+    throw new Error("notionQueue.columnFileUrl 必须为非空字符串");
+  if (typeof o.columnStatus !== "string" || !o.columnStatus.trim())
+    throw new Error("notionQueue.columnStatus 必须为非空字符串");
+  if (typeof o.statusQueued !== "string") throw new Error("notionQueue.statusQueued 必须为字符串");
+  if (typeof o.statusDone !== "string") throw new Error("notionQueue.statusDone 必须为字符串");
+  if (typeof o.statusFailed !== "string") throw new Error("notionQueue.statusFailed 必须为字符串");
+  if (o.onSuccess !== "update" && o.onSuccess !== "delete")
+    throw new Error("notionQueue.onSuccess 必须为 update 或 delete");
+}
+
 function validateIndustry(ind: unknown, index: number): asserts ind is ScheduleIndustry {
   if (ind == null || typeof ind !== "object") throw new Error(`行业[${index}] 必须为对象`);
   const o = ind as Record<string, unknown>;
@@ -122,8 +164,9 @@ function validateIndustry(ind: unknown, index: number): asserts ind is ScheduleI
   if (mMin > mMax) throw new Error(`行业[${index}] modelSwitchIntervalMin 不能大于 modelSwitchIntervalMax`);
   const chainRuns = Number(o.chainRunsPerSlot);
   if (!Number.isInteger(chainRuns) || chainRuns < 0) throw new Error(`行业[${index}].chainRunsPerSlot 必须为非负整数`);
+  const taskSource = o.taskSource === "notionQueue" ? "notionQueue" : "schedule";
   if (!Array.isArray(o.tasks)) throw new Error(`行业[${index}].tasks 必须为数组`);
-  if (o.tasks.length === 0) throw new Error(`行业[${index}].tasks 不能为空`);
+  if (taskSource === "schedule" && o.tasks.length === 0) throw new Error(`行业[${index}].tasks 不能为空`);
   o.tasks.forEach((t, i) => validateTask(t, i));
 }
 
@@ -167,6 +210,7 @@ export function validateSchedule(s: Schedule): void {
         throw new Error(`autoClickDuringOutputWait[${i}] 必须为非空字符串`);
     });
   }
+  if (s.notionQueue !== undefined) validateNotionQueue(s.notionQueue);
 }
 
 const SCHEDULE_FILENAME = "schedule.json";
@@ -209,6 +253,7 @@ function normalizeIndustry(ind: unknown): ScheduleIndustry {
   const mMin = o.modelSwitchIntervalMin !== undefined ? Number(o.modelSwitchIntervalMin) : Number(o.modelSwitchInterval);
   const mMax = o.modelSwitchIntervalMax !== undefined ? Number(o.modelSwitchIntervalMax) : Number(o.modelSwitchInterval);
   const chainRuns = o.chainRunsPerSlot !== undefined ? Number(o.chainRunsPerSlot) : def.chainRunsPerSlot;
+  const taskSource = o.taskSource === "notionQueue" ? "notionQueue" : "schedule";
   return {
     id: typeof o.id === "string" ? o.id : def.id,
     notionUrl: typeof o.notionUrl === "string" ? o.notionUrl : def.notionUrl,
@@ -217,6 +262,7 @@ function normalizeIndustry(ind: unknown): ScheduleIndustry {
     modelSwitchIntervalMin: Number.isInteger(mMin) && mMin >= 0 ? mMin : def.modelSwitchIntervalMin,
     modelSwitchIntervalMax: Number.isInteger(mMax) && mMax >= 0 ? mMax : def.modelSwitchIntervalMax,
     chainRunsPerSlot: Number.isInteger(chainRuns) && chainRuns >= 0 ? chainRuns : def.chainRunsPerSlot,
+    taskSource,
     tasks: Array.isArray(o.tasks) ? (o.tasks as ScheduleTask[]) : def.tasks,
   };
 }
@@ -274,8 +320,23 @@ export function mergeSchedule(partial: unknown): Schedule {
     autoClickDuringOutputWait: Array.isArray(o.autoClickDuringOutputWait)
       ? (o.autoClickDuringOutputWait as unknown[]).filter((x): x is string => typeof x === "string" && x.trim() !== "")
       : undefined,
+    notionQueue: o.notionQueue != null && typeof o.notionQueue === "object" ? normalizeNotionQueue(o.notionQueue as Record<string, unknown>) : undefined,
   };
   return out;
+}
+
+/** 归一化 notionQueue 配置，补默认值 */
+function normalizeNotionQueue(o: Record<string, unknown>): NotionQueueConfig {
+  return {
+    databaseUrl: typeof o.databaseUrl === "string" ? o.databaseUrl.trim() : "",
+    columnActionName: typeof o.columnActionName === "string" ? o.columnActionName.trim() : "Action Name",
+    columnFileUrl: typeof o.columnFileUrl === "string" ? o.columnFileUrl.trim() : "File URL",
+    columnStatus: typeof o.columnStatus === "string" ? o.columnStatus.trim() : "Status",
+    statusQueued: typeof o.statusQueued === "string" ? o.statusQueued : "Queued",
+    statusDone: typeof o.statusDone === "string" ? o.statusDone : "Done",
+    statusFailed: typeof o.statusFailed === "string" ? o.statusFailed : "Failed",
+    onSuccess: o.onSuccess === "delete" ? "delete" : "update",
+  };
 }
 
 /** 写入 schedule 文件；写入前校验 */

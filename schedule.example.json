@@ -4,6 +4,16 @@
   "loginWaitMs": 60000,
   "maxRetries": 3,
   "storagePath": ".notion-auth.json",
+  "notionQueue": {
+    "databaseUrl": "https://www.notion.so/your-workspace/your-database-id",
+    "columnActionName": "Action Name",
+    "columnFileUrl": "File URL",
+    "columnStatus": "Status",
+    "statusQueued": "Queued",
+    "statusDone": "Done",
+    "statusFailed": "Failed",
+    "onSuccess": "update"
+  },
   "timeSlots": [
     {
       "startHour": 1,
@@ -72,6 +82,17 @@
         }
       ],
       "chainRunsPerSlot": 0
+    },
+    {
+      "id": "industryQueue",
+      "notionUrl": "https://www.notion.so/your-portal",
+      "newChatEveryRunsMin": 1,
+      "newChatEveryRunsMax": 1,
+      "modelSwitchIntervalMin": 0,
+      "modelSwitchIntervalMax": 0,
+      "chainRunsPerSlot": 0,
+      "taskSource": "notionQueue",
+      "tasks": []
     }
   ]
 }
