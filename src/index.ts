@@ -29,6 +29,66 @@ import { logger } from "./logger.js";
 import { saveProgress } from "./progress.js";
 import { EXIT_RECOVERY_RESTART } from "./exit-codes.js";
 import type { ScheduleIndustry } from "./schedule.js";
+import type { Browser } from "playwright";
+
+/** 当前已启动的浏览器实例，供退出前关闭及 SIGTERM/SIGINT/stdin 处理使用；launch 后赋值，close 后置空 */
+let currentBrowser: Browser | null = null;
+
+const BROWSER_CLOSE_TIMEOUT_MS = 10_000;
+
+/**
+ * 关闭当前浏览器后退出进程；用于 process.exit 会跳过 finally 的路径（恢复重启、信号）。
+ * 带超时避免 close 卡死导致进程无法退出。
+ */
+async function closeBrowserAndExit(code: number): Promise<never> {
+  if (currentBrowser) {
+    try {
+      await Promise.race([
+        currentBrowser.close(),
+        new Promise<never>((_, reject) => {
+          setTimeout(() => reject(new Error("browser.close 超时")), BROWSER_CLOSE_TIMEOUT_MS);
+        }),
+      ]);
+    } catch (e) {
+      logger.warn("关闭浏览器失败或超时", e);
+    }
+    currentBrowser = null;
+  }
+  process.exit(code);
+}
+
+/** 关闭浏览器后退出，供 SIGTERM/SIGINT 共用；exitCode: 143=SIGTERM, 130=SIGINT */
+function handleStopSignal(exitCode: number): void {
+  if (currentBrowser) {
+    currentBrowser
+      .close()
+      .then(() => process.exit(exitCode))
+      .catch((e) => {
+        logger.warn("关闭浏览器失败", e);
+        process.exit(exitCode);
+      });
+  } else {
+    process.exit(exitCode);
+  }
+}
+
+/** Dashboard 点击停止时发送 SIGTERM（Unix）或 SIGINT（Windows）；关闭浏览器后再退出 */
+process.on("SIGTERM", () => handleStopSignal(143));
+process.on("SIGINT", () => handleStopSignal(130));
+
+/** Windows 上 Dashboard 通过 stdin 发 "stop" 让子进程先关浏览器再退出（方案 2） */
+if (process.stdin && !process.stdin.isTTY && typeof process.stdin.on === "function") {
+  process.stdin.setEncoding("utf8");
+  process.stdin.on("data", (data: string | Buffer) => {
+    const lines = String(data).split(/\r?\n/);
+    for (const line of lines) {
+      if (line.trim().toLowerCase() === "stop") {
+        handleStopSignal(130);
+        return;
+      }
+    }
+  });
+}
 
 /** 闭区间 [min, max] 内随机整数（含两端），用于间隔与 N/M 区间 */
 function randomIntInclusive(min: number, max: number): number {
@@ -64,10 +124,10 @@ async function main(): Promise<void> {
   }
   logger.info(`当前行业: ${currentIndustry.id}, URL: ${currentIndustry.notionUrl}`);
 
-  const browser = await chromium.launch({ headless: false });
+  currentBrowser = await chromium.launch({ headless: false });
   const storagePath = schedule.storagePath;
   const contextOptions = existsSync(storagePath) ? { storageState: storagePath } : {};
-  const context = await browser.newContext(contextOptions);
+  const context = await currentBrowser.newContext(contextOptions);
   const page = await context.newPage();
   page.setDefaultTimeout(30_000);
 
@@ -179,7 +239,7 @@ async function main(): Promise<void> {
           if (!ok) {
             logger.warn("本轮流试与恢复后仍失败，请求恢复重启");
             await saveProgress({ totalDone: 0, conversationRuns: 0, completed: false });
-            process.exit(EXIT_RECOVERY_RESTART);
+            await closeBrowserAndExit(EXIT_RECOVERY_RESTART);
           }
 
           runCount++;
@@ -220,10 +280,13 @@ async function main(): Promise<void> {
     } catch (e) {
       logger.warn("保存登录态失败", e);
     }
-    try {
-      await browser.close();
-    } catch (e) {
-      logger.warn("关闭浏览器失败", e);
+    if (currentBrowser) {
+      try {
+        await currentBrowser.close();
+      } catch (e) {
+        logger.warn("关闭浏览器失败", e);
+      }
+      currentBrowser = null;
     }
   }
 }

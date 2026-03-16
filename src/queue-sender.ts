@@ -36,6 +36,7 @@ import {
   WARMUP_STATUS_SENT,
   type WarmupExecutionEventType,
 } from "./warmup-constants.js";
+import { healthCheck } from "./mail-automation-agent-client.js";
 import {
   createWarmupProviderExecutionContext,
   getWarmupActionDescriptor,
@@ -171,14 +172,17 @@ async function processOne(
   if (item.dependsOnTaskId.trim()) {
     const dependency = await lookupDependencyStatus(notion, entry.queue_database_url, item.dependsOnTaskId);
     if (!dependency.found) {
+      logger.info(`Warmup Queue 任务失败 task_id=${item.taskId} reason=missing_dependency`);
       await failItem(notion, item, executorRunId, "missing_dependency");
       return;
     }
     if (dependency.status === WARMUP_STATUS_CANCELLED) {
+      logger.info(`Warmup Queue 任务失败 task_id=${item.taskId} reason=blocked_by_cancelled_dependency`);
       await failItem(notion, item, executorRunId, "blocked_by_cancelled_dependency");
       return;
     }
     if (dependency.status === WARMUP_STATUS_FAILED) {
+      logger.info(`Warmup Queue 任务失败 task_id=${item.taskId} reason=blocked_by_failed_dependency`);
       await failItem(notion, item, executorRunId, "blocked_by_failed_dependency");
       return;
     }
@@ -194,35 +198,46 @@ async function processOne(
     item.actorMailboxId || item.account,
   );
   if (!credential) {
+    logger.info(`Warmup Queue 任务失败 task_id=${item.taskId} reason=credential_not_found actor=${item.actorMailboxId || item.account}`);
     await failItem(notion, item, executorRunId, "credential_not_found");
     return;
   }
   if (!isCredentialEligible(credential.executorEnabled, credential.credentialStatus)) {
+    logger.info(`Warmup Queue 任务失败 task_id=${item.taskId} reason=credential_not_eligible executor_enabled=${credential.executorEnabled} status=${credential.credentialStatus}`);
     await failItem(notion, item, executorRunId, "credential_not_eligible");
     return;
   }
 
   const actionDescriptor = getWarmupActionDescriptor(item.plannedEventType);
   if (actionDescriptor.requiresSubject && !item.subject.trim()) {
+    logger.info(`Warmup Queue 任务失败 task_id=${item.taskId} reason=missing_subject`);
     await failItem(notion, item, executorRunId, "missing_subject");
     return;
   }
   if (actionDescriptor.requiresBody && !item.body.trim()) {
+    logger.info(`Warmup Queue 任务失败 task_id=${item.taskId} reason=missing_body`);
     await failItem(notion, item, executorRunId, "missing_body");
     return;
   }
   if (actionDescriptor.requiresReplyToMessageId && !item.replyToMessageId.trim()) {
+    logger.info(`Warmup Queue 任务失败 task_id=${item.taskId} reason=missing_reply_to_message_id`);
     await failItem(notion, item, executorRunId, "missing_reply_to_message_id");
     return;
   }
 
-  const providerContext = createWarmupProviderExecutionContext(item, credential);
+  const defaultAddressBookId =
+    entry.mail_automation_agent_default_address_book_id?.trim() ||
+    process.env.MAIL_AUTOMATION_AGENT_DEFAULT_ADDRESS_BOOK_ID?.trim() ||
+    undefined;
+  const providerContext = createWarmupProviderExecutionContext(item, credential, { defaultAddressBookId });
   const adapter = getWarmupProviderAdapter(providerContext.runtime.provider);
   if (!adapter) {
+    logger.info(`Warmup Queue 任务失败 task_id=${item.taskId} reason=unsupported_provider provider=${providerContext.runtime.provider}`);
     await failItem(notion, item, executorRunId, "unsupported_provider");
     return;
   }
   if (!adapter.supports(item.plannedEventType)) {
+    logger.info(`Warmup Queue 任务失败 task_id=${item.taskId} reason=unsupported_action event_type=${item.plannedEventType}`);
     await failItem(notion, item, executorRunId, "unsupported_action");
     return;
   }
@@ -241,6 +256,7 @@ async function processOne(
       mapping.actionType,
     );
     if (!bandwidth) {
+      logger.info(`Warmup Queue 任务失败 task_id=${item.taskId} reason=missing_bandwidth_detail`);
       await failItem(notion, item, executorRunId, "missing_bandwidth_detail");
       return;
     }
@@ -248,6 +264,7 @@ async function processOne(
 
   const bandwidthReason = evaluateBandwidthGuard(bandwidth, new Date());
   if (bandwidthReason) {
+    logger.info(`Warmup Queue 任务失败 task_id=${item.taskId} reason=${bandwidthReason}`);
     await failItem(notion, item, executorRunId, bandwidthReason);
     return;
   }
@@ -292,22 +309,37 @@ async function runOneRound(notion: Client, entry: WarmupExecutorEntry): Promise<
     now,
     batchSize: Math.min(100, Math.max(1, entry.batch_size ?? 20)),
   });
-  if (items.length === 0) return;
+  if (items.length === 0) {
+    logger.info(`Warmup Executor 本轮无候选任务 entry=${entry.name}`);
+    return;
+  }
+  logger.info(`Warmup Executor 本轮候选数 entry=${entry.name} count=${items.length}`);
   for (const item of items) {
     try {
       await processOne(notion, entry, item, executorRunId);
     } catch (error) {
+      const reason =
+        error instanceof Error && /^(timeout|credential_not_found|not_found|api_error):/.test(error.message)
+          ? error.message.slice(0, error.message.indexOf(":"))
+          : "executor_exception";
+      logger.info(`Warmup Queue 任务失败 task_id=${item.taskId} reason=${reason}`);
       logger.warn(
         `Warmup Executor 处理失败 task_id=${item.taskId}`,
         error instanceof Error ? error.message : error,
       );
-      await failItem(notion, item, executorRunId, "executor_exception");
+      await failItem(notion, item, executorRunId, reason);
     }
   }
 }
 
 async function main(): Promise<void> {
   logger.info("Warmup Executor 已启动，配置来自 queue-sender.json；每分钟轮询真实库并执行真实动作");
+  try {
+    await healthCheck();
+  } catch (error) {
+    logger.error(error instanceof Error ? error : String(error));
+    process.exit(1);
+  }
   for (;;) {
     try {
       const config = await loadQueueSenderConfigOrDefault();

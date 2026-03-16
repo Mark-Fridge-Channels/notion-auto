@@ -314,6 +314,11 @@ function getDashboardHtml(): string {
     .row { margin-bottom: 0.9rem; }
     label { display: block; margin-bottom: 0.25rem; font-size: 0.9rem; font-weight: 500; }
     .hint { color: #666; font-size: 0.8rem; }
+    .modal-section-hint { margin: 1rem 0 0.4rem; padding: 0; font-size: 0.8rem; color: #555; font-weight: 600; }
+    .modal-section-hint:first-of-type { margin-top: 0.5rem; }
+    .label-tag { font-size: 0.7rem; padding: 0.1rem 0.35rem; border-radius: 4px; font-weight: 500; }
+    .label-tag.read { background: #e7f1ff; color: #0a58ca; }
+    .label-tag.write { background: #fff3cd; color: #997404; }
     input, textarea, select { width: 100%; padding: 0.5rem 0.65rem; border: 1px solid #ddd; border-radius: 6px; font-size: 16px; }
     textarea { min-height: 56px; resize: vertical; }
     .slot-row, .task-row, .list-row { display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center; padding: 0.6rem; border: 1px solid #eee; border-radius: 6px; margin-bottom: 0.6rem; background: #fafafa; }
@@ -413,7 +418,7 @@ function getDashboardHtml(): string {
   <section id="panel-warmup" class="panel">
     <div class="card full">
       <h2>Warmup Executor 配置 <span class="hint">写入 queue-sender.json</span></h2>
-      <p class="hint">每条配置对应一套 Warmup 数据层：Queue、Credential Registry、Execution Log、Conversation Event Log、BandWidth Detail、Warmup Mailbox Pool。</p>
+      <p class="hint">每条配置对应一套 Warmup 数据层。读入：Queue、Credential Registry、BandWidth Detail、Mailbox Pool；写入：Execution Log、Conversation Event Log。</p>
       <div id="warmupEntriesContainer"></div>
       <button id="btnAddWarmupEntry" class="primary" type="button">添加一条</button>
       <button id="btnSaveWarmupConfig" class="primary" type="button">保存 Warmup 配置</button>
@@ -446,12 +451,14 @@ function getDashboardHtml(): string {
     <div class="modal-box">
       <h3>编辑 Warmup 条目</h3>
       <div class="row"><label>显示名</label><input id="modalWarmupName" type="text" placeholder="主 Warmup"></div>
-      <div class="row"><label>Email Warmup Queue URL</label><input id="modalWarmupQueueUrl" type="url" placeholder="https://www.notion.so/..."></div>
-      <div class="row"><label>Credential Registry URL</label><input id="modalWarmupCredentialUrl" type="url" placeholder="https://www.notion.so/..."></div>
-      <div class="row"><label>Execution Log URL</label><input id="modalWarmupExecutionLogUrl" type="url" placeholder="https://www.notion.so/..."></div>
-      <div class="row"><label>Conversation Event Log URL</label><input id="modalWarmupConversationLogUrl" type="url" placeholder="https://www.notion.so/..."></div>
-      <div class="row"><label>BandWidth Detail URL</label><input id="modalWarmupBandwidthUrl" type="url" placeholder="https://www.notion.so/..."></div>
-      <div class="row"><label>Warmup Mailbox Pool URL</label><input id="modalWarmupMailboxPoolUrl" type="url" placeholder="https://www.notion.so/..."></div>
+      <p class="modal-section-hint">读入：Executor 从以下 Notion 库读取任务、凭据与带宽等</p>
+      <div class="row"><label>Email Warmup Queue URL <span class="label-tag read">读</span></label><input id="modalWarmupQueueUrl" type="url" placeholder="https://www.notion.so/..."></div>
+      <div class="row"><label>Credential Registry URL <span class="label-tag read">读</span></label><input id="modalWarmupCredentialUrl" type="url" placeholder="https://www.notion.so/..."></div>
+      <div class="row"><label>BandWidth Detail URL <span class="label-tag read">读</span></label><input id="modalWarmupBandwidthUrl" type="url" placeholder="https://www.notion.so/..."></div>
+      <div class="row"><label>Warmup Mailbox Pool URL <span class="label-tag read">读</span></label><input id="modalWarmupMailboxPoolUrl" type="url" placeholder="https://www.notion.so/..."></div>
+      <p class="modal-section-hint">写入：Executor 向以下 Notion 库写入执行与会话记录</p>
+      <div class="row"><label>Execution Log URL <span class="label-tag write">写</span></label><input id="modalWarmupExecutionLogUrl" type="url" placeholder="https://www.notion.so/..."></div>
+      <div class="row"><label>Conversation Event Log URL <span class="label-tag write">写</span></label><input id="modalWarmupConversationLogUrl" type="url" placeholder="https://www.notion.so/..."></div>
       <div class="row"><label>每批条数</label><input id="modalWarmupBatchSize" type="number" min="1" max="100" value="${DEFAULT_BATCH_SIZE}"></div>
       <div class="form-actions">
         <button id="modalSaveWarmup" class="primary" type="button">保存</button>

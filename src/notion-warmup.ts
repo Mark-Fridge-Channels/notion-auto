@@ -3,7 +3,6 @@ import { logger } from "./logger.js";
 import {
   WARMUP_AUDIT_KEEP,
   WARMUP_CREDENTIAL_STATUS_VALID,
-  WARMUP_LEGACY_TASK_TYPE,
   WARMUP_PLATFORM_EMAIL,
   WARMUP_STATUS_CANCELLED,
   WARMUP_STATUS_FAILED,
@@ -258,9 +257,18 @@ function isExecuteWindowActive(start: Date | null, end: Date | null, now: Date):
   return false;
 }
 
+/** Resolve property value by trying multiple keys (Notion API uses the UI column name as key, e.g. "Planned Event Type" or "planned_event_type"). */
+function getProp(props: Record<string, unknown>, ...keys: string[]): unknown {
+  for (const k of keys) {
+    if (Object.prototype.hasOwnProperty.call(props, k) && props[k] != null) return props[k];
+  }
+  return undefined;
+}
+
 function parseQueueItem(page: { id: string; properties: Record<string, unknown> }): WarmupQueueItem | null {
   const props = page.properties;
-  const eventType = (getSelectName(props["planned_event_type"]) || getSelectName(props["planned_action"])) as WarmupPlannedEventType;
+  const eventType = (getSelectName(getProp(props, "planned_event_type", "Planned Event Type")) ||
+    getSelectName(getProp(props, "planned_action", "Planned Action"))) as WarmupPlannedEventType;
   if (!eventType) return null;
   const executeWindow = getDateRange(props["Execute Window"]);
   const taskId = getPlainText(props["Task ID"]);
@@ -275,7 +283,7 @@ function parseQueueItem(page: { id: string; properties: Record<string, unknown> 
     threadId: getPlainText(props["thread_id"]),
     relationshipId: getPlainText(props["relationship_id"]),
     plannedEventType: eventType,
-    plannedAction: getSelectName(props["planned_action"]),
+    plannedAction: getSelectName(getProp(props, "planned_action", "Planned Action")),
     roleInChain: getSelectName(props["role_in_chain"]),
     dependsOnTaskId: getPlainText(props["depends_on_task_id"]),
     executeWindowStart: executeWindow.start,
@@ -315,14 +323,43 @@ export async function queryWarmupQueueCandidates(
   const items: WarmupQueueItem[] = [];
   for (const page of response.results) {
     if (!("properties" in page)) continue;
-    const item = parseQueueItem({ id: page.id, properties: page.properties });
-    if (!item) continue;
-    if (item.status !== WARMUP_STATUS_PENDING) continue;
-    if (item.auditDecision !== WARMUP_AUDIT_KEEP) continue;
-    if (item.legacyTaskType !== WARMUP_LEGACY_TASK_TYPE) continue;
-    if (item.platformLegacy !== WARMUP_PLATFORM_EMAIL) continue;
-    if (!item.auditRunId || !item.auditedAt) continue;
-    if (!isExecuteWindowActive(item.executeWindowStart, item.executeWindowEnd, options.now)) continue;
+    const props = page.properties as Record<string, unknown>;
+    const item = parseQueueItem({ id: page.id, properties: props });
+    if (!item) {
+      const eventTypeKeys = ["planned_event_type", "Planned Event Type", "planned_action", "Planned Action"];
+      const eventTypeValues = Object.fromEntries(
+        eventTypeKeys.map((k) => [k, props[k] != null ? getSelectName(props[k]) || "(empty)" : "(missing)"])
+      );
+      const rawEventType = props["planned_event_type"];
+      const rawPlannedAction = props["planned_action"];
+      const rawSnippet = (v: unknown) => (v === undefined ? "undefined" : JSON.stringify(v).slice(0, 400));
+      logger.info(
+        `Warmup Queue 候选过滤 page_id=${page.id} reason=parse_fail ` +
+          `property_keys=[${Object.keys(props).join(",")}] ` +
+          `event_type_sources=${JSON.stringify(eventTypeValues)} ` +
+          `raw_planned_event_type=${rawSnippet(rawEventType)} ` +
+          `raw_planned_action=${rawSnippet(rawPlannedAction)}`
+      );
+      continue;
+    }
+    if (item.status !== WARMUP_STATUS_PENDING) {
+      logger.info(`Warmup Queue 候选过滤 task_id=${item.taskId} reason=status_not_pending status=${item.status}`);
+      continue;
+    }
+    if (item.auditDecision !== WARMUP_AUDIT_KEEP) {
+      logger.info(`Warmup Queue 候选过滤 task_id=${item.taskId} reason=audit_not_keep audit_decision=${item.auditDecision}`);
+      continue;
+    }
+    if (!item.auditRunId || !item.auditedAt) {
+      logger.info(`Warmup Queue 候选过滤 task_id=${item.taskId} reason=audit_missing`);
+      continue;
+    }
+    if (!isExecuteWindowActive(item.executeWindowStart, item.executeWindowEnd, options.now)) {
+      logger.info(
+        `Warmup Queue 候选过滤 task_id=${item.taskId} reason=execute_window_inactive window_start=${item.executeWindowStart?.toISOString() ?? "null"} window_end=${item.executeWindowEnd?.toISOString() ?? "null"}`,
+      );
+      continue;
+    }
     items.push(item);
   }
   return items;

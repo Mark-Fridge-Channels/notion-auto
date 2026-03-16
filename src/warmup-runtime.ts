@@ -1,6 +1,6 @@
 import type { WarmupCredentialRecord } from "./notion-warmup.js";
 
-export type WarmupProviderKey = "Gmail" | "Zoho" | "Microsoft 365" | "SMTP";
+export type WarmupProviderKey = "Gmail" | "Zoho" | "Microsoft 365" | "SMTP" | "MailAutomationAgent";
 
 export interface WarmupSmtpConfig {
   host: string;

@@ -68,6 +68,8 @@ npm run run -- --help
 
 **Warmup Executor 与 NOTION_API_KEY**：当前实现会在真实 Notion 数据库上读取 Queue、Credential Registry、BandWidth Detail，并执行真实邮箱动作后回写 `Email Warmup Queue`、`Execution Log` 与 `Warmup Conversation Event Log`。需配置环境变量 `NOTION_API_KEY`（Notion Integration Token，且 Integration 需加入 Warmup 相关数据库的 Collaborators）。
 
+**Warmup Executor 与 Mail Automation Agent**：邮件动作（发信、回复、打开、标星、加联系人）统一通过 **Mail Automation Agent**（Thunderbird 扩展 + minimal-server）执行，不再直接调用 Gmail/Zoho/M365/SMTP API。**前置条件与启动顺序**：1）先启动 minimal-server（如 `node minimal-server/server.js`，默认 `http://127.0.0.1:3939`）；2）Thunderbird 已安装并加载 Mail Automation Agent 扩展；3）再启动 Warmup Executor（或 Dashboard）。环境变量见 `env.example`：`MAIL_AUTOMATION_AGENT_BASE_URL`、`MAIL_AUTOMATION_AGENT_TIMEOUT_MS`、可选 `MAIL_AUTOMATION_AGENT_DEFAULT_ADDRESS_BOOK_ID`（Add Contact 用）。启动时会对 minimal-server 做健康检查，不可达则进程退出。
+
 **Warmup Executor（现行逻辑）**：
 
 - **消费条件**：只读取满足 `Status = Pending`、`audit_decision = Keep`、`Legacy Task Type = Warmup`、`Platform (Legacy) = Email` 的 Queue 项。
@@ -75,11 +77,7 @@ npm run run -- --help
 - **依赖口径**：若 `depends_on_task_id` 非空，则必须在同库中找到上游 `Task ID` 且其 `Status = Sent`，才允许继续执行。
 - **凭据与风控**：通过 `actor_mailbox_id` 命中 `Credential Registry`，并优先读取 relation 关联的 `BandWidth Detail` 做 gate。
 - **执行结果**：成功项会把 Queue 写成 `Status = Sent`，并写入两张 log；失败项写 `Status = Failed` 与阻塞状态，便于人工复盘。
-- **Provider 动作支持**：
-  - `Gmail`：`Send`、`Reply`、`Open`、`Star`、`Add Contact`、`Wait`
-  - `Zoho`：`Send`、`Reply`、`Open`、`Star`、`Add Contact`、`Wait`
-  - `Microsoft 365`：`Send`、`Reply`、`Open`、`Star`、`Add Contact`、`Wait`
-  - `SMTP`：`Send`、`Reply` 走 SMTP；`Open`、`Star` 走 `auth_config_json.imap`；`Add Contact` 走 `auth_config_json.contacts/carddav`
+- **邮件执行**：统一走 **Mail Automation Agent**（minimal-server）：`Send`、`Reply`、`Open`、`Star`、`Add Contact`、`Wait`（noop）。Credential 仅需能解析出账号（邮箱），不再区分 Gmail/Zoho/M365/SMTP。
 
 ### Credential Registry 的 `auth_config_json`
 

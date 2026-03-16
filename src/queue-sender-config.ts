@@ -26,6 +26,8 @@ export interface WarmupExecutorEntry {
   warmup_mailbox_pool_database_url: string;
   /** 每批取条数，可选，默认 20 */
   batch_size?: number;
+  /** Mail Automation Agent Add Contact 使用的默认通讯录 ID；可选，env MAIL_AUTOMATION_AGENT_DEFAULT_ADDRESS_BOOK_ID 优先 */
+  mail_automation_agent_default_address_book_id?: string;
 }
 
 export interface WarmupExecutorConfig {
@@ -66,6 +68,11 @@ function validateEntry(e: unknown, index: number): asserts e is WarmupExecutorEn
     if (!Number.isInteger(b) || b < 1 || b > 100)
       throw new Error(`entries[${index}].batch_size 必须为 1–100 的整数`);
   }
+  if (o.mail_automation_agent_default_address_book_id !== undefined) {
+    if (typeof o.mail_automation_agent_default_address_book_id !== "string") {
+      throw new Error(`entries[${index}].mail_automation_agent_default_address_book_id 必须为字符串`);
+    }
+  }
 }
 
 function migrateLegacyConfig(raw: unknown): QueueSenderConfig | null {
@@ -103,6 +110,10 @@ function migrateLegacyConfig(raw: unknown): QueueSenderConfig | null {
         typeof legacy.batch_size === "number" && Number.isInteger(legacy.batch_size)
           ? legacy.batch_size
           : DEFAULT_BATCH_SIZE,
+      mail_automation_agent_default_address_book_id:
+        typeof legacy.mail_automation_agent_default_address_book_id === "string"
+          ? legacy.mail_automation_agent_default_address_book_id.trim() || undefined
+          : undefined,
     });
   }
   return { entries };
@@ -133,6 +144,10 @@ export function validateQueueSenderConfig(raw: unknown): QueueSenderConfig {
       bandwidth_detail_database_url: e.bandwidth_detail_database_url.trim(),
       warmup_mailbox_pool_database_url: e.warmup_mailbox_pool_database_url.trim(),
       batch_size,
+      mail_automation_agent_default_address_book_id:
+        typeof e.mail_automation_agent_default_address_book_id === "string"
+          ? e.mail_automation_agent_default_address_book_id.trim() || undefined
+          : undefined,
     });
   }
   return { entries };
@@ -207,6 +222,9 @@ export async function saveQueueSenderConfig(
         bandwidth_detail_database_url: e.bandwidth_detail_database_url,
         warmup_mailbox_pool_database_url: e.warmup_mailbox_pool_database_url,
         batch_size: e.batch_size ?? DEFAULT_BATCH_SIZE,
+        ...(e.mail_automation_agent_default_address_book_id != null && {
+          mail_automation_agent_default_address_book_id: e.mail_automation_agent_default_address_book_id,
+        }),
       })),
     },
     null,

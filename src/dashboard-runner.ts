@@ -13,6 +13,8 @@ import { EXIT_RECOVERY_RESTART } from "./exit-codes.js";
 const MAX_RUN_LOGS = 10;
 const MAX_LINES_PER_RUN = 2000;
 const RESTART_ALERT_THRESHOLD = 5;
+/** Windows 上发 "stop" 后等待子进程退出的时间，超时则 taskkill 杀进程树 */
+const STOP_GRACE_MS = 3000;
 
 export type RunStatus = "idle" | "running";
 
@@ -72,9 +74,12 @@ function spawnChild(configPath: string, isAutoResume: boolean): void {
   const env = { ...process.env };
   if (isAutoResume) env.NOTION_AUTO_RESUME = "1";
 
+  // Windows 需 pipe stdin，以便 stop() 发 "stop" 让子进程先关浏览器再退出（issue 011）
+  const stdio: ["pipe" | "ignore", "pipe", "pipe"] =
+    process.platform === "win32" ? ["pipe", "pipe", "pipe"] : ["ignore", "pipe", "pipe"];
   const opts: Parameters<typeof spawn>[2] = {
     cwd: process.cwd(),
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio,
     env,
   };
 
@@ -156,12 +161,37 @@ async function maybeAutoRestart(exitCode?: number): Promise<void> {
 
 /**
  * 停止当前脚本子进程（若有）；并标记用户不再希望运行，exit 时不再自动重启。
+ * Windows：先向 stdin 发 "stop" 让子进程关浏览器再退出，超时未退则 taskkill 杀进程树（issue 011）。
  */
 export function stop(): void {
   userWantsRunning = false;
   if (currentProcess == null) return;
-  currentProcess.kill("SIGTERM");
-  currentProcess = null;
+
+  if (process.platform === "win32") {
+    const child = currentProcess;
+    const pid = child.pid;
+    if (pid != null && child.stdin) {
+      child.stdin.write("stop\n");
+      child.stdin.end();
+      const timeout = setTimeout(() => {
+        if (currentProcess !== null && currentProcess.pid === pid) {
+          logger.warn("子进程未在限定时间内退出，使用 taskkill 结束进程树");
+          spawn("taskkill", ["/pid", String(pid), "/f", "/t"], {
+            shell: true,
+            stdio: "ignore",
+            windowsHide: true,
+          });
+        }
+      }, STOP_GRACE_MS);
+      child.once("exit", () => clearTimeout(timeout));
+    } else {
+      child.kill("SIGINT");
+      currentProcess = null;
+    }
+  } else {
+    currentProcess.kill("SIGTERM");
+    currentProcess = null;
+  }
 }
 
 export function getRunStatus(): RunStatus {
