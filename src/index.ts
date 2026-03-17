@@ -41,6 +41,9 @@ let currentBrowser: Browser | null = null;
 
 const BROWSER_CLOSE_TIMEOUT_MS = 10_000;
 
+/** 等待 Notion AI 头像可见的超时（毫秒）；打开页面/切换行业/队列任务后等 AI 入口出现 */
+const AI_FACE_VISIBLE_TIMEOUT_MS = 60_000;
+
 /**
  * 关闭当前浏览器后退出进程；用于 process.exit 会跳过 finally 的路径（恢复重启、SIGTERM）。
  * 带超时避免 close 卡死导致进程无法退出。
@@ -195,7 +198,7 @@ async function main(): Promise<void> {
         await page.goto(currentIndustry.notionUrl, { waitUntil: "domcontentloaded" });
         await sleep(500);
         const img = page.locator(AI_FACE_IMG).first();
-        await img.waitFor({ state: "visible" });
+        await img.waitFor({ state: "visible", timeout: AI_FACE_VISIBLE_TIMEOUT_MS });
         await img.locator("xpath=..").click();
         await sleep(MODAL_WAIT_MS);
         await dismissPersonalizeDialogIfPresent(page);
@@ -232,7 +235,7 @@ async function main(): Promise<void> {
             await page.goto(task.fileUrl, { waitUntil: "domcontentloaded" });
             await sleep(500);
             const img = page.locator(AI_FACE_IMG).first();
-            await img.waitFor({ state: "visible" });
+            await img.waitFor({ state: "visible", timeout: AI_FACE_VISIBLE_TIMEOUT_MS });
             await img.locator("xpath=..").click();
             await sleep(MODAL_WAIT_MS);
             await dismissPersonalizeDialogIfPresent(page);
@@ -417,7 +420,7 @@ async function openNotionAI(
   await runWithRetry(maxRetries, async () => {
     await page.goto(notionUrl, { waitUntil: "domcontentloaded" });
     const img = page.locator(AI_FACE_IMG).first();
-    await img.waitFor({ state: "visible" });
+    await img.waitFor({ state: "visible", timeout: AI_FACE_VISIBLE_TIMEOUT_MS });
     const parent = img.locator("xpath=..");
     await parent.click();
     await sleep(MODAL_WAIT_MS);
@@ -551,7 +554,7 @@ async function reopenNotionAndNewChat(
   await page.reload({ waitUntil: "domcontentloaded" });
   await sleep(500);
   const img = page.locator(AI_FACE_IMG).first();
-  await img.waitFor({ state: "visible" });
+  await img.waitFor({ state: "visible", timeout: AI_FACE_VISIBLE_TIMEOUT_MS });
   await img.locator("xpath=..").click();
   await sleep(MODAL_WAIT_MS);
   await dismissPersonalizeDialogIfPresent(page);
