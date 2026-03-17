@@ -77,6 +77,8 @@ export interface Schedule {
   intervalMaxMs: number;
   /** 首次打开页面时的登录等待（毫秒） */
   loginWaitMs: number;
+  /** 发送后等待 AI 回复完成（可发送状态）的超时（毫秒）；换模型前等待也使用此时长。默认 5 分钟，最小 1 分钟 */
+  waitSubmitReadyMs?: number;
   /** 单步最大重试次数 */
   maxRetries: number;
   /** 登录态保存路径（相对项目目录） */
@@ -93,12 +95,19 @@ export interface Schedule {
 
 const DEFAULT_STORAGE_PATH = ".notion-auth.json";
 
+/** 发送后等待可发送状态的最小超时（毫秒，即 1 分钟） */
+const MIN_WAIT_SUBMIT_READY_MS = 60_000;
+
+/** 发送后等待可发送状态的默认超时（毫秒，即 5 分钟） */
+const DEFAULT_WAIT_SUBMIT_READY_MS = 300_000;
+
 /** 默认/示例配置：一个区间 + 一个行业 + 一个任务 */
 export function getDefaultSchedule(): Schedule {
   return {
     intervalMinMs: 2 * 60 * 1000,
     intervalMaxMs: 2 * 60 * 1000,
     loginWaitMs: 60 * 1000,
+    waitSubmitReadyMs: DEFAULT_WAIT_SUBMIT_READY_MS,
     maxRetries: 3,
     storagePath: DEFAULT_STORAGE_PATH,
     timeSlots: [
@@ -199,6 +208,10 @@ export function validateSchedule(s: Schedule): void {
   if (!Number.isFinite(s.intervalMaxMs) || s.intervalMaxMs < 1) throw new Error("intervalMaxMs 必须为正数");
   if (s.intervalMinMs > s.intervalMaxMs) throw new Error("intervalMinMs 不能大于 intervalMaxMs");
   if (!Number.isFinite(s.loginWaitMs) || s.loginWaitMs < 0) throw new Error("loginWaitMs 必须为非负数");
+  if (s.waitSubmitReadyMs !== undefined) {
+    if (!Number.isFinite(s.waitSubmitReadyMs) || s.waitSubmitReadyMs < MIN_WAIT_SUBMIT_READY_MS)
+      throw new Error("waitSubmitReadyMs 至少 1 分钟 (60000 毫秒)");
+  }
   if (!Number.isFinite(s.maxRetries) || s.maxRetries < 1) throw new Error("maxRetries 必须为正整数");
   if (typeof s.storagePath !== "string" || s.storagePath.includes("..") || s.storagePath.startsWith("/"))
     throw new Error("storagePath 必须为当前目录下的相对路径");
@@ -313,6 +326,10 @@ export function mergeSchedule(partial: unknown): Schedule {
       return Math.max(a, b);
     })(),
     loginWaitMs: Number(o.loginWaitMs) ?? def.loginWaitMs,
+    waitSubmitReadyMs: (() => {
+      const raw = Number(o.waitSubmitReadyMs);
+      return Number.isFinite(raw) ? raw : (def.waitSubmitReadyMs ?? DEFAULT_WAIT_SUBMIT_READY_MS);
+    })(),
     maxRetries: Number(o.maxRetries) || def.maxRetries,
     storagePath: typeof o.storagePath === "string" ? o.storagePath : def.storagePath,
     timeSlots,

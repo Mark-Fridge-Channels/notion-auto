@@ -20,7 +20,6 @@ import {
   SEND_BUTTON,
   NEW_CHAT_BUTTON,
   MODAL_WAIT_MS,
-  WAIT_SUBMIT_READY_MS,
   PERSONALIZE_DIALOG,
   PERSONALIZE_DIALOG_CHECK_MS,
 } from "./selectors.js";
@@ -173,6 +172,8 @@ async function main(): Promise<void> {
     let chainRunsInSlot = 0;
     /** 是否刚因「跑满 N 轮」而离开当前时段；再次落入同一行业时重置 chainRunsInSlot */
     let leftCurrentSlot = false;
+    /** 发送后等待可发送状态的超时（毫秒），来自 schedule，默认 5 分钟；换模型前等待也使用此时长 */
+    const waitSubmitReadyMs = schedule.waitSubmitReadyMs ?? 300_000;
 
     for (;;) {
       // 每轮任务链开始前：检查是否跨时间区间需切换行业
@@ -252,6 +253,7 @@ async function main(): Promise<void> {
             prompt,
             schedule.maxRetries,
             schedule.autoClickDuringOutputWait ?? [],
+            waitSubmitReadyMs,
           );
           try {
             if (ok) {
@@ -284,15 +286,15 @@ async function main(): Promise<void> {
             currentM = drawSessionM(currentIndustry);
           }
           if (currentM > 0 && sessionRuns > 0 && sessionRuns % currentM === 0) {
-            await switchToNextModel(page);
+            await switchToNextModel(page, waitSubmitReadyMs);
           }
 
-          let ok = await tryTypeAndSend(page, task.content, schedule.maxRetries, schedule.autoClickDuringOutputWait ?? []);
+          let ok = await tryTypeAndSend(page, task.content, schedule.maxRetries, schedule.autoClickDuringOutputWait ?? [], waitSubmitReadyMs);
           if (!ok) {
             logger.warn("本轮流试失败，尝试 New AI chat 后重试…");
             try {
               await clickNewAIChat(page, schedule.maxRetries);
-              ok = await tryTypeAndSend(page, task.content, schedule.maxRetries, schedule.autoClickDuringOutputWait ?? []);
+              ok = await tryTypeAndSend(page, task.content, schedule.maxRetries, schedule.autoClickDuringOutputWait ?? [], waitSubmitReadyMs);
             } catch (e) {
               logger.warn("New AI chat 失败", e);
             }
@@ -302,7 +304,7 @@ async function main(): Promise<void> {
               logger.warn(`重新打开 Notion 并重试（${r + 1}/${MAX_REOPEN_PER_ROUND}）…`);
               try {
                 await reopenNotionAndNewChat(page, currentIndustry.notionUrl, schedule.maxRetries);
-                ok = await tryTypeAndSend(page, task.content, schedule.maxRetries, schedule.autoClickDuringOutputWait ?? []);
+                ok = await tryTypeAndSend(page, task.content, schedule.maxRetries, schedule.autoClickDuringOutputWait ?? [], waitSubmitReadyMs);
               } catch (e) {
                 logger.warn("reopenNotionAndNewChat 失败", e);
               }
@@ -496,7 +498,12 @@ async function sweepAutoClickButtons(
   }
 }
 
-async function typeAndSend(page: import("playwright").Page, text: string, buttonNames: string[] = []): Promise<void> {
+async function typeAndSend(
+  page: import("playwright").Page,
+  text: string,
+  buttonNames: string[] = [],
+  timeoutMs: number,
+): Promise<void> {
   if (process.env.NOTION_AUTO_SIMULATE_STUCK === "1") {
     throw new Error("模拟卡住（NOTION_AUTO_SIMULATE_STUCK=1）");
   }
@@ -515,7 +522,7 @@ async function typeAndSend(page: import("playwright").Page, text: string, button
   await send.waitFor({ state: "visible" });
   await send.click();
   try {
-    await waitForSendButtonWithAutoClick(page, buttonNames, WAIT_SUBMIT_READY_MS);
+    await waitForSendButtonWithAutoClick(page, buttonNames, timeoutMs);
   } catch (e) {
     throw new WaitAfterSendTimeoutError(e);
   }
@@ -581,16 +588,17 @@ async function tryTypeAndSend(
   prompt: string,
   max: number,
   buttonNames: string[],
+  timeoutMs: number,
 ): Promise<boolean> {
   for (let i = 0; i < max; i++) {
     try {
-      await typeAndSend(page, prompt, buttonNames);
+      await typeAndSend(page, prompt, buttonNames, timeoutMs);
       return true;
     } catch (e) {
       if (e instanceof WaitAfterSendTimeoutError) {
         logger.warn("发送后等待超时，仅再等一次发送按钮出现，不再重发");
         try {
-          await page.locator(SEND_BUTTON).first().waitFor({ state: "visible", timeout: WAIT_SUBMIT_READY_MS });
+          await page.locator(SEND_BUTTON).first().waitFor({ state: "visible", timeout: timeoutMs });
           return true;
         } catch {
           return false;

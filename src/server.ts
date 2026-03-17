@@ -161,7 +161,13 @@ async function handleRequest(
     if (path === "/api/schedule" && method === "POST") {
       const body = await readJsonBody(req);
       const schedule = mergeSchedule(body);
-      validateSchedule(schedule);
+      try {
+        validateSchedule(schedule);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        sendJson(res, 400, { error: msg });
+        return;
+      }
       await saveSchedule(getSchedulePath(), schedule);
       res.writeHead(204);
       res.end();
@@ -360,6 +366,10 @@ function getDashboardHtml(): string {
       <div class="row">
         <label>如果没有登录账号，首次等待多少秒进行手动登录操作 <span class="hint">默认 60</span></label>
         <input id="loginWaitSeconds" type="number" min="0" placeholder="60">
+      </div>
+      <div class="row">
+        <label>发送后等待 AI 回复完成的超时（分钟） <span class="hint">AI 回复有时较慢，调大可以多等一会儿再判定超时，避免被误判失败；换模型前也会用这个时长等待。默认 5，至少 1</span></label>
+        <input id="waitSubmitReadyMinutes" type="number" min="1" placeholder="5">
       </div>
       <div class="row">
         <label>最大重试次数 <span class="hint">打开 Notion AI、点击新建对话、输入发送等单步失败时最多尝试次数，默认 3</span></label>
@@ -679,6 +689,7 @@ function getDashboardHtml(): string {
       document.getElementById('intervalSecondsMin').value = schedule.intervalMinMs != null ? Math.round(schedule.intervalMinMs / 1000) : 120;
       document.getElementById('intervalSecondsMax').value = schedule.intervalMaxMs != null ? Math.round(schedule.intervalMaxMs / 1000) : 120;
       document.getElementById('loginWaitSeconds').value = schedule.loginWaitMs != null ? Math.round(schedule.loginWaitMs / 1000) : 60;
+      document.getElementById('waitSubmitReadyMinutes').value = schedule.waitSubmitReadyMs != null ? Math.round(schedule.waitSubmitReadyMs / 60000) : 5;
       document.getElementById('maxRetries').value = schedule.maxRetries ?? 3;
       const names = schedule.autoClickDuringOutputWait || [];
       autoClickButtonsContainer.innerHTML = '';
@@ -725,6 +736,8 @@ function getDashboardHtml(): string {
       const intervalMinMs = Math.min(secMin, secMax) * 1000;
       const intervalMaxMs = Math.max(secMin, secMax) * 1000;
       const loginWaitMs = (Number(document.getElementById('loginWaitSeconds').value) || 60) * 1000;
+      const waitSubmitReadyMinutes = Number(document.getElementById('waitSubmitReadyMinutes').value) || 5;
+      const waitSubmitReadyMs = waitSubmitReadyMinutes * 60 * 1000;
       const maxRetries = Number(document.getElementById('maxRetries').value) || 3;
       const slots = [];
       timeSlotsContainer.querySelectorAll('.slot-row').forEach(row => {
@@ -758,7 +771,7 @@ function getDashboardHtml(): string {
         statusFailed: (document.getElementById('queueStatusFailed') && document.getElementById('queueStatusFailed').value) ? document.getElementById('queueStatusFailed').value : 'Failed',
         onSuccess: (document.querySelector('input[name="queueOnSuccess"]:checked') && document.querySelector('input[name="queueOnSuccess"]:checked').value === 'delete') ? 'delete' : 'update'
       } : undefined;
-      return { intervalMinMs, intervalMaxMs, loginWaitMs, maxRetries, storagePath: '.notion-auth.json', timeSlots: slots, industries, autoClickDuringOutputWait, notionQueue };
+      return { intervalMinMs, intervalMaxMs, loginWaitMs, waitSubmitReadyMs, maxRetries, storagePath: '.notion-auth.json', timeSlots: slots, industries, autoClickDuringOutputWait, notionQueue };
     }
 
     document.getElementById('btnAddAutoClickButton').onclick = function () { appendAutoClickRow(''); };

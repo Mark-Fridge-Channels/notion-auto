@@ -35,10 +35,12 @@ function getModelPickerButton(page: Page): Promise<ReturnType<Page["locator"]> |
 /**
  * 执行一次「打开弹窗 → 识别当前选中 → 点击下一项」。
  * 先等待 SEND_BUTTON 可见（可发送状态），与发送后等待时长一致，避免输出未结束就尝试切换；再定位其左侧元素并执行切换。
+ * @param timeoutMs 等待可发送状态的超时（毫秒），未传则使用 selectors 默认值
  */
-async function doSwitchToNextModel(page: Page): Promise<void> {
+async function doSwitchToNextModel(page: Page, timeoutMs?: number): Promise<void> {
+  const waitMs = timeoutMs ?? WAIT_SUBMIT_READY_MS;
   const sendBtn = page.locator(SEND_BUTTON).first();
-  await sendBtn.waitFor({ state: "visible", timeout: WAIT_SUBMIT_READY_MS });
+  await sendBtn.waitFor({ state: "visible", timeout: waitMs });
 
   const buttonToOpenPicker = await getModelPickerButton(page);
   if (!buttonToOpenPicker) {
@@ -71,12 +73,12 @@ async function doSwitchToNextModel(page: Page): Promise<void> {
 }
 
 /**
- * 切换到下一个模型：先等待可发送状态（最多与 WAIT_SUBMIT_READY_MS 一致），再打开发送左侧弹窗、点击下一项。
+ * 切换到下一个模型：先等待可发送状态（超时由调用方传入，与「发送后等待」配置一致），再打开发送左侧弹窗、点击下一项。
  * 不做短超时 + 3 次重试，避免在输出未结束时报错；等待到能切换后再执行一次，失败则打日志并返回。
  */
-export async function switchToNextModel(page: Page): Promise<void> {
+export async function switchToNextModel(page: Page, timeoutMs?: number): Promise<void> {
   try {
-    await doSwitchToNextModel(page);
+    await doSwitchToNextModel(page, timeoutMs);
     logger.info("已切换至下一模型");
   } catch (e) {
     logger.warn("模型切换失败，跳过本次切换，继续运行", e);
