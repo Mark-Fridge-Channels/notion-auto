@@ -397,10 +397,19 @@ function getDashboardHtml(): string {
         </div>
         <div class="queue-col">
           <div class="row"><label>列名：Status</label><input type="text" id="queueColumnStatus" placeholder="Status"></div>
+          <div class="row"><label>列名：Batch Phase（Number，可选，留空=禁用批次排序）</label><input type="text" id="queueColumnBatchPhase" placeholder="batch_phase"></div>
           <div class="row"><label>待执行状态值</label><input type="text" id="queueStatusQueued" placeholder="Queued"></div>
           <div class="row"><label>完成后状态值</label><input type="text" id="queueStatusDone" placeholder="Done"></div>
           <div class="row"><label>失败后状态值</label><input type="text" id="queueStatusFailed" placeholder="Failed"></div>
         </div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="queue-conductor" style="margin-top:1rem; padding-top:1rem; border-top:1px solid #dee2e6;">
+        <h3 class="hint" style="margin-top:0">Conductor（队列空时触发）</h3>
+        <div class="row"><label>Conductor 页面 URL</label><input type="url" id="queueConductorPageUrl" placeholder="https://www.notion.so/..."></div>
+        <div class="row"><label>Conductor 发送内容</label><input type="text" id="queueConductorPrompt" placeholder="指令文案，留空则不启用"></div>
+        <div class="row"><label>空队列持续多少分钟后触发</label><input type="number" id="queueConductorEmptyMinutes" min="0" placeholder="30"></div>
       </div>
     </div>
     <div class="card" style="grid-column: 1 / -1;">
@@ -702,21 +711,29 @@ function getDashboardHtml(): string {
         document.getElementById('queueColumnActionName').value = q.columnActionName || 'Action Name';
         document.getElementById('queueColumnFileUrl').value = q.columnFileUrl || 'File URL';
         document.getElementById('queueColumnStatus').value = q.columnStatus || 'Status';
+        document.getElementById('queueColumnBatchPhase').value = (q.columnBatchPhase !== undefined && q.columnBatchPhase !== null) ? q.columnBatchPhase : 'batch_phase';
         document.getElementById('queueStatusQueued').value = q.statusQueued || 'Queued';
         document.getElementById('queueStatusDone').value = q.statusDone || 'Done';
         document.getElementById('queueStatusFailed').value = q.statusFailed || 'Failed';
         const radio = document.querySelector('input[name="queueOnSuccess"][value="' + (q.onSuccess === 'delete' ? 'delete' : 'update') + '"]');
         if (radio) radio.checked = true;
+        document.getElementById('queueConductorPageUrl').value = q.conductorPageUrl || '';
+        document.getElementById('queueConductorPrompt').value = q.conductorPrompt || '';
+        document.getElementById('queueConductorEmptyMinutes').value = (q.conductorEmptyQueueMinutes !== undefined && q.conductorEmptyQueueMinutes !== null) ? String(q.conductorEmptyQueueMinutes) : '30';
       } else {
         document.getElementById('queueDatabaseUrl').value = '';
         document.getElementById('queueColumnActionName').value = 'Action Name';
         document.getElementById('queueColumnFileUrl').value = 'File URL';
         document.getElementById('queueColumnStatus').value = 'Status';
+        document.getElementById('queueColumnBatchPhase').value = 'batch_phase';
         document.getElementById('queueStatusQueued').value = 'Queued';
         document.getElementById('queueStatusDone').value = 'Done';
         document.getElementById('queueStatusFailed').value = 'Failed';
         const upd = document.querySelector('input[name="queueOnSuccess"][value="update"]');
         if (upd) upd.checked = true;
+        document.getElementById('queueConductorPageUrl').value = '';
+        document.getElementById('queueConductorPrompt').value = '';
+        document.getElementById('queueConductorEmptyMinutes').value = '30';
       }
     }
     /** 在「自动点击按钮」列表末尾追加一行；value 为输入框初始值 */
@@ -766,10 +783,20 @@ function getDashboardHtml(): string {
         columnActionName: (document.getElementById('queueColumnActionName') && document.getElementById('queueColumnActionName').value) ? document.getElementById('queueColumnActionName').value.trim() : 'Action Name',
         columnFileUrl: (document.getElementById('queueColumnFileUrl') && document.getElementById('queueColumnFileUrl').value) ? document.getElementById('queueColumnFileUrl').value.trim() : 'File URL',
         columnStatus: (document.getElementById('queueColumnStatus') && document.getElementById('queueColumnStatus').value) ? document.getElementById('queueColumnStatus').value.trim() : 'Status',
+        columnBatchPhase: (() => { const el = document.getElementById('queueColumnBatchPhase'); const v = el && el.value; return (v != null && typeof v === 'string') ? v.trim() : 'batch_phase'; })(),
         statusQueued: (document.getElementById('queueStatusQueued') && document.getElementById('queueStatusQueued').value) ? document.getElementById('queueStatusQueued').value : 'Queued',
         statusDone: (document.getElementById('queueStatusDone') && document.getElementById('queueStatusDone').value) ? document.getElementById('queueStatusDone').value : 'Done',
         statusFailed: (document.getElementById('queueStatusFailed') && document.getElementById('queueStatusFailed').value) ? document.getElementById('queueStatusFailed').value : 'Failed',
-        onSuccess: (document.querySelector('input[name="queueOnSuccess"]:checked') && document.querySelector('input[name="queueOnSuccess"]:checked').value === 'delete') ? 'delete' : 'update'
+        onSuccess: (document.querySelector('input[name="queueOnSuccess"]:checked') && document.querySelector('input[name="queueOnSuccess"]:checked').value === 'delete') ? 'delete' : 'update',
+        ...(function () {
+          const url = (document.getElementById('queueConductorPageUrl') && document.getElementById('queueConductorPageUrl').value) ? document.getElementById('queueConductorPageUrl').value.trim() : '';
+          const prompt = (document.getElementById('queueConductorPrompt') && document.getElementById('queueConductorPrompt').value) ? document.getElementById('queueConductorPrompt').value.trim() : '';
+          if (!url || !prompt) return {};
+          const el = document.getElementById('queueConductorEmptyMinutes');
+          const v = el && el.value !== '' ? Number(el.value) : NaN;
+          const minutes = Number.isFinite(v) && v >= 0 ? v : 30;
+          return { conductorPageUrl: url, conductorPrompt: prompt, conductorEmptyQueueMinutes: minutes };
+        })()
       } : undefined;
       return { intervalMinMs, intervalMaxMs, loginWaitMs, waitSubmitReadyMs, maxRetries, storagePath: '.notion-auth.json', timeSlots: slots, industries, autoClickDuringOutputWait, notionQueue };
     }

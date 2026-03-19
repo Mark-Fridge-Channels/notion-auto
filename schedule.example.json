@@ -9,10 +9,14 @@
     "columnActionName": "Action Name",
     "columnFileUrl": "File URL",
     "columnStatus": "Status",
+    "columnBatchPhase": "batch_phase",
     "statusQueued": "Queued",
     "statusDone": "Done",
     "statusFailed": "Failed",
-    "onSuccess": "update"
+    "onSuccess": "update",
+    "conductorPageUrl": "https://www.notion.so/your-conductor-page",
+    "conductorPrompt": "请根据当前待办生成新的队列任务",
+    "conductorEmptyQueueMinutes": 30
   },
   "timeSlots": [
     {

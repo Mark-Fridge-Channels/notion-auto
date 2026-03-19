@@ -44,6 +44,9 @@ const BROWSER_CLOSE_TIMEOUT_MS = 10_000;
 /** 等待 Notion AI 头像可见的超时（毫秒）；打开页面/切换行业/队列任务后等 AI 入口出现 */
 const AI_FACE_VISIBLE_TIMEOUT_MS = 60_000;
 
+/** Conductor 执行后固定等待时间（毫秒），再继续抓取队列 */
+const CONDUCTOR_POST_WAIT_MS = 5 * 60 * 1000;
+
 /**
  * 关闭当前浏览器后退出进程；用于 process.exit 会跳过 finally 的路径（恢复重启、SIGTERM）。
  * 带超时避免 close 卡死导致进程无法退出。
@@ -218,6 +221,8 @@ async function main(): Promise<void> {
         isQueueAvailable(schedule.notionQueue)
       ) {
         const queueConfig = schedule.notionQueue!;
+        /** 空队列起始时间戳（毫秒）；取到任务时清空，用于判断是否达到 Conductor 触发阈值 */
+        let emptyQueueSince: number | null = null;
         for (;;) {
           const industryNow = getIndustryForNow(schedule);
           if (industryNow == null || industryNow.id !== currentIndustry.id) {
@@ -226,10 +231,43 @@ async function main(): Promise<void> {
           }
           const task = await fetchOneQueuedTask(queueConfig);
           if (!task) {
+            const now = Date.now();
+            if (emptyQueueSince == null) emptyQueueSince = now;
+            const thresholdMs = (queueConfig.conductorEmptyQueueMinutes ?? 30) * 60 * 1000;
+            const conductorUrl = queueConfig.conductorPageUrl?.trim();
+            const conductorPrompt = queueConfig.conductorPrompt?.trim();
+            if (conductorUrl && conductorPrompt && now - emptyQueueSince >= thresholdMs) {
+              logger.info(`队列已空满 ${queueConfig.conductorEmptyQueueMinutes ?? 30} 分钟，执行 Conductor`);
+              try {
+                await page.goto(conductorUrl, { waitUntil: "domcontentloaded" });
+                await sleep(500);
+                const img = page.locator(AI_FACE_IMG).first();
+                await img.waitFor({ state: "visible", timeout: AI_FACE_VISIBLE_TIMEOUT_MS });
+                await img.locator("xpath=..").click();
+                await sleep(MODAL_WAIT_MS);
+                await dismissPersonalizeDialogIfPresent(page);
+                const ok = await tryTypeAndSend(
+                  page,
+                  conductorPrompt,
+                  schedule.maxRetries,
+                  schedule.autoClickDuringOutputWait ?? [],
+                  waitSubmitReadyMs,
+                );
+                if (ok) logger.info("Conductor 执行完成");
+                else logger.warn("Conductor 发送失败");
+              } catch (e) {
+                logger.warn("Conductor 执行失败", e);
+              }
+              emptyQueueSince = null;
+              logger.info("等待 5 分钟后继续抓取队列…");
+              await sleep(CONDUCTOR_POST_WAIT_MS);
+              continue;
+            }
             logger.info("队列暂无待执行任务，60 秒后重试…");
             await sleep(60_000);
             continue;
           }
+          emptyQueueSince = null;
           logger.info(`队列任务: ${task.actionName.slice(0, 40)}… → ${task.fileUrl.slice(0, 50)}…`);
           try {
             await page.goto(task.fileUrl, { waitUntil: "domcontentloaded" });
@@ -250,7 +288,7 @@ async function main(): Promise<void> {
             await sleep(intervalMs);
             continue;
           }
-          const prompt = "@" + (task.actionName || "").trim();
+          const prompt = "help me run @" + (task.actionName || "").trim();
           const ok = await tryTypeAndSend(
             page,
             prompt,
@@ -521,6 +559,10 @@ async function typeAndSend(
   const selectAll = process.platform === "darwin" ? "Meta+a" : "Control+a";
   await page.keyboard.press(selectAll);
   await page.keyboard.type(text, { delay: 30 });
+  // Notion AI 输入框对候选/文件选择有内部机制：先按一次 Enter 触发选中，再点击发送。
+  await sleep(1000);
+  await page.keyboard.press("Enter");
+  await sleep(50);
   const send = page.locator(SEND_BUTTON).first();
   await send.waitFor({ state: "visible" });
   await send.click();

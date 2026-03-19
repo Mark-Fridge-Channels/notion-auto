@@ -63,15 +63,25 @@ function findPropertyIdByName(
 /** Status 列在 Notion 中的类型：Select（单选下拉）或 Status（看板状态列），API 的 filter/update 格式不同 */
 export type StatusColumnType = "select" | "status";
 
+/** 解析结果：batchPhaseId 为空表示未配置或列不存在，不启用批次排序 */
+interface ResolvedPropertyIds {
+  actionNameId: string;
+  fileUrlId: string;
+  statusId: string;
+  statusColumnType: StatusColumnType;
+  /** Batch Phase 列 id（Number）；空表示不按批次排序 */
+  batchPhaseId: string | null;
+}
+
 /**
  * 从 data source schema 解析出 Action Name / File URL / Status 的 property id，以及 Status 列的类型。
- * Notion 中 Status 列可能是 type=select 或 type=status，查询与更新时需使用对应格式。
+ * 若配置了 columnBatchPhase 且数据源中存在该列，则返回 batchPhaseId，用于按批次排序（有值优先、升序，无值排最后）。
  */
 async function resolvePropertyIds(
   client: Client,
   dataSourceId: string,
   config: NotionQueueConfig,
-): Promise<{ actionNameId: string; fileUrlId: string; statusId: string; statusColumnType: StatusColumnType }> {
+): Promise<ResolvedPropertyIds> {
   const ds = await client.dataSources.retrieve({ data_source_id: dataSourceId });
   const properties = ("properties" in ds && ds.properties) || {};
   const actionNameId = findPropertyIdByName(properties, config.columnActionName);
@@ -89,7 +99,15 @@ async function resolvePropertyIds(
   const statusProp = properties[statusId] as { type?: string } | undefined;
   const statusColumnType: StatusColumnType =
     statusProp?.type === "status" ? "status" : "select";
-  return { actionNameId, fileUrlId, statusId, statusColumnType };
+  const columnBatchPhase = (config.columnBatchPhase ?? "").trim();
+  let batchPhaseId: string | null = null;
+  if (columnBatchPhase) {
+    batchPhaseId = findPropertyIdByName(properties, columnBatchPhase);
+    if (!batchPhaseId) {
+      logger.warn(`未找到列「${columnBatchPhase}」，队列将按创建时间排序`);
+    }
+  }
+  return { actionNameId, fileUrlId, statusId, statusColumnType, batchPhaseId };
 }
 
 /**
@@ -119,7 +137,51 @@ function getUrl(pageProps: Record<string, unknown>, propId: string): string {
 }
 
 /**
+ * 从 page 的 properties 中读取 number（Batch Phase 列）；空或非数字返回 null。
+ */
+function getNumber(pageProps: Record<string, unknown>, propId: string): number | null {
+  const prop = pageProps[propId];
+  if (prop == null || typeof prop !== "object") return null;
+  const p = prop as Record<string, unknown>;
+  if (p.type !== "number") return null;
+  const v = p.number;
+  if (v == null) return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** 单条候选任务：用于本地按 batch_phase + created_time 排序后取第一条 */
+interface QueuedCandidate {
+  pageId: string;
+  properties: Record<string, unknown>;
+  createdTime: string;
+  batchPhase: number | null;
+}
+
+/**
+ * 按约定排序：有 batch_phase 的优先且按值升序，同 phase 内按 created_time 升序；无 batch_phase 的排最后、按 created_time 升序。
+ */
+function compareCandidates(a: QueuedCandidate, b: QueuedCandidate): number {
+  const aHas = a.batchPhase !== null;
+  const bHas = b.batchPhase !== null;
+  if (aHas && !bHas) return -1;
+  if (!aHas && bHas) return 1;
+  if (aHas && bHas) {
+    if (a.batchPhase! !== b.batchPhase!) return a.batchPhase! - b.batchPhase!;
+  }
+  return a.createdTime.localeCompare(b.createdTime);
+}
+
+/** 拉取候选任务时每页条数；用于本地按 batch_phase + created_time 排序后取第一条 */
+const QUEUE_FETCH_PAGE_SIZE = 50;
+
+/** 缺失 created_time 时的兜底值，保证在排序中排到最后 */
+const FALLBACK_CREATED_TIME = "9999-12-31T23:59:59.999Z";
+
+/**
  * 拉取一条 Status = config.statusQueued 的任务；无则返回 null。
+ * 若配置了 columnBatchPhase 且数据源存在该列：先取一批候选（按 created_time 升序），再按「有 batch_phase 优先、batch_phase 升序、created_time 升序」本地排序后取第一条；无 batch_phase 的记录排最后。
+ * 未配置或列不存在时，仅按 created_time 升序取第一条（与原有行为一致）。
  */
 export async function fetchOneQueuedTask(
   config: NotionQueueConfig,
@@ -131,36 +193,87 @@ export async function fetchOneQueuedTask(
   const client = new Client({ auth: NOTION_API_KEY });
   try {
     const dataSourceId = await getDataSourceId(client, config.databaseUrl);
-    const { actionNameId, fileUrlId, statusId, statusColumnType } = await resolvePropertyIds(
-      client,
-      dataSourceId,
-      config,
-    );
+    const { actionNameId, fileUrlId, statusId, statusColumnType, batchPhaseId } =
+      await resolvePropertyIds(client, dataSourceId, config);
     const statusFilter =
       statusColumnType === "status"
         ? { property: statusId, status: { equals: config.statusQueued } }
         : { property: statusId, select: { equals: config.statusQueued } };
-    // 按创建时间正序，保证先插入的任务先执行；created_time 为 Notion 内置元数据，无需在库中添加「创建时间」列
+
+    const pageSize = batchPhaseId ? QUEUE_FETCH_PAGE_SIZE : 1;
     const response = await client.dataSources.query({
       data_source_id: dataSourceId,
       filter: statusFilter,
       sorts: [{ timestamp: "created_time", direction: "ascending" }],
-      page_size: 1,
+      page_size: pageSize,
       result_type: "page",
     });
     const results = response.results ?? [];
     if (results.length === 0) return null;
-    const page = results[0];
-    if (!page || !("id" in page)) return null;
-    const pageId = page.id;
-    let properties: Record<string, unknown> =
-      "properties" in page ? (page.properties as Record<string, unknown>) : {};
+
+    let chosenPage: { id: string; properties: Record<string, unknown> } | null = null;
+    if (batchPhaseId && results.length > 0) {
+      const candidates: QueuedCandidate[] = [];
+      for (const page of results) {
+        if (!page || !("id" in page)) continue;
+        const props =
+          "properties" in page ? (page.properties as Record<string, unknown>) : {};
+        const createdTime =
+          "created_time" in page && typeof (page as { created_time?: string }).created_time === "string"
+            ? (page as { created_time: string }).created_time
+            : FALLBACK_CREATED_TIME;
+        const batchPhase = getNumber(props, batchPhaseId);
+        candidates.push({
+          pageId: page.id,
+          properties: props,
+          createdTime,
+          batchPhase,
+        });
+      }
+      candidates.sort(compareCandidates);
+      // 按排序顺序取第一条 File URL 非空的候选，避免首条无 URL 时队列卡死
+      for (const c of candidates) {
+        let props = c.properties;
+        if (Object.keys(props).length === 0) {
+          const fullPage = await client.pages.retrieve({ page_id: c.pageId });
+          props =
+            "properties" in fullPage
+              ? (fullPage.properties as Record<string, unknown>)
+              : {};
+        }
+        if (getUrl(props, fileUrlId).trim()) {
+          chosenPage = { id: c.pageId, properties: props };
+          break;
+        }
+        logger.warn(`队列任务 ${c.pageId} 的 File URL 为空，跳过`);
+      }
+    } else {
+      const page = results[0];
+      if (page && "id" in page) {
+        let props: Record<string, unknown> =
+          "properties" in page ? (page.properties as Record<string, unknown>) : {};
+        if (Object.keys(props).length === 0) {
+          const fullPage = await client.pages.retrieve({ page_id: page.id });
+          props =
+            "properties" in fullPage
+              ? (fullPage.properties as Record<string, unknown>)
+              : {};
+        }
+        chosenPage = { id: page.id, properties: props };
+      }
+    }
+
+    if (!chosenPage) return null;
+    const { id: pageId, properties } = chosenPage;
     if (Object.keys(properties).length === 0) {
       const fullPage = await client.pages.retrieve({ page_id: pageId });
-      properties = "properties" in fullPage ? (fullPage.properties as Record<string, unknown>) : {};
+      chosenPage.properties =
+        "properties" in fullPage
+          ? (fullPage.properties as Record<string, unknown>)
+          : {};
     }
-    const actionName = getRichTextPlain(properties, actionNameId).trim();
-    const fileUrl = getUrl(properties, fileUrlId).trim();
+    const actionName = getRichTextPlain(chosenPage.properties, actionNameId).trim();
+    const fileUrl = getUrl(chosenPage.properties, fileUrlId).trim();
     if (!fileUrl) {
       logger.warn(`队列任务 ${pageId} 的 File URL 为空，跳过`);
       return null;

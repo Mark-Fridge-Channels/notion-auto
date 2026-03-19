@@ -24,6 +24,8 @@ export interface NotionQueueConfig {
   columnFileUrl: string;
   /** 列名：Status（Select：Queued/Done/Failed） */
   columnStatus: string;
+  /** 列名：Batch Phase（Number，可选；用于排序时优先按该列升序，无值记录排最后；空串表示不启用） */
+  columnBatchPhase?: string;
   /** 待执行状态值，默认 Queued */
   statusQueued: string;
   /** 成功完成后状态值，默认 Done */
@@ -32,6 +34,12 @@ export interface NotionQueueConfig {
   statusFailed: string;
   /** 成功后：更新为 statusDone，或删除该记录 */
   onSuccess: "update" | "delete";
+  /** Conductor：队列空时触发的页面 URL（普通 Notion 页面）；与 conductorPrompt 同时配置时生效 */
+  conductorPageUrl?: string;
+  /** Conductor：打开页面后发送的文案 */
+  conductorPrompt?: string;
+  /** 空队列持续多少分钟后触发 Conductor；默认 30，仅当配置了 conductorPageUrl+conductorPrompt 时有效 */
+  conductorEmptyQueueMinutes?: number;
 }
 
 /** 行业：Notion Portal URL + 任务链 + 行业级每 N 次新会话、每 M 次换模型（区间，开新会话时随机） */
@@ -149,11 +157,25 @@ function validateNotionQueue(q: unknown): void {
     throw new Error("notionQueue.columnFileUrl 必须为非空字符串");
   if (typeof o.columnStatus !== "string" || !o.columnStatus.trim())
     throw new Error("notionQueue.columnStatus 必须为非空字符串");
+  if (o.columnBatchPhase !== undefined && o.columnBatchPhase !== null && typeof o.columnBatchPhase !== "string")
+    throw new Error("notionQueue.columnBatchPhase 必须为字符串（空串表示不启用批次排序）");
   if (typeof o.statusQueued !== "string") throw new Error("notionQueue.statusQueued 必须为字符串");
   if (typeof o.statusDone !== "string") throw new Error("notionQueue.statusDone 必须为字符串");
   if (typeof o.statusFailed !== "string") throw new Error("notionQueue.statusFailed 必须为字符串");
   if (o.onSuccess !== "update" && o.onSuccess !== "delete")
     throw new Error("notionQueue.onSuccess 必须为 update 或 delete");
+  // Conductor：若配置了任一 Conductor 相关字段，则 URL 与发送内容必填；空队列分钟数若存在须 >= 0
+  const hasConductorUrl = typeof o.conductorPageUrl === "string" && o.conductorPageUrl.trim() !== "";
+  const hasConductorPrompt = typeof o.conductorPrompt === "string" && o.conductorPrompt.trim() !== "";
+  const hasConductorMinutes = o.conductorEmptyQueueMinutes !== undefined && o.conductorEmptyQueueMinutes !== null;
+  if (hasConductorUrl || hasConductorPrompt || hasConductorMinutes) {
+    if (!hasConductorUrl) throw new Error("notionQueue 已配置 Conductor 相关项，conductorPageUrl 必填");
+    if (!hasConductorPrompt) throw new Error("notionQueue 已配置 Conductor 相关项，conductorPrompt 必填");
+    if (hasConductorMinutes) {
+      const min = Number(o.conductorEmptyQueueMinutes);
+      if (!Number.isFinite(min) || min < 0) throw new Error("notionQueue.conductorEmptyQueueMinutes 必须为非负数");
+    }
+  }
 }
 
 function validateIndustry(ind: unknown, index: number): asserts ind is ScheduleIndustry {
@@ -342,17 +364,33 @@ export function mergeSchedule(partial: unknown): Schedule {
   return out;
 }
 
+/** 默认空队列触发 Conductor 的分钟数（仅当配置了 Conductor 且未填该字段时使用） */
+const DEFAULT_CONDUCTOR_EMPTY_QUEUE_MINUTES = 30;
+
 /** 归一化 notionQueue 配置，补默认值 */
 function normalizeNotionQueue(o: Record<string, unknown>): NotionQueueConfig {
+  const conductorPageUrl = typeof o.conductorPageUrl === "string" ? o.conductorPageUrl.trim() : undefined;
+  const conductorPrompt = typeof o.conductorPrompt === "string" ? o.conductorPrompt.trim() : undefined;
+  const rawMinutes = o.conductorEmptyQueueMinutes;
+  const conductorEmptyQueueMinutes =
+    rawMinutes !== undefined && rawMinutes !== null && Number.isFinite(Number(rawMinutes)) && Number(rawMinutes) >= 0
+      ? Number(rawMinutes)
+      : conductorPageUrl && conductorPrompt
+        ? DEFAULT_CONDUCTOR_EMPTY_QUEUE_MINUTES
+        : undefined;
   return {
     databaseUrl: typeof o.databaseUrl === "string" ? o.databaseUrl.trim() : "",
     columnActionName: typeof o.columnActionName === "string" ? o.columnActionName.trim() : "Action Name",
     columnFileUrl: typeof o.columnFileUrl === "string" ? o.columnFileUrl.trim() : "File URL",
     columnStatus: typeof o.columnStatus === "string" ? o.columnStatus.trim() : "Status",
+    columnBatchPhase: typeof o.columnBatchPhase === "string" ? o.columnBatchPhase.trim() : "batch_phase",
     statusQueued: typeof o.statusQueued === "string" ? o.statusQueued : "Queued",
     statusDone: typeof o.statusDone === "string" ? o.statusDone : "Done",
     statusFailed: typeof o.statusFailed === "string" ? o.statusFailed : "Failed",
     onSuccess: o.onSuccess === "delete" ? "delete" : "update",
+    ...(conductorPageUrl && conductorPrompt
+      ? { conductorPageUrl, conductorPrompt, conductorEmptyQueueMinutes }
+      : {}),
   };
 }
 
