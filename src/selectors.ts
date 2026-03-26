@@ -17,7 +17,7 @@ export const SEND_BUTTON = '[data-testid="agent-send-message-button"]';
 export const WAIT_SUBMIT_READY_MS = 300_000;
 
 /** 新建对话按钮 */
-export const NEW_CHAT_BUTTON = '[aria-label="New AI chat"]';
+export const NEW_CHAT_BUTTON = '[aria-label="Start new chat"]';
 
 /** 弹窗出现后额外等待（毫秒） */
 export const MODAL_WAIT_MS = 1000;

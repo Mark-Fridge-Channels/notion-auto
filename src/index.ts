@@ -226,10 +226,33 @@ async function main(): Promise<void> {
         for (;;) {
           const industryNow = getIndustryForNow(schedule);
           if (industryNow == null || industryNow.id !== currentIndustry.id) {
-            logger.info("队列模式：已离开当前时段，停止取新任务");
+            logger.info("队列模式：已到点/已离开当前时段或行业已切换，停止拉取新任务");
             break;
           }
-          const task = await fetchOneQueuedTask(queueConfig);
+          const queueFetch = await fetchOneQueuedTask(queueConfig);
+          const task = queueFetch.task;
+          if (!queueFetch.listQueryOk) {
+            logger.warn(
+              `队列模式：未成功拿到任务列表 — ${queueFetch.errorMessage ?? "未知错误"}（请检查 NOTION_API_KEY、数据库 URL、列名及 Integration 权限）`,
+            );
+          } else {
+            const moreHint = queueFetch.hasMoreQueued ? "；本页之后也未拉取，数据库可能还有更多匹配页" : "";
+            if (task) {
+              logger.info(
+                `队列模式：任务列表拉取成功，Status「${queueConfig.statusQueued}」本批共 ${queueFetch.matchedCount} 条${moreHint}，已选取 1 条执行`,
+              );
+            } else {
+              const explain =
+                queueFetch.noTaskReason === "empty_queue"
+                  ? `当前待执行 0 条（空队列）`
+                  : queueFetch.noTaskReason === "no_valid_candidate"
+                    ? `本批 ${queueFetch.matchedCount} 条均无有效 File URL，无法选取`
+                    : queueFetch.noTaskReason === "missing_file_url"
+                      ? `本批有 ${queueFetch.matchedCount} 条，但选中记录的 File URL 为空`
+                      : "未选取到可执行任务";
+              logger.info(`队列模式：任务列表拉取成功，${explain}${moreHint}`);
+            }
+          }
           if (!task) {
             const now = Date.now();
             if (emptyQueueSince == null) emptyQueueSince = now;

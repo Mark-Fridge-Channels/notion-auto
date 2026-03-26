@@ -178,17 +178,46 @@ const QUEUE_FETCH_PAGE_SIZE = 50;
 /** 缺失 created_time 时的兜底值，保证在排序中排到最后 */
 const FALLBACK_CREATED_TIME = "9999-12-31T23:59:59.999Z";
 
+/** 未取到可执行任务时的原因（列表已成功拉取时才有意义） */
+export type QueuedTaskNoneReason =
+  | "empty_queue"
+  | "no_valid_candidate"
+  | "missing_file_url";
+
+/** 拉取队列任务的结果：含任务与列表诊断信息，便于主循环打日志 */
+export interface QueuedTaskFetchResult {
+  task: QueuedTask | null;
+  /** 是否成功向 Notion 发起并完成本次列表查询（false 表示 API/配置异常，未拿到可靠条数） */
+  listQueryOk: boolean;
+  /** listQueryOk 为 true：API 返回的本批 Status=Queued 的页面数 */
+  matchedCount: number;
+  /** listQueryOk 且存在下一页时：数据库中可能还有更多匹配页 */
+  hasMoreQueued?: boolean;
+  /** listQueryOk 为 false 时的错误说明 */
+  errorMessage?: string;
+  /** task 为 null 且 listQueryOk 为 true 时的原因 */
+  noTaskReason?: QueuedTaskNoneReason;
+}
+
+function errorText(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
 /**
- * 拉取一条 Status = config.statusQueued 的任务；无则返回 null。
+ * 拉取一条 Status = config.statusQueued 的任务；无则 `task` 为 null，详见 `listQueryOk` / `noTaskReason` / `errorMessage`。
  * 若配置了 columnBatchPhase 且数据源存在该列：先取一批候选（按 created_time 升序），再按「有 batch_phase 优先、batch_phase 升序、created_time 升序」本地排序后取第一条；无 batch_phase 的记录排最后。
  * 未配置或列不存在时，仅按 created_time 升序取第一条（与原有行为一致）。
  */
-export async function fetchOneQueuedTask(
-  config: NotionQueueConfig,
-): Promise<QueuedTask | null> {
+export async function fetchOneQueuedTask(config: NotionQueueConfig): Promise<QueuedTaskFetchResult> {
   if (!NOTION_API_KEY?.trim()) {
-    logger.warn("未配置 NOTION_API_KEY，跳过 Notion 队列");
-    return null;
+    const msg = "未配置 NOTION_API_KEY，无法请求 Notion 队列";
+    logger.warn(msg);
+    return {
+      task: null,
+      listQueryOk: false,
+      matchedCount: 0,
+      errorMessage: msg,
+    };
   }
   const client = new Client({ auth: NOTION_API_KEY });
   try {
@@ -209,7 +238,20 @@ export async function fetchOneQueuedTask(
       result_type: "page",
     });
     const results = response.results ?? [];
-    if (results.length === 0) return null;
+    const hasMoreQueued =
+      "has_more" in response && typeof (response as { has_more?: boolean }).has_more === "boolean"
+        ? Boolean((response as { has_more: boolean }).has_more)
+        : undefined;
+
+    if (results.length === 0) {
+      return {
+        task: null,
+        listQueryOk: true,
+        matchedCount: 0,
+        hasMoreQueued,
+        noTaskReason: "empty_queue",
+      };
+    }
 
     let chosenPage: { id: string; properties: Record<string, unknown> } | null = null;
     if (batchPhaseId && results.length > 0) {
@@ -263,7 +305,15 @@ export async function fetchOneQueuedTask(
       }
     }
 
-    if (!chosenPage) return null;
+    if (!chosenPage) {
+      return {
+        task: null,
+        listQueryOk: true,
+        matchedCount: results.length,
+        hasMoreQueued,
+        noTaskReason: "no_valid_candidate",
+      };
+    }
     const { id: pageId, properties } = chosenPage;
     if (Object.keys(properties).length === 0) {
       const fullPage = await client.pages.retrieve({ page_id: pageId });
@@ -276,12 +326,29 @@ export async function fetchOneQueuedTask(
     const fileUrl = getUrl(chosenPage.properties, fileUrlId).trim();
     if (!fileUrl) {
       logger.warn(`队列任务 ${pageId} 的 File URL 为空，跳过`);
-      return null;
+      return {
+        task: null,
+        listQueryOk: true,
+        matchedCount: results.length,
+        hasMoreQueued,
+        noTaskReason: "missing_file_url",
+      };
     }
-    return { pageId, actionName, fileUrl };
+    return {
+      task: { pageId, actionName, fileUrl },
+      listQueryOk: true,
+      matchedCount: results.length,
+      hasMoreQueued,
+    };
   } catch (e) {
-    logger.warn("fetchOneQueuedTask 失败", e);
-    return null;
+    const msg = errorText(e);
+    logger.warn(`fetchOneQueuedTask 失败：${msg}`, e);
+    return {
+      task: null,
+      listQueryOk: false,
+      matchedCount: 0,
+      errorMessage: msg,
+    };
   }
 }
 
