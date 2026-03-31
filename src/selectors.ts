@@ -5,7 +5,7 @@
 export const NOTION_URL = "https://www.notion.so/Prompt-gateway-3029166fd9fd803cb5a4c41904fcf94c?t=new";
 
 /** Notion AI 头像的父 div：通过 img alt 定位后取父级 */
-export const AI_FACE_IMG = 'img[alt="Notion AI face"]';
+export const AI_FACE_IMG = '.notion-assistant-corner-origin-container div.notion-ai-button[role="button"][aria-label="ai"]';
 
 /** 弹窗内输入框：contenteditable，placeholder 含 Do anything with AI */
 export const AI_INPUT = '[data-content-editable-leaf="true"][placeholder="Do anything with AI…"]';
