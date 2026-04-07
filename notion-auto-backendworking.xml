@@ -2,11 +2,21 @@
   <id>notion-auto</id>
   <name>notion-auto</name>
   <description>notion-auto</description>
+
   <startmode>Automatic</startmode>
   <delayedAutoStart>true</delayedAutoStart>
+
+  <serviceaccount>
+    <username>.\YANzhang</username>
+    <password>你的Windows登录密码</password>
+    <allowservicelogon>true</allowservicelogon>
+  </serviceaccount>
+
   <executable>C:\Program Files\nodejs\npm.cmd</executable>
   <arguments>run dashboard</arguments>
   <workingdirectory>%BASE%</workingdirectory>
+
   <onfailure action="restart" delay="10 sec" />
   <hidewindow>true</hidewindow>
+  <stoptimeout>30 sec</stoptimeout>
 </service>
