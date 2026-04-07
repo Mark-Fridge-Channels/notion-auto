@@ -1,0 +1,12 @@
+<service>
+  <id>notion-auto</id>
+  <name>notion-auto</name>
+  <description>notion-auto</description>
+  <startmode>Automatic</startmode>
+  <delayedAutoStart>true</delayedAutoStart>
+  <executable>C:\Program Files\nodejs\npm.cmd</executable>
+  <arguments>run dashboard</arguments>
+  <workingdirectory>%BASE%</workingdirectory>
+  <onfailure action="restart" delay="10 sec" />
+  <hidewindow>true</hidewindow>
+</service>

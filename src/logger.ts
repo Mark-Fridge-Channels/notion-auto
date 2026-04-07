@@ -1,6 +1,6 @@
 /**
  * 简单 logger：进度与错误统一输出到 stderr，便于与 --help（stdout）区分；
- * 同时追加写入项目根下 log/ 目录，文件名：本地日期 + 进程号（每次进程启动一份，便于区分并行实例与多次运行）。
+ * 每条带本地时间戳（精确到毫秒）；并追加写入 log/ 目录，文件名：日期 + 进程号。
  */
 
 import { appendFileSync, mkdirSync } from "node:fs";
@@ -20,6 +20,19 @@ function localDateYmd(): string {
   return `${y}-${m}-${day}`;
 }
 
+/** 本地日期时间 + 毫秒，用于每条日志前缀 */
+function localDateTimeMs(): string {
+  const d = new Date();
+  const y = d.getFullYear();
+  const mo = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  const h = String(d.getHours()).padStart(2, "0");
+  const min = String(d.getMinutes()).padStart(2, "0");
+  const s = String(d.getSeconds()).padStart(2, "0");
+  const ms = String(d.getMilliseconds()).padStart(3, "0");
+  return `${y}-${mo}-${day} ${h}:${min}:${s}.${ms}`;
+}
+
 function appendToLogFile(line: string): void {
   if (logFileDisabled) return;
   try {
@@ -34,7 +47,8 @@ function appendToLogFile(line: string): void {
 }
 
 function log(level: string, ...args: unknown[]): void {
-  const prefix = `[notion-auto ${level}]`;
+  const ts = localDateTimeMs();
+  const prefix = `[${ts}] [notion-auto ${level}]`;
   const msg = args.length === 1 && typeof args[0] === "string"
     ? args[0]
     : args.map((a) => (typeof a === "object" ? JSON.stringify(a) : String(a))).join(" ");
