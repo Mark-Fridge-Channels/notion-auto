@@ -13,6 +13,9 @@ export const AI_INPUT = '[data-content-editable-leaf="true"][placeholder="Do any
 /** 发送按钮 */
 export const SEND_BUTTON = '[data-testid="agent-send-message-button"]';
 
+/** 统一聊天模型选择器按钮（生产环境优先使用） */
+export const UNIFIED_CHAT_MODEL_BUTTON = 'div[data-testid="unified-chat-model-button"]';
+
 /** 等待 AI 回复完成后「Submit」按钮再次出现的超时（毫秒）；与 schedule.waitSubmitReadyMs 默认 5 分钟一致，供未传参时 fallback */
 export const WAIT_SUBMIT_READY_MS = 300_000;
 

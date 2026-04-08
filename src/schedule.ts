@@ -12,6 +12,10 @@ export interface ScheduleTask {
   content: string;
   /** 该任务在本轮任务链中执行几次 */
   runCount: number;
+  /**
+   * 可选：执行前切换到该模型（展示名 normalize 后子串匹配）；指定时当轮不触发「每 M 次」轮换。
+   */
+  model?: string;
 }
 
 /** Notion 任务队列全局配置：数据库 URL、列名映射、状态值、成功后行为 */
@@ -26,6 +30,8 @@ export interface NotionQueueConfig {
   columnStatus: string;
   /** 列名：Batch Phase（Number，可选；用于排序时优先按该列升序，无值记录排最后；空串表示不启用） */
   columnBatchPhase?: string;
+  /** 列名：指定模型（Rich text，可选；留空或不配置表示不读取）；非空时当条任务按指定模型切换且当轮不触发「每 M 次」 */
+  columnModel?: string;
   /** 待执行状态值，默认 Queued */
   statusQueued: string;
   /** 成功完成后状态值，默认 Done */
@@ -99,6 +105,10 @@ export interface Schedule {
   autoClickDuringOutputWait?: string[];
   /** Notion 任务队列全局配置；使用队列的行业共用此配置 */
   notionQueue?: NotionQueueConfig;
+  /**
+   * 全局模型黑名单：与弹窗内选项展示名在 normalize 后整行相等则不参与轮换与指定匹配（须自行保证仍有可用模型）。
+   */
+  modelBlacklist?: string[];
 }
 
 const DEFAULT_STORAGE_PATH = ".notion-auth.json";
@@ -135,7 +145,22 @@ export function getDefaultSchedule(): Schedule {
         ],
       },
     ],
+    modelBlacklist: [],
   };
+}
+
+/** 归一化单个任务（保留可选 model） */
+function normalizeTask(raw: unknown): ScheduleTask {
+  const fallback: ScheduleTask = { content: "", runCount: 1 };
+  if (raw == null || typeof raw !== "object") return fallback;
+  const o = raw as Record<string, unknown>;
+  const content = typeof o.content === "string" ? o.content : "";
+  const rc = Number(o.runCount);
+  const runCount = Number.isInteger(rc) && rc >= 1 ? rc : 1;
+  const modelRaw = typeof o.model === "string" ? o.model.trim() : "";
+  const out: ScheduleTask = { content, runCount };
+  if (modelRaw) out.model = modelRaw;
+  return out;
 }
 
 function validateTask(t: unknown, index: number): asserts t is ScheduleTask {
@@ -144,6 +169,8 @@ function validateTask(t: unknown, index: number): asserts t is ScheduleTask {
   if (typeof o.content !== "string") throw new Error(`任务[${index}].content 必须为字符串`);
   const rc = Number(o.runCount);
   if (!Number.isInteger(rc) || rc < 1) throw new Error(`任务[${index}].runCount 必须为正整数`);
+  if (o.model !== undefined && o.model !== null && typeof o.model !== "string")
+    throw new Error(`任务[${index}].model 必须为字符串`);
 }
 
 function validateNotionQueue(q: unknown): void {
@@ -159,6 +186,8 @@ function validateNotionQueue(q: unknown): void {
     throw new Error("notionQueue.columnStatus 必须为非空字符串");
   if (o.columnBatchPhase !== undefined && o.columnBatchPhase !== null && typeof o.columnBatchPhase !== "string")
     throw new Error("notionQueue.columnBatchPhase 必须为字符串（空串表示不启用批次排序）");
+  if (o.columnModel !== undefined && o.columnModel !== null && typeof o.columnModel !== "string")
+    throw new Error("notionQueue.columnModel 必须为字符串");
   if (typeof o.statusQueued !== "string") throw new Error("notionQueue.statusQueued 必须为字符串");
   if (typeof o.statusDone !== "string") throw new Error("notionQueue.statusDone 必须为字符串");
   if (typeof o.statusFailed !== "string") throw new Error("notionQueue.statusFailed 必须为字符串");
@@ -246,6 +275,12 @@ export function validateSchedule(s: Schedule): void {
     });
   }
   if (s.notionQueue !== undefined) validateNotionQueue(s.notionQueue);
+  if (s.modelBlacklist !== undefined) {
+    if (!Array.isArray(s.modelBlacklist)) throw new Error("modelBlacklist 必须为字符串数组");
+    s.modelBlacklist.forEach((line, i) => {
+      if (typeof line !== "string") throw new Error(`modelBlacklist[${i}] 必须为字符串`);
+    });
+  }
 }
 
 const SCHEDULE_FILENAME = "schedule.json";
@@ -298,7 +333,7 @@ function normalizeIndustry(ind: unknown): ScheduleIndustry {
     modelSwitchIntervalMax: Number.isInteger(mMax) && mMax >= 0 ? mMax : def.modelSwitchIntervalMax,
     chainRunsPerSlot: Number.isInteger(chainRuns) && chainRuns >= 0 ? chainRuns : def.chainRunsPerSlot,
     taskSource,
-    tasks: Array.isArray(o.tasks) ? (o.tasks as ScheduleTask[]) : def.tasks,
+    tasks: Array.isArray(o.tasks) ? (o.tasks as unknown[]).map((t) => normalizeTask(t)) : def.tasks,
   };
 }
 
@@ -360,6 +395,9 @@ export function mergeSchedule(partial: unknown): Schedule {
       ? (o.autoClickDuringOutputWait as unknown[]).filter((x): x is string => typeof x === "string" && x.trim() !== "")
       : undefined,
     notionQueue: o.notionQueue != null && typeof o.notionQueue === "object" ? normalizeNotionQueue(o.notionQueue as Record<string, unknown>) : undefined,
+    modelBlacklist: Array.isArray(o.modelBlacklist)
+      ? (o.modelBlacklist as unknown[]).filter((x): x is string => typeof x === "string")
+      : def.modelBlacklist,
   };
   return out;
 }
@@ -378,12 +416,15 @@ function normalizeNotionQueue(o: Record<string, unknown>): NotionQueueConfig {
       : conductorPageUrl && conductorPrompt
         ? DEFAULT_CONDUCTOR_EMPTY_QUEUE_MINUTES
         : undefined;
+  const columnModel =
+    typeof o.columnModel === "string" && o.columnModel.trim() ? o.columnModel.trim() : undefined;
   return {
     databaseUrl: typeof o.databaseUrl === "string" ? o.databaseUrl.trim() : "",
     columnActionName: typeof o.columnActionName === "string" ? o.columnActionName.trim() : "Action Name",
     columnFileUrl: typeof o.columnFileUrl === "string" ? o.columnFileUrl.trim() : "File URL",
     columnStatus: typeof o.columnStatus === "string" ? o.columnStatus.trim() : "Status",
     columnBatchPhase: typeof o.columnBatchPhase === "string" ? o.columnBatchPhase.trim() : "batch_phase",
+    ...(columnModel ? { columnModel } : {}),
     statusQueued: typeof o.statusQueued === "string" ? o.statusQueued : "Queued",
     statusDone: typeof o.statusDone === "string" ? o.statusDone : "Done",
     statusFailed: typeof o.statusFailed === "string" ? o.statusFailed : "Failed",

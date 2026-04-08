@@ -23,7 +23,7 @@ import {
   PERSONALIZE_DIALOG,
   PERSONALIZE_DIALOG_CHECK_MS,
 } from "./selectors.js";
-import { switchToNextModel } from "./model-picker.js";
+import { readModelButtonLabel, switchModel } from "./model-picker.js";
 import { logger } from "./logger.js";
 import { saveProgress } from "./progress.js";
 import { EXIT_RECOVERY_RESTART } from "./exit-codes.js";
@@ -34,7 +34,13 @@ import {
   isQueueAvailable,
 } from "./notion-queue.js";
 import type { ScheduleIndustry } from "./schedule.js";
-import type { Browser } from "playwright";
+import type { Browser, Page } from "playwright";
+import { extractConversationPlainText } from "./conversation-extract.js";
+import {
+  appendRunLogEntry,
+  isRunLogEnabled,
+  type RunLogSendCapture,
+} from "./notion-run-log.js";
 
 /** 当前已启动的浏览器实例，供退出前关闭及 SIGTERM 处理使用；launch 后赋值，close 后置空 */
 let currentBrowser: Browser | null = null;
@@ -180,6 +186,7 @@ async function main(): Promise<void> {
     let leftCurrentSlot = false;
     /** 发送后等待可发送状态的超时（毫秒），来自 schedule，默认 5 分钟；换模型前等待也使用此时长 */
     const waitSubmitReadyMs = schedule.waitSubmitReadyMs ?? 300_000;
+    const modelSwitchOpts = { blacklist: schedule.modelBlacklist ?? [] };
 
     for (;;) {
       // 每轮任务链开始前：检查是否跨时间区间需切换行业
@@ -269,15 +276,24 @@ async function main(): Promise<void> {
                 await img.locator("xpath=..").click();
                 await sleep(MODAL_WAIT_MS);
                 await dismissPersonalizeDialogIfPresent(page);
+                if (currentM > 0 && sessionRuns > 0 && sessionRuns % currentM === 0) {
+                  await switchModel(page, undefined, modelSwitchOpts, waitSubmitReadyMs);
+                }
+                const llmModel = await readLlmModelLabel(page);
+                const conductorCapture: RunLogSendCapture = { startedAtMs: null, notionUrlAtSend: null };
                 const ok = await tryTypeAndSend(
                   page,
                   conductorPrompt,
                   schedule.maxRetries,
                   schedule.autoClickDuringOutputWait ?? [],
                   waitSubmitReadyMs,
+                  conductorCapture,
                 );
-                if (ok) logger.info("Conductor 执行完成");
-                else logger.warn("Conductor 发送失败");
+                if (ok) {
+                  logger.info("Conductor 执行完成");
+                  sessionRuns++;
+                } else logger.warn("Conductor 发送失败");
+                await flushRunLogToNotion(page, conductorCapture, conductorPrompt, ok, llmModel);
               } catch (e) {
                 logger.warn("Conductor 执行失败", e);
               }
@@ -311,23 +327,34 @@ async function main(): Promise<void> {
             await sleep(intervalMs);
             continue;
           }
+          const queueModel = task.model?.trim();
+          if (queueModel) {
+            await switchModel(page, queueModel, modelSwitchOpts, waitSubmitReadyMs);
+          } else if (currentM > 0 && sessionRuns > 0 && sessionRuns % currentM === 0) {
+            await switchModel(page, undefined, modelSwitchOpts, waitSubmitReadyMs);
+          }
+          const llmModel = await readLlmModelLabel(page);
           const prompt = "help me run @" + (task.actionName || "").trim();
+          const queueCapture: RunLogSendCapture = { startedAtMs: null, notionUrlAtSend: null };
           const ok = await tryTypeAndSend(
             page,
             prompt,
             schedule.maxRetries,
             schedule.autoClickDuringOutputWait ?? [],
             waitSubmitReadyMs,
+            queueCapture,
           );
           try {
             if (ok) {
               await markTaskDone(queueConfig, task.pageId);
+              sessionRuns++;
             } else {
               await markTaskFailed(queueConfig, task.pageId);
             }
           } catch (err) {
             logger.warn("更新队列任务状态时出错", err);
           }
+          await flushRunLogToNotion(page, queueCapture, prompt, ok, llmModel);
           const intervalMs = randomIntInclusive(schedule.intervalMinMs, schedule.intervalMaxMs);
           logger.info(`等待 ${intervalMs / 1000} 秒后取下一条…`);
           await sleep(intervalMs);
@@ -349,16 +376,36 @@ async function main(): Promise<void> {
             currentN = drawSessionN(currentIndustry);
             currentM = drawSessionM(currentIndustry);
           }
-          if (currentM > 0 && sessionRuns > 0 && sessionRuns % currentM === 0) {
-            await switchToNextModel(page, waitSubmitReadyMs);
+          const taskModel = task.model?.trim();
+          if (taskModel) {
+            await switchModel(page, taskModel, modelSwitchOpts, waitSubmitReadyMs);
+          } else if (currentM > 0 && sessionRuns > 0 && sessionRuns % currentM === 0) {
+            await switchModel(page, undefined, modelSwitchOpts, waitSubmitReadyMs);
           }
 
-          let ok = await tryTypeAndSend(page, task.content, schedule.maxRetries, schedule.autoClickDuringOutputWait ?? [], waitSubmitReadyMs);
+          let llmModel = await readLlmModelLabel(page);
+          const chainCapture: RunLogSendCapture = { startedAtMs: null, notionUrlAtSend: null };
+          let ok = await tryTypeAndSend(
+            page,
+            task.content,
+            schedule.maxRetries,
+            schedule.autoClickDuringOutputWait ?? [],
+            waitSubmitReadyMs,
+            chainCapture,
+          );
           if (!ok) {
             logger.warn("本轮流试失败，尝试 New AI chat 后重试…");
             try {
               await clickNewAIChat(page, schedule.maxRetries);
-              ok = await tryTypeAndSend(page, task.content, schedule.maxRetries, schedule.autoClickDuringOutputWait ?? [], waitSubmitReadyMs);
+              llmModel = await readLlmModelLabel(page);
+              ok = await tryTypeAndSend(
+                page,
+                task.content,
+                schedule.maxRetries,
+                schedule.autoClickDuringOutputWait ?? [],
+                waitSubmitReadyMs,
+                chainCapture,
+              );
             } catch (e) {
               logger.warn("New AI chat 失败", e);
             }
@@ -368,7 +415,15 @@ async function main(): Promise<void> {
               logger.warn(`重新打开 Notion 并重试（${r + 1}/${MAX_REOPEN_PER_ROUND}）…`);
               try {
                 await reopenNotionAndNewChat(page, currentIndustry.notionUrl, schedule.maxRetries);
-                ok = await tryTypeAndSend(page, task.content, schedule.maxRetries, schedule.autoClickDuringOutputWait ?? [], waitSubmitReadyMs);
+                llmModel = await readLlmModelLabel(page);
+                ok = await tryTypeAndSend(
+                  page,
+                  task.content,
+                  schedule.maxRetries,
+                  schedule.autoClickDuringOutputWait ?? [],
+                  waitSubmitReadyMs,
+                  chainCapture,
+                );
               } catch (e) {
                 logger.warn("reopenNotionAndNewChat 失败", e);
               }
@@ -376,6 +431,7 @@ async function main(): Promise<void> {
           }
           if (!ok) {
             logger.warn("本轮流试与恢复后仍失败，请求恢复重启");
+            await flushRunLogToNotion(page, chainCapture, task.content, false, llmModel);
             await saveProgress({ totalDone: 0, conversationRuns: 0, completed: false });
             await closeBrowserAndExit(EXIT_RECOVERY_RESTART);
           }
@@ -383,6 +439,7 @@ async function main(): Promise<void> {
           runCount++;
           sessionRuns++;
           await saveProgress({ totalDone: runCount, conversationRuns: 0, completed: false });
+          await flushRunLogToNotion(page, chainCapture, task.content, true, llmModel);
           logger.info(`行业 ${currentIndustry.id} 已执行 ${runCount} 次（任务 "${task.content.slice(0, 30)}…"）`);
 
           const intervalMs = randomIntInclusive(schedule.intervalMinMs, schedule.intervalMaxMs);
@@ -567,6 +624,7 @@ async function typeAndSend(
   text: string,
   buttonNames: string[] = [],
   timeoutMs: number,
+  sendCapture?: RunLogSendCapture,
 ): Promise<void> {
   if (process.env.NOTION_AUTO_SIMULATE_STUCK === "1") {
     throw new Error("模拟卡住（NOTION_AUTO_SIMULATE_STUCK=1）");
@@ -589,6 +647,10 @@ async function typeAndSend(
   const send = page.locator(SEND_BUTTON).first();
   await send.waitFor({ state: "visible" });
   await send.click();
+  if (sendCapture && sendCapture.startedAtMs === null) {
+    sendCapture.startedAtMs = Date.now();
+    sendCapture.notionUrlAtSend = page.url();
+  }
   try {
     await waitForSendButtonWithAutoClick(page, buttonNames, timeoutMs);
   } catch (e) {
@@ -651,16 +713,59 @@ class WaitAfterSendTimeoutError extends Error {
   }
 }
 
+/**
+ * 任务判定结束后：展开 Thought、抽取对话，将元数据与正文写入任务日志库（需 NOTION_API_KEY + NOTION_RUN_LOG_DATABASE_URL）。
+ */
+async function flushRunLogToNotion(
+  page: Page,
+  capture: RunLogSendCapture,
+  input: string,
+  success: boolean,
+  llmModel: string,
+): Promise<void> {
+  if (!isRunLogEnabled()) return;
+  let extractedBody = "";
+  try {
+    extractedBody = await extractConversationPlainText(page);
+  } catch (e) {
+    logger.warn("运行日志：抽取对话正文失败", e);
+  }
+  const finishedAtMs = Date.now();
+  try {
+    await appendRunLogEntry({
+      startedAtMs: capture.startedAtMs,
+      finishedAtMs,
+      input,
+      notionUrlAtSend: capture.notionUrlAtSend,
+      success,
+      extractedBody,
+      llmModel,
+    });
+  } catch (e) {
+    logger.warn("运行日志：写入 Notion 失败", e);
+  }
+}
+
+/** 发送前读取模型按钮展示名，失败时返回空串 */
+async function readLlmModelLabel(page: Page): Promise<string> {
+  try {
+    return (await readModelButtonLabel(page)).trim();
+  } catch {
+    return "";
+  }
+}
+
 async function tryTypeAndSend(
   page: import("playwright").Page,
   prompt: string,
   max: number,
   buttonNames: string[],
   timeoutMs: number,
+  sendCapture?: RunLogSendCapture | null,
 ): Promise<boolean> {
   for (let i = 0; i < max; i++) {
     try {
-      await typeAndSend(page, prompt, buttonNames, timeoutMs);
+      await typeAndSend(page, prompt, buttonNames, timeoutMs, sendCapture ?? undefined);
       return true;
     } catch (e) {
       if (e instanceof WaitAfterSendTimeoutError) {

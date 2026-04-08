@@ -380,6 +380,10 @@ function getDashboardHtml(): string {
       </div>
       <div id="autoClickButtonsContainer"></div>
       <button type="button" id="btnAddAutoClickButton" class="primary" style="margin-top:0.25rem">添加一项</button>
+      <div class="row" style="margin-top:0.75rem">
+        <label>全局模型黑名单 <span class="hint">每行一条；须与 Notion 模型菜单中的选项在规范化后<strong>整行完全相同</strong>才会被排除。请自行保证仍有可用模型。</span></label>
+        <textarea id="modelBlacklistLines" rows="4" placeholder="每行一个完整模型名（与菜单一致）" style="width:100%;max-width:36rem;font-family:inherit"></textarea>
+      </div>
     </div>
     <div class="card">
       <h2>时间区间 <span class="hint">左闭右开，本地时区</span></h2>
@@ -393,6 +397,7 @@ function getDashboardHtml(): string {
           <div class="row"><label>数据库 URL</label><input type="url" id="queueDatabaseUrl" placeholder="https://www.notion.so/..."></div>
           <div class="row"><label>列名：Action Name（Text）</label><input type="text" id="queueColumnActionName" placeholder="Action Name"></div>
           <div class="row"><label>列名：File URL（URL）</label><input type="text" id="queueColumnFileUrl" placeholder="File URL"></div>
+          <div class="row"><label>列名：指定模型（Rich text，可选）</label><input type="text" id="queueColumnModel" placeholder="留空=不读该列"></div>
           <div class="row"><label>成功后</label><div class="queue-radio-group"><label><input type="radio" name="queueOnSuccess" value="update" checked><span>更新为「完成后状态」</span></label><label><input type="radio" name="queueOnSuccess" value="delete"><span>删除该记录</span></label></div></div>
         </div>
         <div class="queue-col">
@@ -424,9 +429,9 @@ function getDashboardHtml(): string {
         <div class="row"><label>任务来源</label><select id="modalTaskSource"><option value="schedule">任务链（手动编辑）</option><option value="notionQueue">Notion 队列</option></select></div>
         <div class="row"><label>Notion Portal URL</label><input type="url" id="modalNotionUrl" placeholder="https://..."></div>
         <div class="row"><label>每 N 次开启新会话（区间内随机次数，每次开启新会话后更新N）</label><span><input type="number" id="modalNewChatEveryRunsMin" min="0" value="1" style="width:4rem"> ～ <input type="number" id="modalNewChatEveryRunsMax" min="0" value="1" style="width:4rem"></span></div>
-        <div class="row"><label>每 M 次换模型（区间，0=不换）</label><span><input type="number" id="modalModelSwitchIntervalMin" min="0" value="0" style="width:4rem"> ～ <input type="number" id="modalModelSwitchIntervalMax" min="0" value="0" style="width:4rem"></span></div>
+        <div class="row"><label>每 M 次换模型（区间，0=不换）<span class="hint">若本条任务或队列行<strong>指定了模型</strong>，该次执行<strong>不会</strong>触发此项（仅切到指定模型）。</span></label><span><input type="number" id="modalModelSwitchIntervalMin" min="0" value="0" style="width:4rem"> ～ <input type="number" id="modalModelSwitchIntervalMax" min="0" value="0" style="width:4rem"></span></div>
         <div class="row"><label>时段内跑几轮任务链（0=一直跑）</label><input type="number" id="modalChainRunsPerSlot" min="0" value="0" style="width:4rem" placeholder="0"></div>
-        <div class="row" id="modalTaskChainRow"><label>任务链</label><div id="modalTasksContainer"></div><button type="button" id="modalAddTask">添加任务</button></div>
+        <div class="row" id="modalTaskChainRow"><label>任务链 <span class="hint">「指定模型」填则当次只按该模型切换（子串匹配菜单名），且当次不执行「每 M 次」轮换；找不到则轮换到候选下一项。</span></label><div id="modalTasksContainer"></div><button type="button" id="modalAddTask">添加任务</button></div>
         <div class="row" id="modalQueueHintRow" style="display:none"><span class="hint">使用 Notion 队列时，任务从上方「Notion 任务队列」配置的数据库中拉取；到点只跑完当前任务即停。</span></div>
         <div class="form-actions">
           <button type="button" id="modalSave" class="primary">保存</button>
@@ -624,6 +629,7 @@ function getDashboardHtml(): string {
         tr.className = 'task-row';
         tr.innerHTML = '<textarea data-key="content" placeholder="输入内容" rows="1">' + escapeHtml(task.content || '') + '</textarea>' +
           '<input type="number" data-key="runCount" min="1" placeholder="次数" value="' + (task.runCount ?? 1) + '" style="width:4rem">' +
+          '<input type="text" data-key="model" placeholder="指定模型（可选）" value="' + escapeAttr(task.model || '') + '" style="width:7rem">' +
           '<button type="button" class="danger" data-remove-task>删</button>';
         tr.querySelector('[data-remove-task]').onclick = () => removeTaskRow(tr);
         tasksContainer.appendChild(tr);
@@ -664,7 +670,11 @@ function getDashboardHtml(): string {
         document.querySelectorAll('#modalTasksContainer .task-row').forEach(tr => {
           const content = (tr.querySelector('[data-key="content"]') && tr.querySelector('[data-key="content"]').value) || '';
           const runCount = Number(tr.querySelector('[data-key="runCount"]') && tr.querySelector('[data-key="runCount"]').value) || 1;
-          tasks.push({ content, runCount });
+          const modelRaw = (tr.querySelector('[data-key="model"]') && tr.querySelector('[data-key="model"]').value) || '';
+          const model = (modelRaw && modelRaw.trim()) || '';
+          const row = { content, runCount };
+          if (model) row.model = model;
+          tasks.push(row);
         });
       }
       ind.id = newId;
@@ -700,6 +710,8 @@ function getDashboardHtml(): string {
       document.getElementById('loginWaitSeconds').value = schedule.loginWaitMs != null ? Math.round(schedule.loginWaitMs / 1000) : 60;
       document.getElementById('waitSubmitReadyMinutes').value = schedule.waitSubmitReadyMs != null ? Math.round(schedule.waitSubmitReadyMs / 60000) : 5;
       document.getElementById('maxRetries').value = schedule.maxRetries ?? 3;
+      const blEl = document.getElementById('modelBlacklistLines');
+      if (blEl) blEl.value = (schedule.modelBlacklist || []).join('\\n');
       const names = schedule.autoClickDuringOutputWait || [];
       autoClickButtonsContainer.innerHTML = '';
       names.forEach(function (name) {
@@ -720,6 +732,8 @@ function getDashboardHtml(): string {
         document.getElementById('queueConductorPageUrl').value = q.conductorPageUrl || '';
         document.getElementById('queueConductorPrompt').value = q.conductorPrompt || '';
         document.getElementById('queueConductorEmptyMinutes').value = (q.conductorEmptyQueueMinutes !== undefined && q.conductorEmptyQueueMinutes !== null) ? String(q.conductorEmptyQueueMinutes) : '30';
+        const qcm = document.getElementById('queueColumnModel');
+        if (qcm) qcm.value = q.columnModel || '';
       } else {
         document.getElementById('queueDatabaseUrl').value = '';
         document.getElementById('queueColumnActionName').value = 'Action Name';
@@ -734,6 +748,8 @@ function getDashboardHtml(): string {
         document.getElementById('queueConductorPageUrl').value = '';
         document.getElementById('queueConductorPrompt').value = '';
         document.getElementById('queueConductorEmptyMinutes').value = '30';
+        const qcm = document.getElementById('queueColumnModel');
+        if (qcm) qcm.value = '';
       }
     }
     /** 在「自动点击按钮」列表末尾追加一行；value 为输入框初始值 */
@@ -784,6 +800,11 @@ function getDashboardHtml(): string {
         columnFileUrl: (document.getElementById('queueColumnFileUrl') && document.getElementById('queueColumnFileUrl').value) ? document.getElementById('queueColumnFileUrl').value.trim() : 'File URL',
         columnStatus: (document.getElementById('queueColumnStatus') && document.getElementById('queueColumnStatus').value) ? document.getElementById('queueColumnStatus').value.trim() : 'Status',
         columnBatchPhase: (() => { const el = document.getElementById('queueColumnBatchPhase'); const v = el && el.value; return (v != null && typeof v === 'string') ? v.trim() : 'batch_phase'; })(),
+        ...(function () {
+          const el = document.getElementById('queueColumnModel');
+          const v = el && el.value && el.value.trim();
+          return v ? { columnModel: v } : {};
+        })(),
         statusQueued: (document.getElementById('queueStatusQueued') && document.getElementById('queueStatusQueued').value) ? document.getElementById('queueStatusQueued').value : 'Queued',
         statusDone: (document.getElementById('queueStatusDone') && document.getElementById('queueStatusDone').value) ? document.getElementById('queueStatusDone').value : 'Done',
         statusFailed: (document.getElementById('queueStatusFailed') && document.getElementById('queueStatusFailed').value) ? document.getElementById('queueStatusFailed').value : 'Failed',
@@ -798,7 +819,24 @@ function getDashboardHtml(): string {
           return { conductorPageUrl: url, conductorPrompt: prompt, conductorEmptyQueueMinutes: minutes };
         })()
       } : undefined;
-      return { intervalMinMs, intervalMaxMs, loginWaitMs, waitSubmitReadyMs, maxRetries, storagePath: '.notion-auth.json', timeSlots: slots, industries, autoClickDuringOutputWait, notionQueue };
+      const modelBlacklist = (function () {
+        const el = document.getElementById('modelBlacklistLines');
+        const raw = (el && el.value) || '';
+        return raw.split(/\\r?\\n/).map(function (s) { return s.trim(); }).filter(Boolean);
+      })();
+      return {
+        intervalMinMs,
+        intervalMaxMs,
+        loginWaitMs,
+        waitSubmitReadyMs,
+        maxRetries,
+        storagePath: '.notion-auth.json',
+        timeSlots: slots,
+        industries,
+        autoClickDuringOutputWait,
+        notionQueue,
+        modelBlacklist,
+      };
     }
 
     document.getElementById('btnAddAutoClickButton').onclick = function () { appendAutoClickRow(''); };

@@ -24,6 +24,8 @@ export interface QueuedTask {
   pageId: string;
   actionName: string;
   fileUrl: string;
+  /** 来自 Rich text 列「指定模型」；有值时当轮按指定模型切换且不触发「每 M 次」 */
+  model?: string;
 }
 
 /**
@@ -71,6 +73,8 @@ interface ResolvedPropertyIds {
   statusColumnType: StatusColumnType;
   /** Batch Phase 列 id（Number）；空表示不按批次排序 */
   batchPhaseId: string | null;
+  /** 指定模型列 id（Rich text）；空表示未配置该列 */
+  modelId: string | null;
 }
 
 /**
@@ -107,7 +111,15 @@ async function resolvePropertyIds(
       logger.warn(`未找到列「${columnBatchPhase}」，队列将按创建时间排序`);
     }
   }
-  return { actionNameId, fileUrlId, statusId, statusColumnType, batchPhaseId };
+  const columnModel = (config.columnModel ?? "").trim();
+  let modelId: string | null = null;
+  if (columnModel) {
+    modelId = findPropertyIdByName(properties, columnModel);
+    if (!modelId) {
+      logger.warn(`未找到指定模型列「${columnModel}」，将忽略该列（请确认列为 Rich text 且列名一致）`);
+    }
+  }
+  return { actionNameId, fileUrlId, statusId, statusColumnType, batchPhaseId, modelId };
 }
 
 /**
@@ -222,7 +234,7 @@ export async function fetchOneQueuedTask(config: NotionQueueConfig): Promise<Que
   const client = new Client({ auth: NOTION_API_KEY });
   try {
     const dataSourceId = await getDataSourceId(client, config.databaseUrl);
-    const { actionNameId, fileUrlId, statusId, statusColumnType, batchPhaseId } =
+    const { actionNameId, fileUrlId, statusId, statusColumnType, batchPhaseId, modelId } =
       await resolvePropertyIds(client, dataSourceId, config);
     const statusFilter =
       statusColumnType === "status"
@@ -334,8 +346,12 @@ export async function fetchOneQueuedTask(config: NotionQueueConfig): Promise<Que
         noTaskReason: "missing_file_url",
       };
     }
+    const modelFromRow =
+      modelId != null ? getRichTextPlain(chosenPage.properties, modelId).trim() : "";
+    const task: QueuedTask = { pageId, actionName, fileUrl };
+    if (modelFromRow) task.model = modelFromRow;
     return {
-      task: { pageId, actionName, fileUrl },
+      task,
       listQueryOk: true,
       matchedCount: results.length,
       hasMoreQueued,
