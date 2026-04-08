@@ -670,6 +670,7 @@ async function typeAndSend(
   await sleep(INPUT_CLICK_DELAY_MS);
   const selectAll = process.platform === "darwin" ? "Meta+a" : "Control+a";
   await page.keyboard.press(selectAll);
+  await page.keyboard.press("Backspace");
   await page.keyboard.type(text, { delay: 30 });
   // Notion AI 输入框对候选/文件选择有内部机制：先按一次 Enter 触发选中，再点击发送。
   await sleep(1000);
