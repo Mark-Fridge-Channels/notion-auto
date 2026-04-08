@@ -103,6 +103,8 @@ export interface Schedule {
   industries: ScheduleIndustry[];
   /** 等待 AI 输出结束期间若出现这些按钮（role=button，name 精确匹配）则自动点击；仅填按钮名称 */
   autoClickDuringOutputWait?: string[];
+  /** 运行日志截图策略：false=仅失败截图（默认），true=成功也截图 */
+  runLogScreenshotOnSuccess?: boolean;
   /** Notion 任务队列全局配置；使用队列的行业共用此配置 */
   notionQueue?: NotionQueueConfig;
   /**
@@ -146,6 +148,7 @@ export function getDefaultSchedule(): Schedule {
       },
     ],
     modelBlacklist: [],
+    runLogScreenshotOnSuccess: false,
   };
 }
 
@@ -274,6 +277,9 @@ export function validateSchedule(s: Schedule): void {
         throw new Error(`autoClickDuringOutputWait[${i}] 必须为非空字符串`);
     });
   }
+  if (s.runLogScreenshotOnSuccess !== undefined && typeof s.runLogScreenshotOnSuccess !== "boolean") {
+    throw new Error("runLogScreenshotOnSuccess 必须为布尔值");
+  }
   if (s.notionQueue !== undefined) validateNotionQueue(s.notionQueue);
   if (s.modelBlacklist !== undefined) {
     if (!Array.isArray(s.modelBlacklist)) throw new Error("modelBlacklist 必须为字符串数组");
@@ -394,6 +400,7 @@ export function mergeSchedule(partial: unknown): Schedule {
     autoClickDuringOutputWait: Array.isArray(o.autoClickDuringOutputWait)
       ? (o.autoClickDuringOutputWait as unknown[]).filter((x): x is string => typeof x === "string" && x.trim() !== "")
       : undefined,
+    runLogScreenshotOnSuccess: o.runLogScreenshotOnSuccess === true,
     notionQueue: o.notionQueue != null && typeof o.notionQueue === "object" ? normalizeNotionQueue(o.notionQueue as Record<string, unknown>) : undefined,
     modelBlacklist: Array.isArray(o.modelBlacklist)
       ? (o.modelBlacklist as unknown[]).filter((x): x is string => typeof x === "string")

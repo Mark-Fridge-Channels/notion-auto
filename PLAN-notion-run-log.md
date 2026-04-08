@@ -17,6 +17,7 @@
 - [x] 🟩 **环境变量与列名常量**（`notion-run-log.ts`）
 - [x] 🟩 **移除 schedule / server 中的 notionRunLog**
 - [x] 🟩 **主流程：读模型 + flush 传 `llmModel`**（`model-picker` 导出 `readModelButtonLabel`）
+- [x] 🟩 **截图开关上报**：默认仅 `failed` 截图；Dashboard 勾选后成功也截图，正文末尾追加分隔文字与图片块
 
 ## 配置
 

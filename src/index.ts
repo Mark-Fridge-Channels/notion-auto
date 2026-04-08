@@ -8,6 +8,9 @@
 
 import { chromium } from "playwright";
 import { existsSync } from "node:fs";
+import { mkdir, unlink } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import {
   loadSchedule,
   getSchedulePath,
@@ -293,7 +296,14 @@ async function main(): Promise<void> {
                   logger.info("Conductor 执行完成");
                   sessionRuns++;
                 } else logger.warn("Conductor 发送失败");
-                await flushRunLogToNotion(page, conductorCapture, conductorPrompt, ok, llmModel);
+                await flushRunLogToNotion(
+                  page,
+                  conductorCapture,
+                  conductorPrompt,
+                  ok,
+                  llmModel,
+                  schedule.runLogScreenshotOnSuccess === true,
+                );
               } catch (e) {
                 logger.warn("Conductor 执行失败", e);
               }
@@ -354,7 +364,14 @@ async function main(): Promise<void> {
           } catch (err) {
             logger.warn("更新队列任务状态时出错", err);
           }
-          await flushRunLogToNotion(page, queueCapture, prompt, ok, llmModel);
+          await flushRunLogToNotion(
+            page,
+            queueCapture,
+            prompt,
+            ok,
+            llmModel,
+            schedule.runLogScreenshotOnSuccess === true,
+          );
           const intervalMs = randomIntInclusive(schedule.intervalMinMs, schedule.intervalMaxMs);
           logger.info(`等待 ${intervalMs / 1000} 秒后取下一条…`);
           await sleep(intervalMs);
@@ -431,7 +448,14 @@ async function main(): Promise<void> {
           }
           if (!ok) {
             logger.warn("本轮流试与恢复后仍失败，请求恢复重启");
-            await flushRunLogToNotion(page, chainCapture, task.content, false, llmModel);
+            await flushRunLogToNotion(
+              page,
+              chainCapture,
+              task.content,
+              false,
+              llmModel,
+              schedule.runLogScreenshotOnSuccess === true,
+            );
             await saveProgress({ totalDone: 0, conversationRuns: 0, completed: false });
             await closeBrowserAndExit(EXIT_RECOVERY_RESTART);
           }
@@ -439,7 +463,14 @@ async function main(): Promise<void> {
           runCount++;
           sessionRuns++;
           await saveProgress({ totalDone: runCount, conversationRuns: 0, completed: false });
-          await flushRunLogToNotion(page, chainCapture, task.content, true, llmModel);
+          await flushRunLogToNotion(
+            page,
+            chainCapture,
+            task.content,
+            true,
+            llmModel,
+            schedule.runLogScreenshotOnSuccess === true,
+          );
           logger.info(`行业 ${currentIndustry.id} 已执行 ${runCount} 次（任务 "${task.content.slice(0, 30)}…"）`);
 
           const intervalMs = randomIntInclusive(schedule.intervalMinMs, schedule.intervalMaxMs);
@@ -722,13 +753,18 @@ async function flushRunLogToNotion(
   input: string,
   success: boolean,
   llmModel: string,
+  screenshotOnSuccess: boolean,
 ): Promise<void> {
   if (!isRunLogEnabled()) return;
   let extractedBody = "";
+  let failureScreenshotPath: string | undefined;
   try {
     extractedBody = await extractConversationPlainText(page);
   } catch (e) {
     logger.warn("运行日志：抽取对话正文失败", e);
+  }
+  if (!success || screenshotOnSuccess) {
+    failureScreenshotPath = await captureFailureScreenshot(page);
   }
   const finishedAtMs = Date.now();
   try {
@@ -740,9 +776,31 @@ async function flushRunLogToNotion(
       success,
       extractedBody,
       llmModel,
+      failureScreenshotPath,
     });
   } catch (e) {
     logger.warn("运行日志：写入 Notion 失败", e);
+  } finally {
+    if (failureScreenshotPath) {
+      try {
+        await unlink(failureScreenshotPath);
+      } catch {
+        // 忽略临时文件清理失败，避免影响主流程
+      }
+    }
+  }
+}
+
+async function captureFailureScreenshot(page: Page): Promise<string | undefined> {
+  try {
+    const dir = join(tmpdir(), "notion-auto-fail-shots");
+    await mkdir(dir, { recursive: true });
+    const path = join(dir, `failed-${Date.now()}.png`);
+    await page.screenshot({ path, fullPage: true });
+    return path;
+  } catch (e) {
+    logger.warn("运行日志：失败截图保存失败", e);
+    return undefined;
   }
 }
 

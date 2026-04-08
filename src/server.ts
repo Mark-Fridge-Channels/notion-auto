@@ -299,7 +299,7 @@ function getDashboardHtml(): string {
     .industry-row .actions { display: flex; gap: 0.35rem; flex-shrink: 0; }
     .modal-overlay { display: none; position: fixed; inset: 0; padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); background: rgba(0,0,0,.4); z-index: 100; align-items: center; justify-content: center; overflow-y: auto; }
     .modal-overlay.visible { display: flex; }
-    .modal-box { background: #fff; border-radius: 8px; padding: 1.25rem; min-width: 280px; max-width: min(90vw, 360px); max-height: 85vh; overflow-y: auto; box-shadow: 0 4px 20px rgba(0,0,0,.15); margin: auto; }
+    .modal-box { background: #fff; border-radius: 8px; padding: 1.25rem; min-width: 280px; max-width: min(180vw, 560px); max-height: 85vh; overflow-y: auto; box-shadow: 0 4px 20px rgba(0,0,0,.15); margin: auto; }
     .modal-box h3 { margin: 0 0 1rem; font-size: 1rem; }
     .modal-box .form-actions { margin-top: 1rem; display: flex; gap: 0.5rem; flex-wrap: wrap; }
     .modal-box .form-actions button { min-height: 44px; }
@@ -376,12 +376,16 @@ function getDashboardHtml(): string {
         <input id="maxRetries" type="number" min="1" placeholder="3">
       </div>
       <div class="row">
+        <label>运行日志截图策略 <span class="hint">默认仅失败截图；勾选后成功也截图（用于联调/验收）。</span></label>
+        <label><input id="runLogScreenshotOnSuccess" type="checkbox" style="width:auto"> 成功也截图</label>
+      </div>
+      <div class="row">
         <label>等待输出期间自动点击的按钮 <span class="hint">将按列表顺序依次检测并点击出现的按钮。填写按钮上显示的文字，精确匹配。</span></label>
       </div>
       <div id="autoClickButtonsContainer"></div>
       <button type="button" id="btnAddAutoClickButton" class="primary" style="margin-top:0.25rem">添加一项</button>
       <div class="row" style="margin-top:0.75rem">
-        <label>全局模型黑名单 <span class="hint">每行一条；须与 Notion 模型菜单中的选项在规范化后<strong>整行完全相同</strong>才会被排除。请自行保证仍有可用模型。</span></label>
+        <label>全局模型黑名单 <span class="hint">每行一条；须与 Notion 模型菜单中的名称保持一致，精确匹配。请自行保证仍有可用模型。</span></label>
         <textarea id="modelBlacklistLines" rows="4" placeholder="每行一个完整模型名（与菜单一致）" style="width:100%;max-width:36rem;font-family:inherit"></textarea>
       </div>
     </div>
@@ -397,7 +401,7 @@ function getDashboardHtml(): string {
           <div class="row"><label>数据库 URL</label><input type="url" id="queueDatabaseUrl" placeholder="https://www.notion.so/..."></div>
           <div class="row"><label>列名：Action Name（Text）</label><input type="text" id="queueColumnActionName" placeholder="Action Name"></div>
           <div class="row"><label>列名：File URL（URL）</label><input type="text" id="queueColumnFileUrl" placeholder="File URL"></div>
-          <div class="row"><label>列名：指定模型（Rich text，可选）</label><input type="text" id="queueColumnModel" placeholder="留空=不读该列"></div>
+          <div class="row"><label>列名：指定模型（Text，可选）</label><input type="text" id="queueColumnModel" placeholder="留空=不读该列"></div>
           <div class="row"><label>成功后</label><div class="queue-radio-group"><label><input type="radio" name="queueOnSuccess" value="update" checked><span>更新为「完成后状态」</span></label><label><input type="radio" name="queueOnSuccess" value="delete"><span>删除该记录</span></label></div></div>
         </div>
         <div class="queue-col">
@@ -431,7 +435,8 @@ function getDashboardHtml(): string {
         <div class="row"><label>每 N 次开启新会话（区间内随机次数，每次开启新会话后更新N）</label><span><input type="number" id="modalNewChatEveryRunsMin" min="0" value="1" style="width:4rem"> ～ <input type="number" id="modalNewChatEveryRunsMax" min="0" value="1" style="width:4rem"></span></div>
         <div class="row"><label>每 M 次换模型（区间，0=不换）<span class="hint">若本条任务或队列行<strong>指定了模型</strong>，该次执行<strong>不会</strong>触发此项（仅切到指定模型）。</span></label><span><input type="number" id="modalModelSwitchIntervalMin" min="0" value="0" style="width:4rem"> ～ <input type="number" id="modalModelSwitchIntervalMax" min="0" value="0" style="width:4rem"></span></div>
         <div class="row"><label>时段内跑几轮任务链（0=一直跑）</label><input type="number" id="modalChainRunsPerSlot" min="0" value="0" style="width:4rem" placeholder="0"></div>
-        <div class="row" id="modalTaskChainRow"><label>任务链 <span class="hint">「指定模型」填则当次只按该模型切换（子串匹配菜单名），且当次不执行「每 M 次」轮换；找不到则轮换到候选下一项。</span></label><div id="modalTasksContainer"></div><button type="button" id="modalAddTask">添加任务</button></div>
+        <div class="row" id="modalTaskChainRow"><label>任务链 <span class="hint">如果手动指定了模型，那就只用你指定的这个模型，并且这一次不走“每 M 次切换一次”的自动轮换规则。
+如果你指定的模型找不到（不可用），就按候选列表切到下一个可用模型。</span></label><div id="modalTasksContainer"></div><button type="button" id="modalAddTask">添加任务</button></div>
         <div class="row" id="modalQueueHintRow" style="display:none"><span class="hint">使用 Notion 队列时，任务从上方「Notion 任务队列」配置的数据库中拉取；到点只跑完当前任务即停。</span></div>
         <div class="form-actions">
           <button type="button" id="modalSave" class="primary">保存</button>
@@ -628,8 +633,8 @@ function getDashboardHtml(): string {
         const tr = document.createElement('div');
         tr.className = 'task-row';
         tr.innerHTML = '<textarea data-key="content" placeholder="输入内容" rows="1">' + escapeHtml(task.content || '') + '</textarea>' +
-          '<input type="number" data-key="runCount" min="1" placeholder="次数" value="' + (task.runCount ?? 1) + '" style="width:4rem">' +
-          '<input type="text" data-key="model" placeholder="指定模型（可选）" value="' + escapeAttr(task.model || '') + '" style="width:7rem">' +
+          '<input type="number" data-key="runCount" min="1" placeholder="次数" value="' + (task.runCount ?? 1) + '" style="width:2rem">' +
+          '<input type="text" data-key="model" placeholder="指定模型（可选）" value="' + escapeAttr(task.model || '') + '" style="width:9rem">' +
           '<button type="button" class="danger" data-remove-task>删</button>';
         tr.querySelector('[data-remove-task]').onclick = () => removeTaskRow(tr);
         tasksContainer.appendChild(tr);
@@ -710,6 +715,8 @@ function getDashboardHtml(): string {
       document.getElementById('loginWaitSeconds').value = schedule.loginWaitMs != null ? Math.round(schedule.loginWaitMs / 1000) : 60;
       document.getElementById('waitSubmitReadyMinutes').value = schedule.waitSubmitReadyMs != null ? Math.round(schedule.waitSubmitReadyMs / 60000) : 5;
       document.getElementById('maxRetries').value = schedule.maxRetries ?? 3;
+      const runLogCapture = document.getElementById('runLogScreenshotOnSuccess');
+      if (runLogCapture) runLogCapture.checked = schedule.runLogScreenshotOnSuccess === true;
       const blEl = document.getElementById('modelBlacklistLines');
       if (blEl) blEl.value = (schedule.modelBlacklist || []).join('\\n');
       const names = schedule.autoClickDuringOutputWait || [];
@@ -772,6 +779,7 @@ function getDashboardHtml(): string {
       const waitSubmitReadyMinutes = Number(document.getElementById('waitSubmitReadyMinutes').value) || 5;
       const waitSubmitReadyMs = waitSubmitReadyMinutes * 60 * 1000;
       const maxRetries = Number(document.getElementById('maxRetries').value) || 3;
+      const runLogScreenshotOnSuccess = Boolean(document.getElementById('runLogScreenshotOnSuccess')?.checked);
       const slots = [];
       timeSlotsContainer.querySelectorAll('.slot-row').forEach(row => {
         const startHour = (Number(row.querySelector('[data-key="startHour"]')?.value) | 0);
@@ -834,6 +842,7 @@ function getDashboardHtml(): string {
         timeSlots: slots,
         industries,
         autoClickDuringOutputWait,
+        runLogScreenshotOnSuccess,
         notionQueue,
         modelBlacklist,
       };

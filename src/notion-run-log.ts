@@ -5,12 +5,14 @@
  */
 
 import "dotenv/config";
+import { readFile } from "node:fs/promises";
 import { Client, extractDatabaseId } from "@notionhq/client";
 import type { BlockObjectRequest, CreatePageParameters } from "@notionhq/client";
 import { logger } from "./logger.js";
 
 const NOTION_API_KEY = process.env.NOTION_API_KEY;
 const NOTION_RUN_LOG_DATABASE_URL = process.env.NOTION_RUN_LOG_DATABASE_URL;
+const NOTION_AUTO_OWNER = process.env.Notion_AUTO_OWNER;
 
 /** 与任务日志库 Property name 完全一致（区分大小写） */
 const COL_TITLE = "title";
@@ -20,6 +22,7 @@ const COL_INPUT = "Input Content";
 const COL_NOTION_URL = "Notion URL";
 const COL_STATUS = "Status";
 const COL_LLM_MODEL = "LLM Model";
+const COL_OWNER = "Owner";
 const STATUS_SUCCESS = "success";
 const STATUS_FAILED = "failed";
 
@@ -92,6 +95,8 @@ export interface AppendRunLogParams {
   extractedBody: string;
   /** 发送前从模型按钮读取的展示名，与当轮实际一致 */
   llmModel: string;
+  /** 本地截图文件路径；无截图时为空 */
+  failureScreenshotPath?: string;
 }
 
 /**
@@ -102,7 +107,16 @@ export async function appendRunLogEntry(params: AppendRunLogParams): Promise<voi
   const dbUrl = NOTION_RUN_LOG_DATABASE_URL?.trim();
   if (!key || !dbUrl) return;
 
-  const { startedAtMs, finishedAtMs, input, notionUrlAtSend, success, extractedBody, llmModel } = params;
+  const {
+    startedAtMs,
+    finishedAtMs,
+    input,
+    notionUrlAtSend,
+    success,
+    extractedBody,
+    llmModel,
+    failureScreenshotPath,
+  } = params;
   const databaseId = extractDatabaseId(dbUrl);
   if (!databaseId) {
     throw new Error(`无法从 NOTION_RUN_LOG_DATABASE_URL 解析 database_id: ${dbUrl}`);
@@ -134,6 +148,14 @@ export async function appendRunLogEntry(params: AppendRunLogParams): Promise<voi
     },
   };
 
+  // Owner 为 Person 列：从 .env 读取 Notion 用户 id，配置后写入对应用户。
+  const ownerId = NOTION_AUTO_OWNER?.trim();
+  if (ownerId) {
+    props[COL_OWNER] = {
+      people: [{ id: ownerId }],
+    };
+  }
+
   if (startedAtMs != null) {
     props[COL_EXECUTE_TIME] = {
       date: { start: new Date(startedAtMs).toISOString() },
@@ -156,5 +178,47 @@ export async function appendRunLogEntry(params: AppendRunLogParams): Promise<voi
     });
   }
 
+  if (failureScreenshotPath) {
+    const fileUpload = await uploadImageForNotion(client, failureScreenshotPath);
+    const tailBlocks: BlockObjectRequest[] = [
+      {
+        object: "block",
+        type: "paragraph",
+        paragraph: {
+          rich_text: [{ type: "text", text: { content: "----- [SCREENSHOT] -----" } }],
+        },
+      },
+      {
+        object: "block",
+        type: "image",
+        image: {
+          type: "file_upload",
+          file_upload: { id: fileUpload.id },
+        },
+      } as BlockObjectRequest,
+    ];
+    await client.blocks.children.append({
+      block_id: pageId,
+      children: tailBlocks,
+    });
+  }
+
   logger.info(`已写入 Notion 任务日志 ${pageId}`);
+}
+
+async function uploadImageForNotion(client: Client, localPath: string): Promise<{ id: string }> {
+  const filename = localPath.split("/").pop() || "failure.png";
+  const bytes = await readFile(localPath);
+  const blob = new Blob([bytes], { type: "image/png" });
+
+  const created = await client.fileUploads.create({
+    mode: "single_part",
+    filename,
+    content_type: "image/png",
+  });
+  const uploaded = await client.fileUploads.send({
+    file_upload_id: created.id,
+    file: { filename, data: blob },
+  });
+  return { id: uploaded.id };
 }
