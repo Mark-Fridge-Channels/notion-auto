@@ -893,12 +893,15 @@ function getDashboardHtml(): string {
       } catch (e) { showMsg(e instanceof Error ? e.message : String(e), true); }
     };
     document.getElementById('btnStop').onclick = async () => {
+      const btn = document.getElementById('btnStop');
       showMsg('');
+      btn.disabled = true;
       try {
         await api('/api/stop', { method: 'POST' });
         await refreshStatus();
         await refreshLogs();
       } catch (e) { showMsg(e instanceof Error ? e.message : String(e), true); }
+      finally { btn.disabled = false; }
     };
     document.getElementById('btnSave').onclick = async () => {
       showMsg('');

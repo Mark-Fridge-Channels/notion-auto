@@ -27,6 +27,8 @@ let runIdCounter = 0;
 let currentProcess: ChildProcess | null = null;
 let runLogs: RunLog[] = [];
 let currentRunLog: RunLog | null = null;
+/** 正在执行 stop 流程（等待子进程退出）时置为 true，避免重复 stop 写入已结束 stdin。 */
+let stopInProgress = false;
 /** 用户点击启动后为 true，点击停止后为 false；用于决定 exit 时是否自动重启 */
 let userWantsRunning = false;
 /** 连续自动重启次数，仅用户点击「启动」时归零 */
@@ -53,6 +55,7 @@ function getStatus(): RunStatus {
  */
 export function start(options: { configPath?: string }): void {
   if (currentProcess != null) return;
+  stopInProgress = false;
   userWantsRunning = true;
   consecutiveRestartCount = 0;
   emailSent = false;
@@ -116,6 +119,7 @@ function spawnChild(configPath: string, isAutoResume: boolean): void {
   function finishRun(exitCode?: number): void {
     if (currentProcess == null) return;
     currentProcess = null;
+    stopInProgress = false;
     if (currentRunLog) currentRunLog.endTime = Date.now();
     if (currentRunLog) {
       runLogs.unshift(currentRunLog);
@@ -159,13 +163,25 @@ async function maybeAutoRestart(exitCode?: number): Promise<void> {
 export function stop(): void {
   userWantsRunning = false;
   if (currentProcess == null) return;
+  if (stopInProgress) return;
+  stopInProgress = true;
 
   if (process.platform === "win32") {
     const child = currentProcess;
     const pid = child.pid;
     if (pid != null && child.stdin) {
-      child.stdin.write("stop\n");
-      child.stdin.end();
+      // 兜底监听：避免 write/end 在边界时序触发 error 冒泡导致主进程崩溃。
+      child.stdin.once("error", (err) => {
+        logger.warn("向子进程 stdin 发送 stop 时发生错误", err);
+      });
+      const writable = child.stdin.writable && !child.stdin.writableEnded && !child.stdin.destroyed;
+      if (writable) {
+        child.stdin.write("stop\n");
+        child.stdin.end();
+      } else {
+        logger.warn("子进程 stdin 不可写，改用 SIGINT 请求退出");
+        child.kill("SIGINT");
+      }
       const timeout = setTimeout(() => {
         if (currentProcess !== null && currentProcess.pid === pid) {
           logger.warn("子进程未在限定时间内退出，使用 taskkill 结束进程树");
@@ -180,10 +196,12 @@ export function stop(): void {
     } else {
       child.kill("SIGINT");
       currentProcess = null;
+      stopInProgress = false;
     }
   } else {
     currentProcess.kill("SIGTERM");
     currentProcess = null;
+    stopInProgress = false;
   }
 }
 

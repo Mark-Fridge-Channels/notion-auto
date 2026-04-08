@@ -46,6 +46,8 @@ interface MenuRow {
   /** dialog 内 menuitem 的下标 */
   dialogIndex: number;
   label: string;
+  /** 菜单项是否不可用（aria-disabled="true"） */
+  disabled: boolean;
 }
 
 /**
@@ -102,16 +104,18 @@ async function collectMenuRows(page: Page): Promise<MenuRow[]> {
   const n = await menuItems.count();
   const rows: MenuRow[] = [];
   for (let i = 0; i < n; i++) {
-    const raw = await menuItems.nth(i).innerText().catch(() => "");
+    const item = menuItems.nth(i);
+    const raw = await item.innerText().catch(() => "");
     const label = firstDisplayLine(raw);
     if (!label || label === "Auto") continue;
-    rows.push({ dialogIndex: i, label });
+    const disabled = (await item.getAttribute("aria-disabled").catch(() => null)) === "true";
+    rows.push({ dialogIndex: i, label, disabled });
   }
   return rows;
 }
 
 function buildEligible(rows: MenuRow[], blacklist: string[]): MenuRow[] {
-  return rows.filter((r) => !isBlacklisted(r.label, blacklist));
+  return rows.filter((r) => !r.disabled && !isBlacklisted(r.label, blacklist));
 }
 
 /**
@@ -139,7 +143,7 @@ export async function switchModel(
     const rows = await collectMenuRows(page);
     const eligible = buildEligible(rows, blacklist);
     if (eligible.length === 0) {
-      logger.warn("模型切换跳过：过滤 Auto/空/黑名单后无可用选项");
+      logger.warn("模型切换跳过：过滤 Auto/空/禁用项/黑名单后无可用选项");
       return;
     }
 

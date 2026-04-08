@@ -27,6 +27,7 @@ import {
   PERSONALIZE_DIALOG_CHECK_MS,
 } from "./selectors.js";
 import { readModelButtonLabel, switchModel } from "./model-picker.js";
+import type { ModelSwitchOptions } from "./model-picker.js";
 import { logger } from "./logger.js";
 import { saveProgress } from "./progress.js";
 import { EXIT_RECOVERY_RESTART } from "./exit-codes.js";
@@ -290,6 +291,7 @@ async function main(): Promise<void> {
                   schedule.maxRetries,
                   schedule.autoClickDuringOutputWait ?? [],
                   waitSubmitReadyMs,
+                  modelSwitchOpts,
                   conductorCapture,
                 );
                 if (ok) {
@@ -352,6 +354,7 @@ async function main(): Promise<void> {
             schedule.maxRetries,
             schedule.autoClickDuringOutputWait ?? [],
             waitSubmitReadyMs,
+            modelSwitchOpts,
             queueCapture,
           );
           try {
@@ -408,6 +411,7 @@ async function main(): Promise<void> {
             schedule.maxRetries,
             schedule.autoClickDuringOutputWait ?? [],
             waitSubmitReadyMs,
+            modelSwitchOpts,
             chainCapture,
           );
           if (!ok) {
@@ -421,6 +425,7 @@ async function main(): Promise<void> {
                 schedule.maxRetries,
                 schedule.autoClickDuringOutputWait ?? [],
                 waitSubmitReadyMs,
+                modelSwitchOpts,
                 chainCapture,
               );
             } catch (e) {
@@ -439,6 +444,7 @@ async function main(): Promise<void> {
                   schedule.maxRetries,
                   schedule.autoClickDuringOutputWait ?? [],
                   waitSubmitReadyMs,
+                  modelSwitchOpts,
                   chainCapture,
                 );
               } catch (e) {
@@ -678,6 +684,10 @@ async function typeAndSend(
   await sleep(50);
   const send = page.locator(SEND_BUTTON).first();
   await send.waitFor({ state: "visible" });
+  if ((await send.getAttribute("aria-disabled").catch(() => null)) === "true") {
+    const errText = await findUnavailableErrorText(page);
+    throw new SendButtonUnavailableError(errText ?? "发送按钮可见但不可用（aria-disabled=true）");
+  }
   await send.click();
   if (sendCapture && sendCapture.startedAtMs === null) {
     sendCapture.startedAtMs = Date.now();
@@ -743,6 +753,30 @@ class WaitAfterSendTimeoutError extends Error {
     super("发送后等待可发送状态超时（AI 可能仍在输出）");
     this.name = "WaitAfterSendTimeoutError";
   }
+}
+
+class SendButtonUnavailableError extends Error {
+  constructor(public readonly detail: string) {
+    super(detail);
+    this.name = "SendButtonUnavailableError";
+  }
+}
+
+async function findUnavailableErrorText(page: Page): Promise<string | null> {
+  return page.evaluate(() => {
+    const icon = document.querySelector("svg.exclamationMarkTriangleFill");
+    if (!icon) return null;
+    let box: Element | null = icon;
+    for (let i = 0; i < 8 && box; i++) {
+      box = box.parentElement;
+      if (!box) break;
+      const textDiv = Array.from(box.querySelectorAll("div")).find((el) =>
+        (el as HTMLElement).innerText?.toLowerCase().includes("temporarily unavailable"),
+      );
+      if (textDiv) return (textDiv as HTMLElement).innerText.trim();
+    }
+    return null;
+  });
 }
 
 /**
@@ -820,6 +854,7 @@ async function tryTypeAndSend(
   max: number,
   buttonNames: string[],
   timeoutMs: number,
+  modelSwitchOpts: ModelSwitchOptions,
   sendCapture?: RunLogSendCapture | null,
 ): Promise<boolean> {
   for (let i = 0; i < max; i++) {
@@ -827,6 +862,11 @@ async function tryTypeAndSend(
       await typeAndSend(page, prompt, buttonNames, timeoutMs, sendCapture ?? undefined);
       return true;
     } catch (e) {
+      if (e instanceof SendButtonUnavailableError) {
+        logger.warn(`发送按钮不可用，准备切换下一个可用模型并重试：${e.detail}`);
+        await switchModel(page, undefined, modelSwitchOpts, timeoutMs);
+        continue;
+      }
       if (e instanceof WaitAfterSendTimeoutError) {
         logger.warn("发送后等待超时，仅再等一次发送按钮出现，不再重发");
         try {
