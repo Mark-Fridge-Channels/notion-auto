@@ -602,10 +602,27 @@ function getDashboardHtml(): string {
 
     /** 当前编辑的行业在 schedule.industries 中的下标，-1 表示未打开 */
     let editingIndustryIndex = -1;
+    /** 行业编辑弹窗是否存在未保存改动（仅用于启动前拦截） */
+    let modalDirty = false;
+
+    function setModalDirty(v) {
+      modalDirty = Boolean(v);
+    }
+
+    const industryModalBox = document.querySelector('#industryModal .modal-box');
+    if (industryModalBox) {
+      const markModalDirty = () => {
+        if (editingIndustryIndex < 0) return;
+        setModalDirty(true);
+      };
+      industryModalBox.addEventListener('input', markModalDirty);
+      industryModalBox.addEventListener('change', markModalDirty);
+    }
 
     function openEditModal(indIdx) {
       if (!currentSchedule || indIdx < 0 || indIdx >= (currentSchedule.industries || []).length) return;
       editingIndustryIndex = indIdx;
+      setModalDirty(false);
       const ind = currentSchedule.industries[indIdx];
       document.getElementById('industryModalTitle').textContent = ind.id ? ('编辑行业: ' + ind.id) : '新建行业';
       document.getElementById('modalIndustryId').value = ind.id || '';
@@ -628,6 +645,7 @@ function getDashboardHtml(): string {
         const idx = Array.from(rows).indexOf(row);
         if (idx >= 0 && ind.tasks) ind.tasks.splice(idx, 1);
         row.remove();
+        setModalDirty(true);
       }
       function appendTaskRow(task) {
         const tr = document.createElement('div');
@@ -644,6 +662,7 @@ function getDashboardHtml(): string {
         if (!ind.tasks) ind.tasks = [];
         ind.tasks.push({ content: '', runCount: 1 });
         appendTaskRow({ content: '', runCount: 1 });
+        setModalDirty(true);
       };
       document.getElementById('modalTaskSource').onchange = function() {
         const isQueue = document.getElementById('modalTaskSource').value === 'notionQueue';
@@ -654,6 +673,7 @@ function getDashboardHtml(): string {
     }
 
     function closeEditModal() {
+      setModalDirty(false);
       editingIndustryIndex = -1;
       document.getElementById('industryModal').classList.remove('visible');
     }
@@ -860,6 +880,10 @@ function getDashboardHtml(): string {
 
     document.getElementById('btnStart').onclick = async () => {
       showMsg('');
+      if (modalDirty) {
+        showMsg('检测到行业弹窗有未保存内容，请先保存或取消弹窗后再启动', true);
+        return;
+      }
       try {
         const schedule = collectSchedule();
         await api('/api/schedule', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(schedule) });
@@ -878,10 +902,19 @@ function getDashboardHtml(): string {
     };
     document.getElementById('btnSave').onclick = async () => {
       showMsg('');
+      if (modalDirty) {
+        showMsg('检测到行业弹窗有未保存内容，请先保存或取消弹窗后再保存配置', true);
+        return;
+      }
       try {
         const schedule = collectSchedule();
         await api('/api/schedule', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(schedule) });
-        showMsg('已保存', false);
+        const { status } = await api('/api/status');
+        if (status === 'running') {
+          showMsg('配置已保存，当前任务继续按旧配置执行；下次启动将使用新配置', false);
+        } else {
+          showMsg('已保存', false);
+        }
         setTimeout(() => showMsg(''), 2000);
       } catch (e) { showMsg(e instanceof Error ? e.message : String(e), true); }
     };
