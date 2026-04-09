@@ -77,9 +77,8 @@ function spawnChild(configPath: string, isAutoResume: boolean): void {
   const env = { ...process.env };
   if (isAutoResume) env.NOTION_AUTO_RESUME = "1";
 
-  // Windows 需 pipe stdin，以便 stop() 发 "stop" 让子进程先关浏览器再退出
-  const stdio: ["pipe" | "ignore", "pipe", "pipe"] =
-    process.platform === "win32" ? ["pipe", "pipe", "pipe"] : ["ignore", "pipe", "pipe"];
+  // 所有平台都启用 stdin pipe：优先发 "stop" 走子进程优雅停机（先点 stop 再关浏览器）
+  const stdio: ["pipe", "pipe", "pipe"] = ["pipe", "pipe", "pipe"];
   const opts: Parameters<typeof spawn>[2] = {
     cwd: process.cwd(),
     stdio,
@@ -117,7 +116,8 @@ function spawnChild(configPath: string, isAutoResume: boolean): void {
   });
 
   function finishRun(exitCode?: number): void {
-    if (currentProcess == null) return;
+    // 仅处理当前活跃子进程；忽略过期进程的 exit/error 事件
+    if (currentProcess !== child) return;
     currentProcess = null;
     stopInProgress = false;
     if (currentRunLog) currentRunLog.endTime = Date.now();
@@ -158,51 +158,52 @@ async function maybeAutoRestart(exitCode?: number): Promise<void> {
 
 /**
  * 停止当前脚本子进程（若有）；并标记用户不再希望运行，exit 时不再自动重启。
- * Windows：先向 stdin 发 "stop" 让子进程关浏览器再退出，超时未退则 taskkill 杀进程树（方案 2+3）。
+ * 所有平台先向 stdin 发 "stop" 触发子进程优雅停机（先点页面 stop 再关浏览器）；
+ * 超时未退再走平台兜底（Windows taskkill；非 Windows SIGTERM）。
  */
 export function stop(): void {
   userWantsRunning = false;
   if (currentProcess == null) return;
   if (stopInProgress) return;
   stopInProgress = true;
-
-  if (process.platform === "win32") {
-    const child = currentProcess;
-    const pid = child.pid;
-    if (pid != null && child.stdin) {
-      // 兜底监听：避免 write/end 在边界时序触发 error 冒泡导致主进程崩溃。
-      child.stdin.once("error", (err) => {
-        logger.warn("向子进程 stdin 发送 stop 时发生错误", err);
-      });
-      const writable = child.stdin.writable && !child.stdin.writableEnded && !child.stdin.destroyed;
-      if (writable) {
-        child.stdin.write("stop\n");
-        child.stdin.end();
+  const child = currentProcess;
+  const pid = child.pid;
+  const fallbackKill = () => {
+    if (currentProcess !== child) return;
+    if (process.platform === "win32") {
+      if (pid != null) {
+        logger.warn("子进程未在限定时间内退出，使用 taskkill 结束进程树");
+        spawn("taskkill", ["/pid", String(pid), "/f", "/t"], {
+          shell: true,
+          stdio: "ignore",
+          windowsHide: true,
+        });
       } else {
-        logger.warn("子进程 stdin 不可写，改用 SIGINT 请求退出");
         child.kill("SIGINT");
       }
-      const timeout = setTimeout(() => {
-        if (currentProcess !== null && currentProcess.pid === pid) {
-          logger.warn("子进程未在限定时间内退出，使用 taskkill 结束进程树");
-          spawn("taskkill", ["/pid", String(pid), "/f", "/t"], {
-            shell: true,
-            stdio: "ignore",
-            windowsHide: true,
-          });
-        }
-      }, STOP_GRACE_MS);
-      child.once("exit", () => clearTimeout(timeout));
-    } else {
-      child.kill("SIGINT");
-      currentProcess = null;
-      stopInProgress = false;
+      return;
     }
-  } else {
-    currentProcess.kill("SIGTERM");
-    currentProcess = null;
-    stopInProgress = false;
+    logger.warn("子进程未在限定时间内退出，改用 SIGTERM 强制结束");
+    child.kill("SIGTERM");
+  };
+
+  if (child.stdin) {
+    // 兜底监听：避免 write/end 在边界时序触发 error 冒泡导致主进程崩溃。
+    child.stdin.once("error", (err) => {
+      logger.warn("向子进程 stdin 发送 stop 时发生错误", err);
+    });
+    const writable = child.stdin.writable && !child.stdin.writableEnded && !child.stdin.destroyed;
+    if (writable) {
+      child.stdin.write("stop\n");
+      child.stdin.end();
+      const timeout = setTimeout(() => fallbackKill(), STOP_GRACE_MS);
+      child.once("exit", () => clearTimeout(timeout));
+      return;
+    }
+    logger.warn("子进程 stdin 不可写，直接走兜底信号");
   }
+
+  fallbackKill();
 }
 
 export function getRunStatus(): RunStatus {

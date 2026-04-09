@@ -120,7 +120,6 @@ function runNpmInstall(cwd: string): Promise<{ exitCode: number; stdout: string;
  * 跨平台：Windows 使用 shell + 单命令，与 dashboard-runner 一致。
  */
 function spawnNewServerAndExit(): void {
-  runner.stop();
   const env = { ...process.env, NOTION_AUTO_RESTART: "1" };
   const cwd = process.cwd();
   const opts = {
@@ -134,6 +133,15 @@ function spawnNewServerAndExit(): void {
   } else {
     spawn("npx", ["tsx", "src/server.ts"], opts);
   }
+}
+
+async function waitRunnerIdle(timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (runner.getRunStatus() === "idle") return true;
+    await new Promise<void>((resolve) => setTimeout(resolve, 100));
+  }
+  return runner.getRunStatus() === "idle";
 }
 
 async function handleRequest(
@@ -203,6 +211,13 @@ async function handleRequest(
       }
       isPullRestartInProgress = true;
       try {
+        // 先停业务子进程，确保先执行「停机前 stop 点击」再做拉取与重启
+        runner.stop();
+        const idle = await waitRunnerIdle(8_000);
+        if (!idle) {
+          sendJson(res, 200, { ok: false, error: "停止任务超时，请稍后重试" });
+          return;
+        }
         const cwd = process.cwd();
         const pullResult = await runGitPull(cwd);
         if (pullResult.exitCode !== 0) {

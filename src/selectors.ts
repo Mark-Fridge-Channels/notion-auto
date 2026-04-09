@@ -13,6 +13,9 @@ export const AI_INPUT = '[data-content-editable-leaf="true"][placeholder="Do any
 /** 发送按钮 */
 export const SEND_BUTTON = '[data-testid="agent-send-message-button"]';
 
+/** 生成中时的停止按钮（与发送按钮同一位，互斥可见） */
+export const STOP_INFERENCE_BUTTON = '[data-testid="agent-stop-inference-button"]';
+
 /** 统一聊天模型选择器按钮（生产环境优先使用） */
 export const UNIFIED_CHAT_MODEL_BUTTON = 'div[data-testid="unified-chat-model-button"]';
 

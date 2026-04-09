@@ -107,7 +107,7 @@ async function collectMenuRows(page: Page): Promise<MenuRow[]> {
     const item = menuItems.nth(i);
     const raw = await item.innerText().catch(() => "");
     const label = firstDisplayLine(raw);
-    if (!label || label === "Auto") continue;
+    if (!label) continue;
     const disabled = (await item.getAttribute("aria-disabled").catch(() => null)) === "true";
     rows.push({ dialogIndex: i, label, disabled });
   }

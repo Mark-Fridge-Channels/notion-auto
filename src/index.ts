@@ -21,6 +21,7 @@ import {
   AI_FACE_IMG,
   AI_INPUT,
   SEND_BUTTON,
+  STOP_INFERENCE_BUTTON,
   NEW_CHAT_BUTTON,
   MODAL_WAIT_MS,
   PERSONALIZE_DIALOG,
@@ -48,20 +49,115 @@ import {
 
 /** 当前已启动的浏览器实例，供退出前关闭及 SIGTERM 处理使用；launch 后赋值，close 后置空 */
 let currentBrowser: Browser | null = null;
+/** 当前活动页面引用，供停机前「最佳努力点击停止生成」使用。 */
+let currentPage: Page | null = null;
+/** 停机流程防重入：避免并发关闭导致“先关后判定 stop”的时序错乱。 */
+let shutdownInProgress = false;
 
 const BROWSER_CLOSE_TIMEOUT_MS = 10_000;
 
 /** 等待 Notion AI 头像可见的超时（毫秒）；打开页面/切换行业/队列任务后等 AI 入口出现 */
 const AI_FACE_VISIBLE_TIMEOUT_MS = 60_000;
 
-/** Conductor 执行后固定等待时间（毫秒），再继续抓取队列 */
+/** Conductor 执行后固定等待时间（毫秒），等待Conductor生成新任务 */
 const CONDUCTOR_POST_WAIT_MS = 5 * 60 * 1000;
+/** 停机前尝试点击「停止生成」的最大预算（毫秒）；超时立即继续，不阻塞停机/重启。 */
+const STOP_BEFORE_SHUTDOWN_BUDGET_MS = 1500;
+/** 停机前点击 stop 成功后的软等待（毫秒）；给页面留出收敛时间，但不设硬门槛。 */
+const STOP_AFTER_CLICK_SOFT_WAIT_MS = 2000;
+
+type PreShutdownStopResult =
+  | "clicked"
+  | "non_generating"
+  | "page_unavailable"
+  | "not_found"
+  | "button_disabled"
+  | "error";
+
+/**
+ * 停机前最佳努力停止当前生成：若页面可用则尝试点 stop，但总预算受限，超时或异常都直接忽略。
+ * 目的：人工停止/拉取重启时尽量优雅收尾，同时不阻塞关浏览器。
+ */
+async function bestEffortStopBeforeShutdown(): Promise<PreShutdownStopResult> {
+  const page = currentPage;
+  if (!page) {
+    logger.info("停机前页面不可用/已关闭，无法点击 stop，继续停机");
+    return "page_unavailable";
+  }
+  if (page.isClosed()) {
+    logger.info("停机前页面不可用/已关闭，无法点击 stop，继续停机");
+    return "page_unavailable";
+  }
+  const stop = page.locator(STOP_INFERENCE_BUTTON).first();
+  const send = page.locator(SEND_BUTTON).first();
+  const deadline = Date.now() + STOP_BEFORE_SHUTDOWN_BUDGET_MS;
+  logger.info(`停机前尝试点击停止生成按钮（预算 ${STOP_BEFORE_SHUTDOWN_BUDGET_MS}ms）`);
+  try {
+    // 停机路径在预算内做短轮询，减少“瞬时不可见”导致漏点 stop。
+    while (true) {
+      if (page.isClosed() || currentBrowser == null) {
+        logger.info("停机前页面不可用/已关闭，无法点击 stop，继续停机");
+        return "page_unavailable";
+      }
+      const stopVisible = await stop.isVisible().catch(() => false);
+      if (stopVisible) break;
+      // 已回到 Send，说明并非生成态，无需继续等 stop。
+      if (await send.isVisible().catch(() => false)) {
+        logger.info("停机前 send 可见，无需点击 stop（非生成态）");
+        return "non_generating";
+      }
+      const left = deadline - Date.now();
+      if (left <= 0) {
+        logger.info("停机前未检测到停止生成按钮，继续停机");
+        return "not_found";
+      }
+      await sleep(Math.min(120, left));
+    }
+    if ((await stop.getAttribute("aria-disabled").catch(() => null)) === "true") {
+      logger.info("停机前 stop 按钮不可用（aria-disabled），继续停机");
+      return "button_disabled";
+    }
+    const left = deadline - Date.now();
+    if (left <= 0) {
+      logger.info("停机前预算耗尽，继续停机");
+      return "not_found";
+    }
+    await stop.click({ timeout: Math.min(300, left) });
+    logger.info("停机前已点击 stop，继续停机");
+    return "clicked";
+  } catch (e) {
+    // 停机前清理失败不应影响退出流程
+    logger.warn("停机前点击停止生成按钮失败（忽略并继续停机）", e);
+    return "error";
+  }
+}
+
+async function softWaitAfterPreShutdownStop(result: PreShutdownStopResult): Promise<void> {
+  if (result !== "clicked") return;
+  const deadline = Date.now() + STOP_AFTER_CLICK_SOFT_WAIT_MS;
+  logger.info(`停机前 stop 点击后软等待 ${STOP_AFTER_CLICK_SOFT_WAIT_MS}ms（非硬门槛）`);
+  while (Date.now() < deadline) {
+    const page = currentPage;
+    if (!page || page.isClosed() || currentBrowser == null) {
+      return;
+    }
+    if (await page.locator(SEND_BUTTON).first().isVisible().catch(() => false)) {
+      return;
+    }
+    const left = deadline - Date.now();
+    if (left <= 0) return;
+    await sleep(Math.min(120, left));
+  }
+}
 
 /**
  * 关闭当前浏览器后退出进程；用于 process.exit 会跳过 finally 的路径（恢复重启、SIGTERM）。
  * 带超时避免 close 卡死导致进程无法退出。
  */
 async function closeBrowserAndExit(code: number): Promise<never> {
+  shutdownInProgress = true;
+  const stopResult = await bestEffortStopBeforeShutdown();
+  await softWaitAfterPreShutdownStop(stopResult);
   if (currentBrowser) {
     try {
       await Promise.race([
@@ -74,23 +170,34 @@ async function closeBrowserAndExit(code: number): Promise<never> {
       logger.warn("关闭浏览器失败或超时", e);
     }
     currentBrowser = null;
+    currentPage = null;
   }
   process.exit(code);
 }
 
 /** 关闭浏览器后退出，供 SIGTERM/SIGINT 共用；exitCode: 143=SIGTERM, 130=SIGINT */
 function handleStopSignal(exitCode: number): void {
-  if (currentBrowser) {
-    currentBrowser
-      .close()
-      .then(() => process.exit(exitCode))
-      .catch((e) => {
-        logger.warn("关闭浏览器失败", e);
-        process.exit(exitCode);
-      });
-  } else {
-    process.exit(exitCode);
-  }
+  if (shutdownInProgress) return;
+  shutdownInProgress = true;
+  void (async () => {
+    const stopResult = await bestEffortStopBeforeShutdown();
+    await softWaitAfterPreShutdownStop(stopResult);
+    if (currentBrowser) {
+      currentBrowser
+        .close()
+        .then(() => {
+          currentBrowser = null;
+          currentPage = null;
+          process.exit(exitCode);
+        })
+        .catch((e) => {
+          logger.warn("关闭浏览器失败", e);
+          process.exit(exitCode);
+        });
+    } else {
+      process.exit(exitCode);
+    }
+  })();
 }
 
 /** Dashboard 点击停止时发送 SIGTERM（Unix）或 SIGINT（Windows）；关闭浏览器后再退出 */
@@ -150,6 +257,7 @@ async function main(): Promise<void> {
   const contextOptions = existsSync(storagePath) ? { storageState: storagePath } : {};
   const context = await currentBrowser.newContext(contextOptions);
   const page = await context.newPage();
+  currentPage = page;
   page.setDefaultTimeout(30_000);
 
   if (!currentIndustry.notionUrl?.trim()) {
@@ -362,6 +470,7 @@ async function main(): Promise<void> {
               await markTaskDone(queueConfig, task.pageId);
               sessionRuns++;
             } else {
+              await clickStopInferenceIfVisible(page);
               await markTaskFailed(queueConfig, task.pageId);
             }
           } catch (err) {
@@ -463,6 +572,7 @@ async function main(): Promise<void> {
               schedule.runLogScreenshotOnSuccess === true,
             );
             await saveProgress({ totalDone: 0, conversationRuns: 0, completed: false });
+            await clickStopInferenceIfVisible(page);
             await closeBrowserAndExit(EXIT_RECOVERY_RESTART);
           }
 
@@ -683,12 +793,33 @@ async function typeAndSend(
   await page.keyboard.press("Enter");
   await sleep(50);
   const send = page.locator(SEND_BUTTON).first();
-  await send.waitFor({ state: "visible" });
-  if ((await send.getAttribute("aria-disabled").catch(() => null)) === "true") {
-    const errText = await findUnavailableErrorText(page);
-    throw new SendButtonUnavailableError(errText ?? "发送按钮可见但不可用（aria-disabled=true）");
+  const stop = page.locator(STOP_INFERENCE_BUTTON).first();
+  // Enter 后：Stop 可见表示已提交并在生成；Send 可见表示仍需点击发送（与 page 默认超时一致）
+  const enterUiDeadline = Date.now() + 30_000;
+  let submitUi: "stop" | "send" | null = null;
+  while (Date.now() < enterUiDeadline) {
+    if (await stop.isVisible().catch(() => false)) {
+      submitUi = "stop";
+      break;
+    }
+    if (await send.isVisible().catch(() => false)) {
+      submitUi = "send";
+      break;
+    }
+    await sleep(50);
   }
-  await send.click();
+  if (submitUi === null) {
+    if (await stop.isVisible().catch(() => false)) submitUi = "stop";
+    else if (await send.isVisible().catch(() => false)) submitUi = "send";
+    else throw new Error("Enter 后在超时内未出现发送或停止按钮");
+  }
+  if (submitUi === "send") {
+    if ((await send.getAttribute("aria-disabled").catch(() => null)) === "true") {
+      const errText = await findUnavailableErrorText(page);
+      throw new SendButtonUnavailableError(errText ?? "发送按钮可见但不可用（aria-disabled=true）");
+    }
+    await send.click();
+  }
   if (sendCapture && sendCapture.startedAtMs === null) {
     sendCapture.startedAtMs = Date.now();
     sendCapture.notionUrlAtSend = page.url();
@@ -703,7 +834,31 @@ async function typeAndSend(
   }
 }
 
+/**
+ * 若 AI 面板主按钮为「停止生成」，则点击以结束当前输出（与发送按钮同属主操作区，需先停再新对话/刷新/重试）。
+ * 不可见或点击失败时静默或打日志后继续，由调用方决定后续恢复逻辑。
+ */
+async function clickStopInferenceIfVisible(page: Page): Promise<void> {
+  const stop = page.locator(STOP_INFERENCE_BUTTON).first();
+  try {
+    await stop.waitFor({ state: "visible", timeout: 2_000 });
+  } catch {
+    return;
+  }
+  if ((await stop.getAttribute("aria-disabled").catch(() => null)) === "true") {
+    logger.warn("停止生成按钮可见但不可用（aria-disabled），跳过点击");
+    return;
+  }
+  try {
+    await stop.click();
+    await sleep(400);
+  } catch (e) {
+    logger.warn("点击停止生成按钮失败（将继续后续流程）", e);
+  }
+}
+
 async function clickNewAIChat(page: import("playwright").Page, maxRetries: number): Promise<void> {
+  await clickStopInferenceIfVisible(page);
   await runWithRetry(maxRetries, async () => {
     const btn = page.locator(NEW_CHAT_BUTTON).first();
     await btn.waitFor({ state: "visible" });
@@ -720,6 +875,7 @@ async function reopenNotionAndNewChat(
   if (process.env.NOTION_AUTO_SIMULATE_STUCK === "1") {
     throw new Error("模拟浏览器卡住（NOTION_AUTO_SIMULATE_STUCK=1）");
   }
+  await clickStopInferenceIfVisible(page);
   await page.reload({ waitUntil: "domcontentloaded" });
   await sleep(500);
   const img = page.locator(AI_FACE_IMG).first();
@@ -868,15 +1024,14 @@ async function tryTypeAndSend(
         continue;
       }
       if (e instanceof WaitAfterSendTimeoutError) {
-        logger.warn("发送后等待超时，仅再等一次发送按钮出现，不再重发");
-        try {
-          await page.locator(SEND_BUTTON).first().waitFor({ state: "visible", timeout: timeoutMs });
-          return true;
-        } catch {
-          return false;
-        }
+        logger.warn("发送后等待超时，尝试停止当前生成并判定本次失败");
+        await clickStopInferenceIfVisible(page);
+        return false;
       }
-      if (i < max - 1) logger.warn(`输入+发送 重试 ${i + 1}/${max}…`, e);
+      if (i < max - 1) {
+        await clickStopInferenceIfVisible(page);
+        logger.warn(`输入+发送 重试 ${i + 1}/${max}…`, e);
+      }
     }
   }
   return false;
