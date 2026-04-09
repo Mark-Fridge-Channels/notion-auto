@@ -19,8 +19,8 @@ export const STOP_INFERENCE_BUTTON = '[data-testid="agent-stop-inference-button"
 /** 统一聊天模型选择器按钮（生产环境优先使用） */
 export const UNIFIED_CHAT_MODEL_BUTTON = 'div[data-testid="unified-chat-model-button"]';
 
-/** 等待 AI 回复完成后「Submit」按钮再次出现的超时（毫秒）；与 schedule.waitSubmitReadyMs 默认 5 分钟一致，供未传参时 fallback */
-export const WAIT_SUBMIT_READY_MS = 300_000;
+/** 等待 AI 回复完成后「Submit」按钮再次出现的超时（毫秒）；与 schedule.waitSubmitReadyMs 默认 30 分钟一致，供未传参时 fallback */
+export const WAIT_SUBMIT_READY_MS = 1_800_000;
 
 /** 新建对话按钮 */
 export const NEW_CHAT_BUTTON = '[aria-label="Start new chat"]';

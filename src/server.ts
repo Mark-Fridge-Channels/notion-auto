@@ -382,15 +382,15 @@ function getDashboardHtml(): string {
         <label>如果没有登录账号，首次等待多少秒进行手动登录操作 <span class="hint">默认 60</span></label>
         <input id="loginWaitSeconds" type="number" min="0" placeholder="60">
       </div>
-      <div class="row">
-        <label>发送后等待 AI 回复完成的超时（分钟） <span class="hint">AI 回复有时较慢，调大可以多等一会儿再判定超时，避免被误判失败；换模型前也会用这个时长等待。默认 5，至少 1</span></label>
-        <input id="waitSubmitReadyMinutes" type="number" min="1" placeholder="5">
+      <div class="row" style="display:none">
+        <label>发送后等待 AI 回复完成的超时（分钟） <span class="hint">AI 回复有时较慢，调大可以多等一会儿再判定超时，避免被误判失败；换模型前也会用这个时长等待。默认 30，至少 1</span></label>
+        <input id="waitSubmitReadyMinutes" type="number" min="1" placeholder="30">
       </div>
-      <div class="row">
+      <div class="row" style="display:none">
         <label>最大重试次数 <span class="hint">打开 Notion AI、点击新建对话、输入发送等单步失败时最多尝试次数，默认 3</span></label>
         <input id="maxRetries" type="number" min="1" placeholder="3">
       </div>
-      <div class="row">
+      <div class="row" style="display:none">
         <label>运行日志截图策略 <span class="hint">默认仅失败截图；勾选后成功也截图（用于联调/验收）。</span></label>
         <label><input id="runLogScreenshotOnSuccess" type="checkbox" style="width:auto"> 成功也截图</label>
       </div>
@@ -399,7 +399,7 @@ function getDashboardHtml(): string {
       </div>
       <div id="autoClickButtonsContainer"></div>
       <button type="button" id="btnAddAutoClickButton" class="primary" style="margin-top:0.25rem">添加一项</button>
-      <div class="row" style="margin-top:0.75rem">
+      <div class="row" style="display:none;margin-top:0.75rem">
         <label>全局模型黑名单 <span class="hint">每行一条；须与 Notion 模型菜单中的名称保持一致，精确匹配。请自行保证仍有可用模型。</span></label>
         <textarea id="modelBlacklistLines" rows="4" placeholder="每行一个完整模型名（与菜单一致）" style="width:100%;max-width:36rem;font-family:inherit"></textarea>
       </div>
@@ -437,14 +437,14 @@ function getDashboardHtml(): string {
       </div>
     </div>
     <div class="card" style="grid-column: 1 / -1;">
-      <h2>行业与任务链</h2>
+      <h2>任务链</h2>
       <div id="industriesContainer" class="industry-list"></div>
-      <button type="button" id="btnAddIndustry" class="primary" style="margin-top:0.5rem">添加行业</button>
+      <button type="button" id="btnAddIndustry" class="primary" style="margin-top:0.5rem">添加任务链</button>
     </div>
     <div id="industryModal" class="modal-overlay">
       <div class="modal-box">
-        <h3 id="industryModalTitle">编辑行业</h3>
-        <div class="row"><label>行业 id（名称）</label><input type="text" id="modalIndustryId" placeholder="id"></div>
+        <h3 id="industryModalTitle">编辑任务链</h3>
+        <div class="row"><label>任务链 id（名称）</label><input type="text" id="modalIndustryId" placeholder="id"></div>
         <div class="row"><label>任务来源</label><select id="modalTaskSource"><option value="schedule">任务链（手动编辑）</option><option value="notionQueue">Notion 队列</option></select></div>
         <div class="row"><label>Notion Portal URL</label><input type="url" id="modalNotionUrl" placeholder="https://..."></div>
         <div class="row"><label>每 N 次开启新会话（区间内随机次数，每次开启新会话后更新N）</label><span><input type="number" id="modalNewChatEveryRunsMin" min="0" value="1" style="width:4rem"> ～ <input type="number" id="modalNewChatEveryRunsMax" min="0" value="1" style="width:4rem"></span></div>
@@ -550,8 +550,8 @@ function getDashboardHtml(): string {
         const row = document.createElement('div');
         row.className = 'slot-row';
         let optHtml = industryIds.length
-          ? industryIds.map(id => '<option value="' + escapeAttr(id) + '"' + (slot.industryId === id ? ' selected' : '') + '>' + escapeHtml(id) + '</option>').join('') + '<option value="' + NEW_INDUSTRY_VALUE + '">+ 新建行业</option>'
-          : '<option value="">（先添加行业）</option><option value="' + NEW_INDUSTRY_VALUE + '">+ 新建行业</option>';
+          ? industryIds.map(id => '<option value="' + escapeAttr(id) + '"' + (slot.industryId === id ? ' selected' : '') + '>' + escapeHtml(id) + '</option>').join('') + '<option value="' + NEW_INDUSTRY_VALUE + '">+ 新建任务链</option>'
+          : '<option value="">（先添加任务链）</option><option value="' + NEW_INDUSTRY_VALUE + '">+ 新建任务链</option>';
         row.innerHTML =
           '<span class="slot-time-group"><label>起</label><input type="number" min="0" max="23" data-key="startHour" placeholder="时" value="' + (slot.startHour ?? 0) + '" title="时" aria-label="起始小时">' +
           '<input type="number" min="0" max="59" data-key="startMinute" placeholder="分" value="' + (slot.startMinute ?? 0) + '" title="分" aria-label="起始分钟"></span>' +
@@ -639,7 +639,7 @@ function getDashboardHtml(): string {
       editingIndustryIndex = indIdx;
       setModalDirty(false);
       const ind = currentSchedule.industries[indIdx];
-      document.getElementById('industryModalTitle').textContent = ind.id ? ('编辑行业: ' + ind.id) : '新建行业';
+      document.getElementById('industryModalTitle').textContent = ind.id ? ('编辑任务链: ' + ind.id) : '新建任务链';
       document.getElementById('modalIndustryId').value = ind.id || '';
       const taskSource = ind.taskSource === 'notionQueue' ? 'notionQueue' : 'schedule';
       document.getElementById('modalTaskSource').value = taskSource;
@@ -666,7 +666,6 @@ function getDashboardHtml(): string {
         const tr = document.createElement('div');
         tr.className = 'task-row';
         tr.innerHTML = '<textarea data-key="content" placeholder="输入内容" rows="1">' + escapeHtml(task.content || '') + '</textarea>' +
-          '<input type="number" data-key="runCount" min="1" placeholder="次数" value="' + (task.runCount ?? 1) + '" style="width:2rem">' +
           '<input type="text" data-key="model" placeholder="指定模型（可选）" value="' + escapeAttr(task.model || '') + '" style="width:9rem">' +
           '<button type="button" class="danger" data-remove-task>删</button>';
         tr.querySelector('[data-remove-task]').onclick = () => removeTaskRow(tr);
@@ -709,10 +708,9 @@ function getDashboardHtml(): string {
       if (taskSource === 'schedule') {
         document.querySelectorAll('#modalTasksContainer .task-row').forEach(tr => {
           const content = (tr.querySelector('[data-key="content"]') && tr.querySelector('[data-key="content"]').value) || '';
-          const runCount = Number(tr.querySelector('[data-key="runCount"]') && tr.querySelector('[data-key="runCount"]').value) || 1;
           const modelRaw = (tr.querySelector('[data-key="model"]') && tr.querySelector('[data-key="model"]').value) || '';
           const model = (modelRaw && modelRaw.trim()) || '';
-          const row = { content, runCount };
+          const row = { content, runCount: 1 };
           if (model) row.model = model;
           tasks.push(row);
         });
@@ -748,7 +746,7 @@ function getDashboardHtml(): string {
       document.getElementById('intervalSecondsMin').value = schedule.intervalMinMs != null ? Math.round(schedule.intervalMinMs / 1000) : 120;
       document.getElementById('intervalSecondsMax').value = schedule.intervalMaxMs != null ? Math.round(schedule.intervalMaxMs / 1000) : 120;
       document.getElementById('loginWaitSeconds').value = schedule.loginWaitMs != null ? Math.round(schedule.loginWaitMs / 1000) : 60;
-      document.getElementById('waitSubmitReadyMinutes').value = schedule.waitSubmitReadyMs != null ? Math.round(schedule.waitSubmitReadyMs / 60000) : 5;
+      document.getElementById('waitSubmitReadyMinutes').value = schedule.waitSubmitReadyMs != null ? Math.round(schedule.waitSubmitReadyMs / 60000) : 30;
       document.getElementById('maxRetries').value = schedule.maxRetries ?? 3;
       const runLogCapture = document.getElementById('runLogScreenshotOnSuccess');
       if (runLogCapture) runLogCapture.checked = schedule.runLogScreenshotOnSuccess === true;
@@ -811,10 +809,10 @@ function getDashboardHtml(): string {
       const intervalMinMs = Math.min(secMin, secMax) * 1000;
       const intervalMaxMs = Math.max(secMin, secMax) * 1000;
       const loginWaitMs = (Number(document.getElementById('loginWaitSeconds').value) || 60) * 1000;
-      const waitSubmitReadyMinutes = Number(document.getElementById('waitSubmitReadyMinutes').value) || 5;
+      const waitSubmitReadyMinutes = 30;
       const waitSubmitReadyMs = waitSubmitReadyMinutes * 60 * 1000;
-      const maxRetries = Number(document.getElementById('maxRetries').value) || 3;
-      const runLogScreenshotOnSuccess = Boolean(document.getElementById('runLogScreenshotOnSuccess')?.checked);
+      const maxRetries = 3;
+      const runLogScreenshotOnSuccess = false;
       const slots = [];
       timeSlotsContainer.querySelectorAll('.slot-row').forEach(row => {
         const startHour = (Number(row.querySelector('[data-key="startHour"]')?.value) | 0);
@@ -862,11 +860,7 @@ function getDashboardHtml(): string {
           return { conductorPageUrl: url, conductorPrompt: prompt, conductorEmptyQueueMinutes: minutes };
         })()
       } : undefined;
-      const modelBlacklist = (function () {
-        const el = document.getElementById('modelBlacklistLines');
-        const raw = (el && el.value) || '';
-        return raw.split(/\\r?\\n/).map(function (s) { return s.trim(); }).filter(Boolean);
-      })();
+      const modelBlacklist = [];
       return {
         intervalMinMs,
         intervalMaxMs,
@@ -896,7 +890,7 @@ function getDashboardHtml(): string {
     document.getElementById('btnStart').onclick = async () => {
       showMsg('');
       if (modalDirty) {
-        showMsg('检测到行业弹窗有未保存内容，请先保存或取消弹窗后再启动', true);
+        showMsg('检测到任务链弹窗有未保存内容，请先保存或取消弹窗后再启动', true);
         return;
       }
       try {
@@ -921,7 +915,7 @@ function getDashboardHtml(): string {
     document.getElementById('btnSave').onclick = async () => {
       showMsg('');
       if (modalDirty) {
-        showMsg('检测到行业弹窗有未保存内容，请先保存或取消弹窗后再保存配置', true);
+        showMsg('检测到任务链弹窗有未保存内容，请先保存或取消弹窗后再保存配置', true);
         return;
       }
       try {

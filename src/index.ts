@@ -296,8 +296,8 @@ async function main(): Promise<void> {
     let chainRunsInSlot = 0;
     /** 是否刚因「跑满 N 轮」而离开当前时段；再次落入同一行业时重置 chainRunsInSlot */
     let leftCurrentSlot = false;
-    /** 发送后等待可发送状态的超时（毫秒），来自 schedule，默认 5 分钟；换模型前等待也使用此时长 */
-    const waitSubmitReadyMs = schedule.waitSubmitReadyMs ?? 300_000;
+    /** 发送后等待可发送状态的超时（毫秒），来自 schedule，默认 30 分钟；换模型前等待也使用此时长 */
+    const waitSubmitReadyMs = schedule.waitSubmitReadyMs ?? 1_800_000;
     const modelSwitchOpts = { blacklist: schedule.modelBlacklist ?? [] };
 
     for (;;) {

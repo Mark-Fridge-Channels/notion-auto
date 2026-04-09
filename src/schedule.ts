@@ -91,7 +91,7 @@ export interface Schedule {
   intervalMaxMs: number;
   /** 首次打开页面时的登录等待（毫秒） */
   loginWaitMs: number;
-  /** 发送后等待 AI 回复完成（可发送状态）的超时（毫秒）；换模型前等待也使用此时长。默认 5 分钟，最小 1 分钟 */
+  /** 发送后等待 AI 回复完成（可发送状态）的超时（毫秒）；换模型前等待也使用此时长。默认 30 分钟，最小 1 分钟 */
   waitSubmitReadyMs?: number;
   /** 单步最大重试次数 */
   maxRetries: number;
@@ -118,8 +118,8 @@ const DEFAULT_STORAGE_PATH = ".notion-auth.json";
 /** 发送后等待可发送状态的最小超时（毫秒，即 1 分钟） */
 const MIN_WAIT_SUBMIT_READY_MS = 60_000;
 
-/** 发送后等待可发送状态的默认超时（毫秒，即 5 分钟） */
-const DEFAULT_WAIT_SUBMIT_READY_MS = 300_000;
+/** 发送后等待可发送状态的默认超时（毫秒，即 30 分钟） */
+const DEFAULT_WAIT_SUBMIT_READY_MS = 1_800_000;
 
 /** 默认/示例配置：一个区间 + 一个行业 + 一个任务 */
 export function getDefaultSchedule(): Schedule {
