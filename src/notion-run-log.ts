@@ -12,7 +12,8 @@ import { logger } from "./logger.js";
 
 const NOTION_API_KEY = process.env.NOTION_API_KEY;
 const NOTION_RUN_LOG_DATABASE_URL = process.env.NOTION_RUN_LOG_DATABASE_URL;
-const NOTION_AUTO_OWNER = process.env.Notion_AUTO_OWNER;
+const NOTION_AUTO_EXECUTOR =
+  process.env.NOTION_AUTO_EXECUTOR ?? process.env.Notion_AUTO_EXECUTOR;
 
 /** 与任务日志库 Property name 完全一致（区分大小写） */
 const COL_TITLE = "title";
@@ -22,7 +23,7 @@ const COL_INPUT = "Input Content";
 const COL_NOTION_URL = "Notion URL";
 const COL_STATUS = "Status";
 const COL_LLM_MODEL = "LLM Model";
-const COL_OWNER = "Owner";
+const COL_EXECUTOR = "Executor";
 const STATUS_SUCCESS = "success";
 const STATUS_FAILED = "failed";
 
@@ -148,11 +149,11 @@ export async function appendRunLogEntry(params: AppendRunLogParams): Promise<voi
     },
   };
 
-  // Owner 为 Person 列：从 .env 读取 Notion 用户 id，配置后写入对应用户。
-  const ownerId = NOTION_AUTO_OWNER?.trim();
-  if (ownerId) {
-    props[COL_OWNER] = {
-      people: [{ id: ownerId }],
+  // Executor 为 Select 列：从 .env 读取选项名，配置后写入对应选项。
+  const executor = NOTION_AUTO_EXECUTOR?.trim();
+  if (executor) {
+    props[COL_EXECUTOR] = {
+      select: { name: executor },
     };
   }
 

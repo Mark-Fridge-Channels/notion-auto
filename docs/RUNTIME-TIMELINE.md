@@ -96,7 +96,7 @@ flowchart TD
 | D3 | 发送 | `tryTypeAndSend` / `typeAndSend` | **`maxRetries`**、**`autoClickDuringOutputWait`**、**`waitSubmitReadyMs`** | 🖥️ / 📄 |
 | D4 | 发送失败恢复 | New chat 再发 → 仍失败则 `reopenNotionAndNewChat` 最多 **3** 次 | **`MAX_REOPEN_PER_ROUND`** | ⚙️ 内置 |
 | D5 | 仍失败 | 先 **`flushRunLogToNotion`（success=false）**，再 **`saveProgress`**，再 **`closeBrowserAndExit(2)`** | 同 D6 的日志环境变量；**`EXIT_RECOVERY_RESTART`** | ⚙️ + 🌐；Dashboard 用 **`progress.completed`** 决定是否再 spawn |
-| D6 | 每轮发送**判定结束后**（成功或失败） | **`flushRunLogToNotion`**（`isRunLogEnabled()` 为真才写 Notion） | **`runLogScreenshotOnSuccess`**（失败必截图/上传；成功是否截图看此项）；日志库：**`NOTION_API_KEY` + `NOTION_RUN_LOG_DATABASE_URL`**；**`Notion_AUTO_OWNER`** | 🖥️ 勾选；🌐 |
+| D6 | 每轮发送**判定结束后**（成功或失败） | **`flushRunLogToNotion`**（`isRunLogEnabled()` 为真才写 Notion） | **`runLogScreenshotOnSuccess`**（失败必截图/上传；成功是否截图看此项）；日志库：**`NOTION_API_KEY` + `NOTION_RUN_LOG_DATABASE_URL`**；**`NOTION_AUTO_EXECUTOR`**（写入日志库 `Executor` 的 Select 值） | 🖥️ 勾选；🌐 |
 | D7 | 步间等待（任务链每步成功后；队列每单任务完成后） | `randomIntInclusive(intervalMinMs, intervalMaxMs)` | **`intervalMinMs` / `intervalMaxMs`**（由 Dashboard 的 **`intervalSecondsMin` / `intervalSecondsMax`** 换算，见下节） | 🖥️ / 📄 |
 
 ### 阶段 E：任务链「整轮」结束后
