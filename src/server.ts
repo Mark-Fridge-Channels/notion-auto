@@ -1,5 +1,5 @@
 /**
- * Dashboard Web 服务：端口 9000，仅 localhost；API 支持多账号。
+ * Dashboard Web 服务：端口 9000，默认 0.0.0.0（支持局域网访问）；API 支持多账号。
  * 支持同时管理多个账号（各自有独立的 config, storage, 子进程）。
  * 启动前加载 .env（dotenv），以便全局环境变量生效。
  */
@@ -11,8 +11,8 @@ import * as accountManager from "./account-manager.js";
 import { mergeSchedule } from "./schedule.js";
 import { logger } from "./logger.js";
 
-const PORT = 9000;
-const HOST = "127.0.0.1";
+const PORT = Number(process.env.PORT) || 9000;
+const HOST = process.env.HOST || "0.0.0.0";
 
 let isPullRestartInProgress = false;
 
