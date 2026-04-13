@@ -1,0 +1,12 @@
+{
+  "accounts": [
+    {
+      "id": "Mark",
+      "label": "Mark"
+    },
+    {
+      "id": "Billy",
+      "label": "Billy"
+    }
+  ]
+}

@@ -95,6 +95,8 @@ export interface Schedule {
   waitSubmitReadyMs?: number;
   /** 单步最大重试次数 */
   maxRetries: number;
+  /** 是否后台无界面运行 Playwright，默认 false */
+  headless?: boolean;
   /** 登录态保存路径（相对项目目录） */
   storagePath: string;
   /** 时间区间列表，左闭右开；至少一个 */
@@ -129,6 +131,7 @@ export function getDefaultSchedule(): Schedule {
     loginWaitMs: 60 * 1000,
     waitSubmitReadyMs: DEFAULT_WAIT_SUBMIT_READY_MS,
     maxRetries: 3,
+    headless: false,
     storagePath: DEFAULT_STORAGE_PATH,
     timeSlots: [
       { startHour: 0, startMinute: 0, endHour: 23, endMinute: 59, industryId: "default" },
@@ -394,6 +397,7 @@ export function mergeSchedule(partial: unknown): Schedule {
       return Number.isFinite(raw) ? raw : (def.waitSubmitReadyMs ?? DEFAULT_WAIT_SUBMIT_READY_MS);
     })(),
     maxRetries: Number(o.maxRetries) || def.maxRetries,
+    headless: typeof o.headless === "boolean" ? o.headless : (def.headless ?? false),
     storagePath: typeof o.storagePath === "string" ? o.storagePath : def.storagePath,
     timeSlots,
     industries: Array.isArray(o.industries) ? (o.industries as unknown[]).map(normalizeIndustry) : def.industries,

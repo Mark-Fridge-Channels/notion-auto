@@ -252,7 +252,9 @@ async function main(): Promise<void> {
   }
   logger.info(`当前行业: ${currentIndustry.id}, URL: ${currentIndustry.notionUrl}`);
 
-  currentBrowser = await chromium.launch({ headless: false });
+  const isGlobalHeadless = process.env.NOTION_AUTO_HEADLESS === "1";
+  const finalHeadless = isGlobalHeadless || (schedule.headless ?? false);
+  currentBrowser = await chromium.launch({ headless: finalHeadless });
   const storagePath = schedule.storagePath;
   const contextOptions = existsSync(storagePath) ? { storageState: storagePath } : {};
   const context = await currentBrowser.newContext(contextOptions);

@@ -3,7 +3,7 @@
  */
 
 import { readFile, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { logger } from "./logger.js";
 
 export interface Progress {
@@ -14,15 +14,18 @@ export interface Progress {
 
 const FILENAME = "progress.json";
 
-export function getProgressPath(): string {
+export function getProgressPath(configPath?: string): string {
+  if (configPath) {
+    return join(dirname(configPath), FILENAME);
+  }
   return join(process.cwd(), FILENAME);
 }
 
 /**
  * 读取 progress.json；不存在或无效则返回 null。
  */
-export async function loadProgress(): Promise<Progress | null> {
-  const path = getProgressPath();
+export async function loadProgress(configPath?: string): Promise<Progress | null> {
+  const path = getProgressPath(configPath);
   try {
     const raw = await readFile(path, "utf-8");
     const data = JSON.parse(raw) as unknown;
@@ -46,8 +49,8 @@ export async function loadProgress(): Promise<Progress | null> {
 /**
  * 写入 progress.json；失败只打日志不抛错，避免单轮保存失败中断主流程。
  */
-export async function saveProgress(p: Progress): Promise<void> {
-  const path = getProgressPath();
+export async function saveProgress(p: Progress, configPath?: string): Promise<void> {
+  const path = getProgressPath(configPath);
   try {
     await writeFile(path, JSON.stringify(p, null, 2), "utf-8");
   } catch (e) {
