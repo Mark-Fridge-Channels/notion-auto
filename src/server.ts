@@ -410,7 +410,7 @@ function getDashboardHtml(): string {
             </div>
             <div style="display:flex;gap:1rem;">
               <div class="row" style="flex:1"><label>文件URL列</label><input type="text" id="qColUrl" value="File URL"></div>
-              <div class="row" style="flex:1"><label>批次列</label><input type="text" id="qColBatch" value="batch_phase"></div>
+              <div class="row" style="flex:1"><label>排序列</label><input type="text" id="qColBatch" value="batch_phase"></div>
             </div>
             <div style="display:flex;gap:0.5rem;">
               <div class="row" style="flex:1"><label>初始态</label><input type="text" id="qStatQ" value="Queued"></div>
@@ -848,7 +848,7 @@ function getDashboardHtml(): string {
       accounts.forEach(acc => {
         if(acc.id === currentAccountId) return;
         const lbl = document.createElement('label');
-        lbl.innerHTML = '<input type="checkbox" value="' + acc.id + '" checked> ' + escapeHtml(acc.label) + ' (' + acc.id + ')';
+        lbl.innerHTML = '<input style="width:30%" type="checkbox" value="' + acc.id + '" checked> ' + escapeHtml(acc.label) + ' (' + acc.id + ')';
         list.appendChild(lbl);
       });
       document.getElementById('modalBroadcast').classList.add('visible');
