@@ -26,6 +26,9 @@ import {
   MODAL_WAIT_MS,
   PERSONALIZE_DIALOG,
   PERSONALIZE_DIALOG_CHECK_MS,
+  SURVEY_LISTBOX,
+  SURVEY_OTHER_INPUT,
+  SURVEY_CHECK_MS,
 } from "./selectors.js";
 import { readModelButtonLabel, switchModel } from "./model-picker.js";
 import type { ModelSwitchOptions } from "./model-picker.js";
@@ -768,6 +771,42 @@ async function sweepAutoClickButtons(
   }
 }
 
+/**
+ * 检测并处理 Notion AI 弹出的「What do you want to do next?」调查选项：
+ * 找到 Other 输入框 → 点击 → 输入 "Run Now" → 点击发送/Next 按钮。
+ * 若调查不可见则立即返回 false；已处理返回 true。
+ */
+async function handleSurveyIfPresent(page: import("playwright").Page): Promise<boolean> {
+  const listbox = page.locator(SURVEY_LISTBOX).first();
+  try {
+    await listbox.waitFor({ state: "visible", timeout: SURVEY_CHECK_MS });
+  } catch {
+    return false;
+  }
+  logger.info("检测到调查选项弹窗，自动选择 Other 并输入 Run Now");
+  const otherInput = page.locator(SURVEY_OTHER_INPUT).first();
+  try {
+    await otherInput.waitFor({ state: "visible", timeout: 5_000 });
+    await otherInput.click();
+    await sleep(200);
+    await page.keyboard.type("Run Now", { delay: 30 });
+    await sleep(500);
+    // 点击发送/Next 按钮（从 DOM 看，可能不带特殊 testid，而是叫 Send 或 Next 的按钮）
+    const surveyBtn = page.getByRole("button", { name: /^(Send|Next)$/i }).last();
+    if (await surveyBtn.isVisible().catch(() => false)) {
+      await surveyBtn.click();
+    } else {
+      // 备用方案：按下回车提交
+      await page.keyboard.press("Enter");
+    }
+    logger.info("调查已回答并发送");
+    return true;
+  } catch (e) {
+    logger.warn("处理调查弹窗失败", e);
+    return false;
+  }
+}
+
 async function typeAndSend(
   page: import("playwright").Page,
   text: string,
@@ -797,8 +836,10 @@ async function typeAndSend(
   const send = page.locator(SEND_BUTTON).first();
   const stop = page.locator(STOP_INFERENCE_BUTTON).first();
   // Enter 后：Stop 可见表示已提交并在生成；Send 可见表示仍需点击发送（与 page 默认超时一致）
+  // 同时检测是否弹出「What do you want to do next?」调查，出现则自动处理后继续轮询。
   const enterUiDeadline = Date.now() + 30_000;
   let submitUi: "stop" | "send" | null = null;
+  let surveyHandled = false;
   while (Date.now() < enterUiDeadline) {
     if (await stop.isVisible().catch(() => false)) {
       submitUi = "stop";
@@ -807,6 +848,16 @@ async function typeAndSend(
     if (await send.isVisible().catch(() => false)) {
       submitUi = "send";
       break;
+    }
+    // 检测调查弹窗（每轮都检测，防止发送后才弹出）
+    if (!surveyHandled) {
+      const surveySeen = await page.locator(SURVEY_LISTBOX).isVisible().catch(() => false);
+      if (surveySeen) {
+        surveyHandled = await handleSurveyIfPresent(page);
+        // 处理后继续轮询 stop/send（下一轮内容会正常生成）
+        await sleep(500);
+        continue;
+      }
     }
     await sleep(50);
   }

@@ -33,3 +33,12 @@ export const PERSONALIZE_DIALOG = '[role="dialog"][aria-label="Personalize your 
 
 /** 检测个性化弹窗是否出现的短超时（毫秒） */
 export const PERSONALIZE_DIALOG_CHECK_MS = 3000;
+
+/** 发送后 Notion AI 有时弹出「What do you want to do next?」调查选项列表 */
+export const SURVEY_LISTBOX = '[role="listbox"][aria-activedescendant^="survey-option-intent-"]';
+
+/** 调查中「Other（自定义输入）」选项的可编辑输入框 */
+export const SURVEY_OTHER_INPUT = '#survey-option-intent-__other__ [contenteditable="true"]';
+
+/** 检测调查弹窗是否出现的短超时（毫秒） */
+export const SURVEY_CHECK_MS = 3000;
