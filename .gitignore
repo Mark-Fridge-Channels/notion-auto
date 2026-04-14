@@ -1,8 +1,8 @@
 node_modules/
 dist/
-# .notion-auth.json
+.notion-auth.json
 params.json
-# progress.json
+progress.json
 *.log
 .DS_Store
 .env
