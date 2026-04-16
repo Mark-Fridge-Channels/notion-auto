@@ -11,6 +11,8 @@ import { existsSync } from "node:fs";
 import {
   NOTION_URL,
   AI_FACE_IMG,
+  ASSISTANT_CORNER_CLOSE_CHECK_MS,
+  ASSISTANT_CORNER_ORIGIN_CONTAINER,
   SEND_BUTTON,
   MODAL_WAIT_MS,
 } from "../src/selectors.js";
@@ -44,6 +46,16 @@ async function main(): Promise<void> {
     await sleep(LOGIN_WAIT_MS);
 
     log("点击 Notion AI 入口…");
+    const container = p.locator(ASSISTANT_CORNER_ORIGIN_CONTAINER).first();
+    await container.waitFor({ state: "attached" });
+    const closeInCorner = container.locator('div[role="button"][aria-label="Close"]').first();
+    try {
+      await closeInCorner.waitFor({ state: "visible", timeout: ASSISTANT_CORNER_CLOSE_CHECK_MS });
+      await closeInCorner.click();
+      await sleep(300);
+    } catch {
+      /* 无预览层 */
+    }
     const img = p.locator(AI_FACE_IMG).first();
     await img.waitFor({ state: "visible" });
     await img.locator("xpath=..").click();

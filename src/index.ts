@@ -19,6 +19,8 @@ import {
 } from "./schedule.js";
 import {
   AI_FACE_IMG,
+  ASSISTANT_CORNER_CLOSE_CHECK_MS,
+  ASSISTANT_CORNER_ORIGIN_CONTAINER,
   AI_INPUT,
   SEND_BUTTON,
   STOP_INFERENCE_BUTTON,
@@ -324,10 +326,7 @@ async function main(): Promise<void> {
         leftCurrentSlot = false;
         await page.goto(currentIndustry.notionUrl, { waitUntil: "domcontentloaded" });
         await sleep(500);
-        const img = page.locator(AI_FACE_IMG).first();
-        await img.waitFor({ state: "visible", timeout: AI_FACE_VISIBLE_TIMEOUT_MS });
-        await img.locator("xpath=..").click();
-        await sleep(MODAL_WAIT_MS);
+        await waitForNotionAIEntryAndClick(page);
         await dismissPersonalizeDialogIfPresent(page);
         await clickNewAIChat(page, schedule.maxRetries);
         sessionRuns = 0;
@@ -388,10 +387,7 @@ async function main(): Promise<void> {
               try {
                 await page.goto(conductorUrl, { waitUntil: "domcontentloaded" });
                 await sleep(500);
-                const img = page.locator(AI_FACE_IMG).first();
-                await img.waitFor({ state: "visible", timeout: AI_FACE_VISIBLE_TIMEOUT_MS });
-                await img.locator("xpath=..").click();
-                await sleep(MODAL_WAIT_MS);
+                await waitForNotionAIEntryAndClick(page);
                 await dismissPersonalizeDialogIfPresent(page);
                 if (currentM > 0 && sessionRuns > 0 && sessionRuns % currentM === 0) {
                   await switchModel(page, undefined, modelSwitchOpts, waitSubmitReadyMs);
@@ -436,10 +432,7 @@ async function main(): Promise<void> {
           try {
             await page.goto(task.fileUrl, { waitUntil: "domcontentloaded" });
             await sleep(500);
-            const img = page.locator(AI_FACE_IMG).first();
-            await img.waitFor({ state: "visible", timeout: AI_FACE_VISIBLE_TIMEOUT_MS });
-            await img.locator("xpath=..").click();
-            await sleep(MODAL_WAIT_MS);
+            await waitForNotionAIEntryAndClick(page);
             await dismissPersonalizeDialogIfPresent(page);
           } catch (e) {
             logger.warn("打开队列任务页面失败", e);
@@ -681,6 +674,41 @@ async function dismissPersonalizeDialogIfPresent(page: import("playwright").Page
   await sleep(300);
 }
 
+/**
+ * 新版 UI 在 AI 入口前可能在助手角先出现一层可关闭预览；仅在 `.notion-assistant-corner-origin-container` 内查找 Close，
+ * 避免误点页面其它「Close」。
+ */
+async function dismissAssistantCornerCloseIfPresent(page: import("playwright").Page): Promise<void> {
+  const closeInCorner = page
+    .locator(ASSISTANT_CORNER_ORIGIN_CONTAINER)
+    .first()
+    .locator('div[role="button"][aria-label="Close"]')
+    .first();
+  try {
+    await closeInCorner.waitFor({ state: "visible", timeout: ASSISTANT_CORNER_CLOSE_CHECK_MS });
+  } catch {
+    return;
+  }
+  try {
+    await closeInCorner.click();
+    await sleep(300);
+  } catch (e) {
+    logger.warn("点击助手角内 Close 失败", e);
+  }
+}
+
+/** 等待助手角挂载、按需关闭预览层，再等待 AI 入口并点击（与既有逻辑一致：点入口的父级容器） */
+async function waitForNotionAIEntryAndClick(page: import("playwright").Page): Promise<void> {
+  const container = page.locator(ASSISTANT_CORNER_ORIGIN_CONTAINER).first();
+  await container.waitFor({ state: "attached", timeout: AI_FACE_VISIBLE_TIMEOUT_MS });
+  await dismissAssistantCornerCloseIfPresent(page);
+  const entry = page.locator(AI_FACE_IMG).first();
+  await entry.waitFor({ state: "visible", timeout: AI_FACE_VISIBLE_TIMEOUT_MS });
+  const parent = entry.locator("xpath=..");
+  await parent.click();
+  await sleep(MODAL_WAIT_MS);
+}
+
 /** 打开 Notion 并点击 AI 入口；使用指定 notionUrl */
 async function openNotionAI(
   page: import("playwright").Page,
@@ -689,11 +717,7 @@ async function openNotionAI(
 ): Promise<void> {
   await runWithRetry(maxRetries, async () => {
     await page.goto(notionUrl, { waitUntil: "domcontentloaded" });
-    const img = page.locator(AI_FACE_IMG).first();
-    await img.waitFor({ state: "visible", timeout: AI_FACE_VISIBLE_TIMEOUT_MS });
-    const parent = img.locator("xpath=..");
-    await parent.click();
-    await sleep(MODAL_WAIT_MS);
+    await waitForNotionAIEntryAndClick(page);
   });
   await dismissPersonalizeDialogIfPresent(page);
 }
@@ -931,10 +955,7 @@ async function reopenNotionAndNewChat(
   await clickStopInferenceIfVisible(page);
   await page.reload({ waitUntil: "domcontentloaded" });
   await sleep(500);
-  const img = page.locator(AI_FACE_IMG).first();
-  await img.waitFor({ state: "visible", timeout: AI_FACE_VISIBLE_TIMEOUT_MS });
-  await img.locator("xpath=..").click();
-  await sleep(MODAL_WAIT_MS);
+  await waitForNotionAIEntryAndClick(page);
   await dismissPersonalizeDialogIfPresent(page);
   const btn = page.locator(NEW_CHAT_BUTTON).first();
   await btn.waitFor({ state: "visible" });

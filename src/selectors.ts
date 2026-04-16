@@ -4,8 +4,14 @@
 
 export const NOTION_URL = "https://www.notion.so/Prompt-gateway-3029166fd9fd803cb5a4c41904fcf94c?t=new";
 
+/** 右下角 Notion 助手角（AI 入口与偶发「预览关闭」均在此容器内；勿对全页匹配 Close） */
+export const ASSISTANT_CORNER_ORIGIN_CONTAINER = ".notion-assistant-corner-origin-container";
+
 /** Notion AI 头像的父 div：通过 img alt 定位后取父级 */
-export const AI_FACE_IMG = '.notion-assistant-corner-origin-container div.notion-ai-button[role="button"][aria-label="ai"]';
+export const AI_FACE_IMG = `${ASSISTANT_CORNER_ORIGIN_CONTAINER} div.notion-ai-button[role="button"][aria-label="ai"]`;
+
+/** 检测助手角内「Close」是否出现的短超时（毫秒）；与个性化弹窗检测量级一致 */
+export const ASSISTANT_CORNER_CLOSE_CHECK_MS = 3000;
 
 /** 弹窗内输入框：contenteditable，placeholder 含 Do anything with AI */
 export const AI_INPUT = '[data-content-editable-leaf="true"][placeholder="Do anything with AI…"]';
