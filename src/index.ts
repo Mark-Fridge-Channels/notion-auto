@@ -8,7 +8,7 @@
 
 import { chromium } from "playwright";
 import { existsSync } from "node:fs";
-import { mkdir, unlink } from "node:fs/promises";
+import { mkdir, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -58,6 +58,11 @@ let currentBrowser: Browser | null = null;
 let currentPage: Page | null = null;
 /** 停机流程防重入：避免并发关闭导致“先关后判定 stop”的时序错乱。 */
 let shutdownInProgress = false;
+/**
+ * 主任务循环是否已进入：在 for(;;) 前置为 true。
+ * 启动失败捕获逻辑据此判断：false = 仍在准备/登录阶段（需保存 serviceFailed 截图）。
+ */
+let taskExecutionStarted = false;
 
 const BROWSER_CLOSE_TIMEOUT_MS = 10_000;
 
@@ -240,6 +245,8 @@ function drawSessionM(industry: ScheduleIndustry): number {
 
 /** 运行入口：解析 --config、--storage，加载 schedule、等待落入区间后启动浏览器并进入主循环 */
 async function main(): Promise<void> {
+  taskExecutionStarted = false;
+  const mainStartTime = Date.now();
   const { configPath, storagePath: overrideStorage } = getConfigPathFromArgs();
   const schedule = await loadSchedule(configPath);
   if (overrideStorage != null) schedule.storagePath = overrideStorage;
@@ -306,6 +313,9 @@ async function main(): Promise<void> {
     /** 发送后等待可发送状态的超时（毫秒），来自 schedule，默认 30 分钟；换模型前等待也使用此时长 */
     const waitSubmitReadyMs = schedule.waitSubmitReadyMs ?? 1_800_000;
     const modelSwitchOpts = { blacklist: schedule.modelBlacklist ?? [] };
+
+    // 标记主任务循环即将进入；此后的失败属于运行时故障，不再触发 serviceFailed 截图
+    taskExecutionStarted = true;
 
     for (;;) {
       // 每轮任务链开始前：检查是否跨时间区间需切换行业
@@ -614,6 +624,12 @@ async function main(): Promise<void> {
       }
       // 未设上限或未跑满：立刻从头再跑下一轮任务链（不 break）
     }
+  } catch (startupErr) {
+    // 仅在主任务循环尚未进入（即启动/登录阶段）时才保存 serviceFailed 截图
+    if (!taskExecutionStarted && currentPage && !currentPage.isClosed()) {
+      await captureServiceFailure(currentPage, mainStartTime);
+    }
+    throw startupErr;
   } finally {
     try {
       await context.storageState({ path: storagePath });
@@ -901,6 +917,9 @@ async function typeAndSend(
     sendCapture.startedAtMs = Date.now();
     sendCapture.notionUrlAtSend = page.url();
   }
+  // 发送已确认（send 按钮点击 或 stop 可见），记录任务开始执行
+  const shortText = text.length > 80 ? text.slice(0, 80) + "…" : text;
+  logger.info(`[任务执行中] 消息已发送，等待 AI 生成结果… 输入: "${shortText}"`);
   try {
     await waitForSendButtonWithAutoClick(page, buttonNames, timeoutMs);
   } catch (e) {
@@ -1066,6 +1085,35 @@ async function captureFailureScreenshot(page: Page): Promise<string | undefined>
   } catch (e) {
     logger.warn("运行日志：失败截图保存失败", e);
     return undefined;
+  }
+}
+
+/**
+ * 服务启动失败时截图 + 保存页面全部 document HTML，存入项目根目录 serviceFailed/ 子目录。
+ * 文件名格式：{账号}_{YYYY-MM-DD_HH-mm-ss}，截图 .png 与页面 .html 共用同一基名。
+ * 账号来自环境变量 NOTION_AUTO_EXECUTOR（由 dashboard-runner 启动子进程时注入）。
+ */
+async function captureServiceFailure(page: Page, startTimeMs: number): Promise<void> {
+  try {
+    const dir = join(process.cwd(), "serviceFailed");
+    await mkdir(dir, { recursive: true });
+
+    const accountLabel = (process.env.NOTION_AUTO_EXECUTOR ?? "unknown").replace(/[/\\:*?"<>|]/g, "_");
+    const date = new Date(startTimeMs);
+    const pad = (n: number): string => String(n).padStart(2, "0");
+    const timeStr = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}_${pad(date.getHours())}-${pad(date.getMinutes())}-${pad(date.getSeconds())}`;
+    const basename = `${accountLabel}_${timeStr}`;
+
+    const screenshotPath = join(dir, `${basename}.png`);
+    await page.screenshot({ path: screenshotPath, fullPage: true });
+    logger.info(`服务启动失败截图已保存: ${screenshotPath}`);
+
+    const htmlPath = join(dir, `${basename}.html`);
+    const html = await page.content();
+    await writeFile(htmlPath, html, "utf-8");
+    logger.info(`服务启动失败页面 HTML 已保存: ${htmlPath}`);
+  } catch (e) {
+    logger.warn("保存服务启动失败截图/HTML 时出错", e);
   }
 }
 

@@ -7,6 +7,8 @@
 import "dotenv/config";
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
+import { readdir, stat as fsStat, readFile } from "node:fs/promises";
+import { join } from "node:path";
 import * as accountManager from "./account-manager.js";
 import { mergeSchedule } from "./schedule.js";
 import { logger } from "./logger.js";
@@ -210,6 +212,53 @@ async function handleRequest(
       return;
     }
 
+    // 列出 serviceFailed 目录的文件（项目级，所有账号共用）
+    if (path === "/api/service-failed" && method === "GET") {
+      const dir = join(process.cwd(), "serviceFailed");
+      try {
+        const names = await readdir(dir);
+        const files = await Promise.all(
+          names.map(async (name) => {
+            const s = await fsStat(join(dir, name));
+            return { name, size: s.size, mtime: s.mtimeMs };
+          }),
+        );
+        files.sort((a, b) => b.mtime - a.mtime);
+        sendJson(res, 200, { files });
+      } catch {
+        sendJson(res, 200, { files: [] });
+      }
+      return;
+    }
+
+    // 下载 / 查看 serviceFailed 目录中的单个文件
+    const sfFileMatch = path.match(/^\/api\/service-failed\/([^/]+)$/);
+    if (sfFileMatch && method === "GET") {
+      const filename = decodeURIComponent(sfFileMatch[1]);
+      // 安全校验：禁止路径穿越
+      if (filename.includes("..") || filename.includes("/") || filename.includes("\\")) {
+        res.writeHead(400);
+        res.end();
+        return;
+      }
+      const filePath = join(process.cwd(), "serviceFailed", filename);
+      try {
+        const data = await readFile(filePath);
+        const ext = filename.split(".").pop()?.toLowerCase() ?? "";
+        const ct = ext === "png" ? "image/png" : ext === "html" ? "text/html; charset=utf-8" : "application/octet-stream";
+        const inline = ext === "html";
+        res.writeHead(200, {
+          "Content-Type": ct,
+          "Content-Disposition": `${inline ? "inline" : "attachment"}; filename*=UTF-8''${encodeURIComponent(filename)}`,
+        });
+        res.end(data);
+      } catch {
+        res.writeHead(404);
+        res.end();
+      }
+      return;
+    }
+
     res.writeHead(404);
     res.end();
   } catch (e) {
@@ -322,6 +371,17 @@ function getDashboardHtml(): string {
     .account-checkbox-list { border: 1px solid #ddd; border-radius: 6px; max-height: 200px; overflow-y: auto; padding: 0.5rem; margin-top: 0.5rem; }
     .account-checkbox-list label { display: flex; align-items: center; gap: 0.5rem; padding: 0.25rem 0; cursor: pointer; font-size: 0.9rem; font-weight: normal; margin-bottom: 0; }
     
+    .sf-pair { display:flex; align-items:center; justify-content:space-between; padding:0.65rem 1rem; border-bottom:1px solid #eee; background:#fff; gap:0.75rem; }
+    .sf-pair:last-child { border-bottom:none; }
+    .sf-pair:hover { background:#fafafa; }
+    .sf-meta { flex:1; min-width:0; }
+    .sf-meta .sf-name { font-size:0.875rem; font-weight:600; color:#333; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .sf-meta .sf-time { font-size:0.78rem; color:#888; margin-top:0.15rem; }
+    .sf-actions { display:flex; gap:0.4rem; flex-shrink:0; }
+    .sf-actions a { display:inline-block; padding:0.25rem 0.6rem; font-size:0.78rem; border-radius:5px; border:1px solid #ddd; background:#fff; color:#333; text-decoration:none; white-space:nowrap; cursor:pointer; transition:background 0.15s; }
+    .sf-actions a:hover { background:#f0f0f0; }
+    .sf-empty { padding:2rem; text-align:center; color:#888; font-size:0.9rem; }
+
     @media (max-width: 768px) {
       .main-container { flex-direction: column; }
       .sidebar { width: 100%; border-right: none; border-bottom: 1px solid #ddd; max-height: 30vh; }
@@ -339,6 +399,7 @@ function getDashboardHtml(): string {
       <button onclick="startAll()" class="primary">全部启动</button>
       <button onclick="stopAll()" class="danger">全部停止</button>
       <button onclick="pullAndRestart()">拉取并重启</button>
+      <button onclick="openServiceFailedModal()" style="border-color:#f0ad4e;color:#856404;">失败记录</button>
     </div>
   </div>
   
@@ -484,6 +545,21 @@ function getDashboardHtml(): string {
     </div>
   </div>
 
+  <!-- Service Failed Records Modal -->
+  <div id="modalServiceFailed" class="modal-overlay">
+    <div class="modal-box" style="min-width:min(90vw,700px);max-height:80vh;display:flex;flex-direction:column;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem;">
+        <h3 style="margin:0;">启动失败记录</h3>
+        <div style="display:flex;gap:0.5rem;">
+          <button onclick="loadServiceFailed()" style="padding:0.25rem 0.6rem;min-height:28px;font-size:0.8rem;">刷新</button>
+          <button onclick="closeModal('modalServiceFailed')">关闭</button>
+        </div>
+      </div>
+      <p style="margin:0 0 0.75rem;font-size:0.85rem;color:#666;">服务在任务执行前失败时自动保存的截图与页面 HTML，文件名含账号和时间戳。</p>
+      <div id="sfList" style="flex:1;overflow-y:auto;"></div>
+    </div>
+  </div>
+
   <!-- Broadcast Modal -->
   <div id="modalBroadcast" class="modal-overlay">
     <div class="modal-box">
@@ -503,6 +579,17 @@ function getDashboardHtml(): string {
     let currentSchedule = null;
     let refreshInterval = null;
     let editingIndIdx = -1;
+
+    // 日志增量更新状态：记录当前选中的 runId 及各 run 已显示的行数
+    let logViewState = {
+      selectedRunId: null,
+      knownRunIds: [],        // 上次 fetch 时的 run id 列表（用于判断是否需要重建 tabs）
+      lineCountByRunId: {}    // { runId: number } 已显示的行数
+    };
+
+    function resetLogState() {
+      logViewState = { selectedRunId: null, knownRunIds: [], lineCountByRunId: {} };
+    }
 
     async function api(method, path, body) {
       const opts = { method };
@@ -596,6 +683,7 @@ function getDashboardHtml(): string {
       try {
         currentSchedule = await api('GET', '/api/accounts/' + id + '/schedule');
         renderSchedule();
+        resetLogState();
         fetchLogs();
       } catch(e) { showMsg(e.message, true); }
     }
@@ -624,7 +712,8 @@ function getDashboardHtml(): string {
       document.getElementById('qStatF').value = q.statusFailed || 'Failed';
       document.getElementById('qOnSuccess').value = q.onSuccess === 'delete' ? 'delete' : 'update';
       
-      renderSlots();
+      // 从服务端加载数据时 skipSync=true，防止旧账号DOM数据覆盖新 schedule
+      renderSlots(true);
       renderIndustries();
     }
 
@@ -653,8 +742,9 @@ function getDashboardHtml(): string {
       });
     }
 
-    function renderSlots() {
-      syncSlotsFromDOM();
+    // skipSync=true 时跳过 DOM→model 同步（账号切换/首次加载时使用，避免旧DOM数据覆盖新schedule）
+    function renderSlots(skipSync) {
+      if (!skipSync) syncSlotsFromDOM();
       const slots = currentSchedule.timeSlots || [];
       const con = document.getElementById('slotsContainer');
       con.innerHTML = '';
@@ -864,25 +954,88 @@ function getDashboardHtml(): string {
       } catch(e) { alert(e.message); }
     };
 
-    // ==== Logs ====
+    // ==== Logs（增量更新：仅在 run 列表结构变化时重建 tabs；同一 run 只追加新增行）====
+    function buildLogTabBtn(r, tabs) {
+      const btn = document.createElement('button');
+      btn.textContent = r.endTime
+        ? '#' + r.id + ' (' + new Date(r.startTime).toLocaleTimeString() + ')'
+        : '#' + r.id + ' (当前)';
+      btn.dataset.runId = String(r.id);
+      btn.onclick = () => {
+        tabs.querySelectorAll('button').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        logViewState.selectedRunId = r.id;
+        const logContent = document.getElementById('logContent');
+        logContent.textContent = (r.lines || []).join('\\n') || '(无输出)';
+        logViewState.lineCountByRunId[r.id] = r.lines.length;
+        logContent.scrollTop = logContent.scrollHeight;
+      };
+      return btn;
+    }
+
     async function fetchLogs() {
-      if(!currentAccountId) return;
+      if (!currentAccountId) return;
       try {
         const { runs } = await api('GET', '/api/accounts/' + currentAccountId + '/logs');
         const tabs = document.getElementById('logTabs');
-        tabs.innerHTML = '';
-        if(!runs || runs.length===0) { document.getElementById('logContent').textContent='(无记录)'; return; }
-        runs.forEach((r, i) => {
-          const btn = document.createElement('button');
-          btn.textContent = r.endTime ? '#' + r.id + ' (' + new Date(r.startTime).toLocaleTimeString() + ')' : '#' + r.id + ' (当前)';
-          btn.onclick = () => {
-            tabs.querySelectorAll('button').forEach(b=>b.classList.remove('active'));
-            btn.classList.add('active');
-            document.getElementById('logContent').textContent = r.lines.join('\\n')||'(无输出)';
-          };
-          tabs.appendChild(btn);
-          if(i===0) btn.click();
-        });
+        const logContent = document.getElementById('logContent');
+
+        if (!runs || runs.length === 0) {
+          logContent.textContent = '(无记录)';
+          tabs.innerHTML = '';
+          resetLogState();
+          return;
+        }
+
+        const newIds = runs.map(r => r.id).join(',');
+        const oldIds = logViewState.knownRunIds.join(',');
+
+        if (newIds !== oldIds) {
+          // Run 列表结构变化（新增/切换了 run）→ 重建 tabs
+          tabs.innerHTML = '';
+          logViewState.knownRunIds = runs.map(r => r.id);
+          logViewState.lineCountByRunId = {};
+
+          // 保留之前选中的 run（若仍存在），否则选最新一条
+          const targetRun = (logViewState.selectedRunId !== null && runs.find(r => r.id === logViewState.selectedRunId))
+            || runs[0];
+          logViewState.selectedRunId = targetRun.id;
+
+          runs.forEach(r => {
+            const btn = buildLogTabBtn(r, tabs);
+            tabs.appendChild(btn);
+            if (r.id === targetRun.id) {
+              btn.classList.add('active');
+              logContent.textContent = (r.lines || []).join('\\n') || '(无输出)';
+              logViewState.lineCountByRunId[r.id] = r.lines.length;
+              logContent.scrollTop = logContent.scrollHeight;
+            }
+          });
+        } else {
+          // Run 列表结构未变 → 增量追加当前选中 run 的新日志行
+          runs.forEach(r => {
+            // 更新 tab 按钮文字（run 结束后 "(当前)" → 时间戳）
+            const btn = tabs.querySelector('button[data-run-id="' + r.id + '"]');
+            if (btn && r.endTime && btn.textContent.includes('(当前)')) {
+              btn.textContent = '#' + r.id + ' (' + new Date(r.startTime).toLocaleTimeString() + ')';
+            }
+          });
+
+          const selectedId = logViewState.selectedRunId;
+          if (selectedId !== null) {
+            const run = runs.find(r => r.id === selectedId);
+            if (run) {
+              const knownCount = logViewState.lineCountByRunId[selectedId] || 0;
+              const newLines = run.lines.slice(knownCount);
+              if (newLines.length > 0) {
+                const atBottom = logContent.scrollHeight - logContent.scrollTop - logContent.clientHeight < 60;
+                logContent.textContent += (knownCount > 0 ? '\\n' : '') + newLines.join('\\n');
+                logViewState.lineCountByRunId[selectedId] = run.lines.length;
+                if (atBottom) logContent.scrollTop = logContent.scrollHeight;
+              }
+            }
+          }
+        }
       } catch(e) {}
     }
 
@@ -902,11 +1055,88 @@ function getDashboardHtml(): string {
       } catch(e) { alert(e.message); document.body.style.opacity='1'; }
     };
 
+    // ==== 启动失败记录 ====
+    window.openServiceFailedModal = function() {
+      document.getElementById('modalServiceFailed').classList.add('visible');
+      loadServiceFailed();
+    };
+
+    window.loadServiceFailed = async function() {
+      const list = document.getElementById('sfList');
+      list.innerHTML = '<div class="sf-empty">加载中…</div>';
+      try {
+        const { files } = await api('GET', '/api/service-failed');
+        if (!files || files.length === 0) {
+          list.innerHTML = '<div class="sf-empty">暂无失败记录</div>';
+          return;
+        }
+        // 将同基名的 .png / .html 两个文件配对展示
+        const pairMap = {};
+        files.forEach(f => {
+          const dot = f.name.lastIndexOf('.');
+          const base = dot >= 0 ? f.name.slice(0, dot) : f.name;
+          const ext = dot >= 0 ? f.name.slice(dot + 1).toLowerCase() : '';
+          if (!pairMap[base]) pairMap[base] = { base, mtime: f.mtime };
+          pairMap[base][ext] = f.name;
+        });
+        const pairs = Object.values(pairMap).sort((a, b) => b.mtime - a.mtime);
+
+        list.innerHTML = '';
+        const container = document.createElement('div');
+        container.style.cssText = 'border:1px solid #eee;border-radius:6px;overflow:hidden;';
+        pairs.forEach(p => {
+          // 解析文件名：{account}_{YYYY-MM-DD_HH-mm-ss}
+          const parts = p.base.split('_');
+          const account = parts.length >= 4 ? parts.slice(0, parts.length - 3).join('_') : p.base;
+          const dateStr = parts.length >= 3 ? parts.slice(-3).join(' ').replace(/-/g, ':').replace(' ', ' ') : '';
+          const timeLabel = (() => {
+            try {
+              const d = parts.slice(-3);
+              // d = ['YYYY-MM-DD', 'HH-mm-ss']  (actually 3 parts: date, h-m-s but split by _ not -)
+              // Actually format is YYYY-MM-DD_HH-mm-ss, split by _ gives: [...account..., 'YYYY-MM-DD', 'HH-mm-ss']
+              const datePart = parts[parts.length - 2];
+              const timePart = parts[parts.length - 1].replace(/-/g, ':');
+              return datePart + ' ' + timePart;
+            } catch { return p.base; }
+          })();
+
+          const row = document.createElement('div');
+          row.className = 'sf-pair';
+          const meta = document.createElement('div');
+          meta.className = 'sf-meta';
+          meta.innerHTML = '<div class="sf-name">' + escapeHtml(account) + '</div><div class="sf-time">' + escapeHtml(timeLabel) + '</div>';
+
+          const actions = document.createElement('div');
+          actions.className = 'sf-actions';
+          if (p.png) {
+            const a = document.createElement('a');
+            a.href = '/api/service-failed/' + encodeURIComponent(p.png);
+            a.download = p.png;
+            a.textContent = '下载截图';
+            actions.appendChild(a);
+          }
+          if (p.html) {
+            const a = document.createElement('a');
+            a.href = '/api/service-failed/' + encodeURIComponent(p.html);
+            a.target = '_blank';
+            a.textContent = '查看HTML';
+            actions.appendChild(a);
+          }
+          row.appendChild(meta);
+          row.appendChild(actions);
+          container.appendChild(row);
+        });
+        list.appendChild(container);
+      } catch(e) {
+        list.innerHTML = '<div class="sf-empty">加载失败: ' + escapeHtml(e.message) + '</div>';
+      }
+    };
+
     // Init
     fetchAccounts().then(() => {
       if(accounts.length) selectAccount(accounts[0].id);
       setInterval(fetchAccounts, 3000);
-      setInterval(fetchLogs, 5000);
+      setInterval(fetchLogs, 10000);
     });
   </script>
 </body>
