@@ -81,7 +81,7 @@ const BROWSER_CLOSE_TIMEOUT_MS = 10_000;
  *  - `--disable-gpu` / `--disable-software-rasterizer`：headless 下完全用不到 GPU 栈；
  *  - `--disable-extensions`：禁用扩展减少 renderer 启动基线；
  *  - `--disable-features=…`：关掉几个默认开启但对本场景无用的特性，降低 renderer 常驻内存；
- *  - `--js-flags=--max-old-space-size=512`：给 V8 老生代上限加盖，避免单个 renderer 的 JS 堆无限膨胀。
+ *  - `--js-flags=--max-old-space-size=2048`：给 V8 老生代上限加盖，避免单个 renderer 的 JS 堆无限膨胀。
  * schedule.chromiumExtraArgs 可在此之后追加，用于极少数场景微调。
  */
 const CHROMIUM_LOW_MEM_ARGS: readonly string[] = [
@@ -90,7 +90,7 @@ const CHROMIUM_LOW_MEM_ARGS: readonly string[] = [
   "--disable-software-rasterizer",
   "--disable-extensions",
   "--disable-features=Translate,MediaRouter,OptimizationHints",
-  "--js-flags=--max-old-space-size=512",
+  "--js-flags=--max-old-space-size=2048",
 ];
 
 /** 组合最终 launch args；extra 追加在内置之后，同键取后者的行为由 Chromium 自身处理 */
