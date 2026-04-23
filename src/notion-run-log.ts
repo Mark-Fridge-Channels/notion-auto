@@ -79,11 +79,23 @@ function bodyToParagraphBlocks(body: string): BlockObjectRequest[] {
   );
 }
 
-function buildLogPageTitle(input: string, finishedAtMs: number): string {
-  const stamp = new Date(finishedAtMs).toISOString();
-  const prefix = input.trim().slice(0, 80);
-  const base = prefix || "(无输入)";
-  return `${base} · ${stamp}`;
+/** 本地时区年月日时分秒，紧凑 14 位，用于日志页 title */
+function formatLocalYmdHms(ms: number): string {
+  const d = new Date(ms);
+  const p = (n: number) => String(n).padStart(2, "0");
+  return (
+    String(d.getFullYear()) +
+    p(d.getMonth() + 1) +
+    p(d.getDate()) +
+    p(d.getHours()) +
+    p(d.getMinutes()) +
+    p(d.getSeconds())
+  );
+}
+
+/** 任务日志库 title 列：固定前缀 + 完成时刻（本地年月日时分秒） */
+function buildLogPageTitle(finishedAtMs: number): string {
+  return `task-${formatLocalYmdHms(finishedAtMs)}`;
 }
 
 export interface AppendRunLogParams {
@@ -124,7 +136,7 @@ export async function appendRunLogEntry(params: AppendRunLogParams): Promise<voi
   }
 
   const client = new Client({ auth: key });
-  const title = buildLogPageTitle(input, finishedAtMs);
+  const title = buildLogPageTitle(finishedAtMs);
 
   const props: Record<string, unknown> = {
     [COL_TITLE]: {
