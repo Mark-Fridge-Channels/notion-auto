@@ -1,6 +1,6 @@
 node_modules/
 dist/
-# .notion-auth.json
+.notion-auth.json
 params.json
 progress.json
 *.log
