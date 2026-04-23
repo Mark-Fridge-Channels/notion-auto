@@ -11,6 +11,7 @@ import { getSchedulePath } from "./schedule.js";
 import { sendRestartAlertEmail } from "./alert-email.js";
 import { logger } from "./logger.js";
 import { EXIT_RECOVERY_RESTART } from "./exit-codes.js";
+import { markAdhocJobFailedIfActive } from "./adhoc-queue.js";
 
 const MAX_RUN_LOGS = 10;
 const MAX_LINES_PER_RUN = 2000;
@@ -51,6 +52,8 @@ export class DashboardRunner {
   private consecutiveRestartCount = 0;
   /** 本周期是否已发过告警邮件（只发一封） */
   private emailSent = false;
+  /** 若当前子进程为「一次性插队」任务，记录 jobId，异常退出时回写队列 */
+  private pendingAdhocJobId: string | null = null;
 
   constructor(accountId: string, label: string, configPath: string, storagePath: string) {
     this.accountId = accountId;
@@ -71,10 +74,19 @@ export class DashboardRunner {
   }
 
   /**
+   * 当前活跃子进程是否为「一次性插队」进程（startAdhocOnce 启动，执行完即退出）。
+   * server 侧据此实现全局一次性子进程并发上限，保护内存。
+   */
+  isAdhocOnceRunning(): boolean {
+    return this.currentProcess != null && this.pendingAdhocJobId != null;
+  }
+
+  /**
    * 启动脚本子进程；若已在运行则先不处理（由调用方先 stop）。
    */
   start(opts?: { headlessOverride?: boolean }): void {
     if (this.currentProcess != null) return;
+    this.pendingAdhocJobId = null;
     this.stopInProgress = false;
     this.userWantsRunning = true;
     this.consecutiveRestartCount = 0;
@@ -82,13 +94,33 @@ export class DashboardRunner {
     this.spawnChild(false, opts?.headlessOverride);
   }
 
-  private spawnChild(isAutoResume: boolean, headlessOverride?: boolean): void {
+  /**
+   * 仅执行一条 Webhook 插队任务后退出：`userWantsRunning` 为 false，子进程异常退出时不会自动重启主循环。
+   * 若该账号已有子进程在跑则抛错（由 account-manager 保证仅 idle 调用）。
+   */
+  startAdhocOnce(jobId: string, opts?: { headlessOverride?: boolean }): void {
+    if (this.currentProcess != null) {
+      throw new Error(`账号 "${this.accountId}" 已有子进程在运行，无法启动插队子进程`);
+    }
+    this.pendingAdhocJobId = jobId;
+    this.stopInProgress = false;
+    this.userWantsRunning = false;
+    this.consecutiveRestartCount = 0;
+    this.emailSent = false;
+    this.spawnChild(false, opts?.headlessOverride, jobId);
+  }
+
+  private spawnChild(isAutoResume: boolean, headlessOverride?: boolean, adhocJobId?: string): void {
     const args = ["--config", this.configPath, "--storage", this.storagePath];
+    if (adhocJobId) args.push("--adhoc-job", adhocJobId);
     const env = { ...process.env };
     if (isAutoResume) env.NOTION_AUTO_RESUME = "1";
     if (headlessOverride) env.NOTION_AUTO_HEADLESS = "1";
     env.NOTION_AUTO_EXECUTOR = this.label;
-    env.NOTION_AUTO_EXECUTOR = this.label;
+    if (adhocJobId) {
+      env.NOTION_AUTO_ADHOC_JOB = adhocJobId;
+      env.NOTION_AUTO_ACCOUNT_ID = this.accountId;
+    }
 
     // 所有平台都启用 stdin pipe：优先发 "stop" 走子进程优雅停机（先点 stop 再关浏览器）
     const stdio: ["pipe", "pipe", "pipe"] = ["pipe", "pipe", "pipe"];
@@ -128,31 +160,44 @@ export class DashboardRunner {
       });
     });
 
-    const finishRun = (exitCode?: number): void => {
+    const finishRun = (exitCode?: number, spawnError?: boolean): void => {
       // 仅处理当前活跃子进程；忽略过期进程的 exit/error 事件
       if (this.currentProcess !== child) return;
       this.currentProcess = null;
       this.stopInProgress = false;
+      const adhocId = this.pendingAdhocJobId;
+      this.pendingAdhocJobId = null;
       if (this.currentRunLog) this.currentRunLog.endTime = Date.now();
       if (this.currentRunLog) {
         this.runLogs.unshift(this.currentRunLog);
         if (this.runLogs.length > MAX_RUN_LOGS) this.runLogs = this.runLogs.slice(0, MAX_RUN_LOGS);
         this.currentRunLog = null;
       }
+      if (adhocId) {
+        const numericFail = typeof exitCode === "number" && exitCode !== 0;
+        if (spawnError || numericFail) {
+          void markAdhocJobFailedIfActive(
+            adhocId,
+            spawnError
+              ? "插队子进程 spawn/运行 error 事件"
+              : `插队子进程异常退出，退出码 ${exitCode}`,
+          );
+        }
+      }
       setImmediate(() => this.maybeAutoRestart(exitCode));
     };
 
-    child.on("exit", (code) => finishRun(code ?? undefined));
+    child.on("exit", (code) => finishRun(code ?? undefined, false));
     child.on("error", (err) => {
       logger.warn(`[${this.accountId}] 子进程 error 事件`, err);
-      finishRun();
+      finishRun(undefined, true);
     });
   }
 
   /** exit 后若 userWantsRunning 且 progress 未 completed 则自动重启；恢复重启（exitCode=2）不计入连续重启次数，不触发告警。 */
   private async maybeAutoRestart(exitCode?: number): Promise<void> {
     if (!this.userWantsRunning) return;
-    const progress = await loadProgress();
+    const progress = await loadProgress(this.configPath);
     if (progress?.completed === true) return;
 
     const isRecoveryRestart = exitCode === EXIT_RECOVERY_RESTART;

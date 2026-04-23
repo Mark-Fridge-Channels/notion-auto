@@ -203,6 +203,31 @@ export function startAccount(id: string): void {
   inst.runner.start();
 }
 
+/**
+ * 在 **idle** 账号上启动一次性插队子进程（执行完一条后退出，不进入 7×24 主循环）。
+ * 若账号非 idle 则抛错（插队已分配给 running 账号时由主进程自行消费，无需调用本函数）。
+ */
+export function startAdhocOnce(accountId: string, jobId: string): void {
+  const inst = instances.get(accountId);
+  if (!inst) throw new Error(`账号 "${accountId}" 不存在`);
+  if (inst.runner.getRunStatus() !== "idle") {
+    throw new Error(`账号 "${accountId}" 非空闲，无法启动插队子进程`);
+  }
+  inst.runner.startAdhocOnce(jobId);
+}
+
+/**
+ * 当前处于「一次性插队子进程」状态的账号数，用于 server 侧全局并发上限判断。
+ * 不包含正在跑主循环（`start()` 启动）的账号。
+ */
+export function countAdhocOnceInFlight(): number {
+  let n = 0;
+  for (const [, inst] of instances) {
+    if (inst.runner.isAdhocOnceRunning()) n++;
+  }
+  return n;
+}
+
 export function stopAccount(id: string): void {
   const inst = instances.get(id);
   if (!inst) throw new Error(`账号 "${id}" 不存在`);

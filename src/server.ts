@@ -12,15 +12,47 @@ import { join } from "node:path";
 import * as accountManager from "./account-manager.js";
 import { mergeSchedule } from "./schedule.js";
 import { logger } from "./logger.js";
+import {
+  enqueueAdhocJob,
+  assignOneQueuedJob,
+  validateAdhocEnqueuePayload,
+  setAdhocTerminalListener,
+  markAdhocJobFailedIfActive,
+} from "./adhoc-queue.js";
 
 const PORT = Number(process.env.PORT) || 9000;
 const HOST = process.env.HOST || "0.0.0.0";
 
+/** 单次 tryDrain 最多分配条数，避免长时间占锁、阻塞 HTTP 与其它进程 */
+const ADHOC_MAX_ASSIGN_PER_TICK = 25;
+/** Webhook JSON body 上限（字节） */
+const WEBHOOK_ADHOC_MAX_BODY_BYTES = 512 * 1024;
+/**
+ * 空闲账号上同时最多存在的「一次性子进程」数，保护整机内存（每个 Chromium 可达数百 MB）。
+ * 0 = 关闭该保护（不推荐）。可通过 env 覆盖，超限时 Queued 任务保持 queued，待空位再分配。
+ */
+const ADHOC_ONESHOT_MAX_CONCURRENCY = (() => {
+  const raw = Number(process.env.NOTION_AUTO_ADHOC_ONESHOT_MAX);
+  if (!Number.isFinite(raw) || raw < 0) return 3;
+  return Math.floor(raw);
+})();
+
 let isPullRestartInProgress = false;
 
-async function readJsonBody(req: import("node:http").IncomingMessage): Promise<unknown> {
+async function readJsonBody(
+  req: import("node:http").IncomingMessage,
+  maxBytes?: number,
+): Promise<unknown> {
   const chunks: Buffer[] = [];
-  for await (const chunk of req) chunks.push(chunk);
+  let total = 0;
+  for await (const chunk of req) {
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    total += buf.length;
+    if (maxBytes != null && total > maxBytes) {
+      throw new Error(`请求体超过 ${maxBytes} 字节`);
+    }
+    chunks.push(buf);
+  }
   const raw = Buffer.concat(chunks).toString("utf-8");
   if (!raw.trim()) return undefined;
   return JSON.parse(raw);
@@ -74,6 +106,56 @@ function runNpmInstall(cwd: string): Promise<{ exitCode: number; stdout: string;
     child.on("close", (code, signal) => finish(code ?? (signal ? 1 : 0), stdout, stderr));
     child.on("error", (err) => { stderr += (err?.message ?? String(err)) + "\\n"; finish(1, stdout, stderr); });
   });
+}
+
+/**
+ * Webhook / 定时器：每轮最多分配 ADHOC_MAX_ASSIGN_PER_TICK 条，并让出事件循环。
+ *
+ * 并发保护（Step 5）：
+ *   - `ADHOC_ONESHOT_MAX_CONCURRENCY` 控制「空闲账号上的一次性子进程」全局上限。
+ *   - 达到上限时，将空闲账号从候选中剔除，仅让 running 账号走进程内消费（不新启动子进程）。
+ *   - 无 running 可用的情况下直接跳过本 tick，任务继续保持 queued，等待下一 tick 或空位。
+ */
+async function tryDrainQueuedAssignments(): Promise<void> {
+  for (let n = 0; n < ADHOC_MAX_ASSIGN_PER_TICK; n++) {
+    const inFlightOneShot = accountManager.countAdhocOnceInFlight();
+    const canSpawnMore =
+      ADHOC_ONESHOT_MAX_CONCURRENCY <= 0 || inFlightOneShot < ADHOC_ONESHOT_MAX_CONCURRENCY;
+    const rawAccounts = accountManager.listAccounts().map((a) => ({
+      id: a.id,
+      runStatus: a.status,
+    }));
+    // 达到一次性子进程并发上限时，本 tick 内不让 assign 选中 idle 账号
+    const accounts = canSpawnMore
+      ? rawAccounts
+      : rawAccounts.filter((a) => a.runStatus === "running");
+    if (accounts.length === 0) break;
+    const r = await assignOneQueuedJob(accounts);
+    if (!r.assigned || !r.jobId || !r.accountId) break;
+    if (r.targetWasIdle) {
+      try {
+        accountManager.startAdhocOnce(r.accountId, r.jobId);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        logger.warn(`为账号 ${r.accountId} 启动插队子进程失败: ${msg}`);
+        await markAdhocJobFailedIfActive(r.jobId, `启动子进程失败: ${msg}`);
+      }
+    }
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+}
+
+function verifyWebhookToken(req: import("node:http").IncomingMessage): boolean {
+  const expected = process.env.NOTION_AUTO_WEBHOOK_TOKEN?.trim();
+  if (!expected) return false;
+  const auth = req.headers.authorization;
+  if (typeof auth === "string" && auth.toLowerCase().startsWith("bearer ")) {
+    return auth.slice(7).trim() === expected;
+  }
+  const raw = req.headers["x-webhook-token"];
+  if (typeof raw === "string") return raw.trim() === expected;
+  if (Array.isArray(raw) && raw[0]) return raw[0].trim() === expected;
+  return false;
 }
 
 function spawnNewServerAndExit(): void {
@@ -213,6 +295,28 @@ async function handleRequest(
     }
 
     // 列出 serviceFailed 目录的文件（项目级，所有账号共用）
+    if (path === "/api/webhook/adhoc" && method === "POST") {
+      if (!process.env.NOTION_AUTO_WEBHOOK_TOKEN?.trim()) {
+        sendJson(res, 503, { error: "未配置环境变量 NOTION_AUTO_WEBHOOK_TOKEN" });
+        return;
+      }
+      if (!verifyWebhookToken(req)) {
+        sendJson(res, 401, { error: "未授权" });
+        return;
+      }
+      const body = await readJsonBody(req, WEBHOOK_ADHOC_MAX_BODY_BYTES);
+      const v = validateAdhocEnqueuePayload(body);
+      if (!v.ok) {
+        sendJson(res, 400, { error: v.error });
+        return;
+      }
+      const jobId = await enqueueAdhocJob(v.data);
+      await tryDrainQueuedAssignments();
+      res.writeHead(202, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ accepted: true, jobId }));
+      return;
+    }
+
     if (path === "/api/service-failed" && method === "GET") {
       const dir = join(process.cwd(), "serviceFailed");
       try {
@@ -1151,6 +1255,13 @@ const server = createServer(handleRequest);
 
 async function start() {
   await accountManager.init();
+  setAdhocTerminalListener(() => {
+    void tryDrainQueuedAssignments();
+  });
+  /** 子进程内完成插队写盘时不会触发本进程 listener，用定时拉取分配 queued */
+  setInterval(() => {
+    void tryDrainQueuedAssignments();
+  }, 8000);
   if (process.env.NOTION_AUTO_RESTART === "1") {
     await new Promise<void>((r) => setTimeout(r, 2000));
   }

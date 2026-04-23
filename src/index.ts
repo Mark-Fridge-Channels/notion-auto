@@ -8,9 +8,10 @@
 
 import { chromium } from "playwright";
 import { existsSync } from "node:fs";
-import { mkdir, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import type { BrowserContext } from "playwright";
 import {
   loadSchedule,
   getSchedulePath,
@@ -43,7 +44,7 @@ import {
   markTaskFailed,
   isQueueAvailable,
 } from "./notion-queue.js";
-import type { ScheduleIndustry } from "./schedule.js";
+import type { ScheduleIndustry, Schedule } from "./schedule.js";
 import type { Browser, Page } from "playwright";
 import { extractConversationPlainText } from "./conversation-extract.js";
 import {
@@ -51,6 +52,14 @@ import {
   isRunLogEnabled,
   type RunLogSendCapture,
 } from "./notion-run-log.js";
+import {
+  deriveAccountIdFromConfigPath,
+  takeAssignedAdhocJob,
+  hasPendingAssignedAdhoc,
+  claimAdhocJobForOneShot,
+  markAdhocJobDone,
+  markAdhocJobFailed,
+} from "./adhoc-queue.js";
 
 /** 当前已启动的浏览器实例，供退出前关闭及 SIGTERM 处理使用；launch 后赋值，close 后置空 */
 let currentBrowser: Browser | null = null;
@@ -65,6 +74,71 @@ let shutdownInProgress = false;
 let taskExecutionStarted = false;
 
 const BROWSER_CLOSE_TIMEOUT_MS = 10_000;
+
+/**
+ * 降内存 Chromium 启动参数：
+ *  - `--disable-dev-shm-usage`：EC2/容器上 /dev/shm 通常很小，退回内存映射会诱发额外 RSS；
+ *  - `--disable-gpu` / `--disable-software-rasterizer`：headless 下完全用不到 GPU 栈；
+ *  - `--disable-extensions`：禁用扩展减少 renderer 启动基线；
+ *  - `--disable-features=…`：关掉几个默认开启但对本场景无用的特性，降低 renderer 常驻内存；
+ *  - `--js-flags=--max-old-space-size=512`：给 V8 老生代上限加盖，避免单个 renderer 的 JS 堆无限膨胀。
+ * schedule.chromiumExtraArgs 可在此之后追加，用于极少数场景微调。
+ */
+const CHROMIUM_LOW_MEM_ARGS: readonly string[] = [
+  "--disable-dev-shm-usage",
+  "--disable-gpu",
+  "--disable-software-rasterizer",
+  "--disable-extensions",
+  "--disable-features=Translate,MediaRouter,OptimizationHints",
+  "--js-flags=--max-old-space-size=512",
+];
+
+/** 组合最终 launch args；extra 追加在内置之后，同键取后者的行为由 Chromium 自身处理 */
+function buildChromiumArgs(extra?: string[]): string[] {
+  if (!extra || extra.length === 0) return [...CHROMIUM_LOW_MEM_ARGS];
+  return [...CHROMIUM_LOW_MEM_ARGS, ...extra];
+}
+
+/** 与 `newContext({ storageState })` 完全兼容的对象结构（Playwright 可变数组） */
+type CookiesOnlyState = Awaited<ReturnType<BrowserContext["storageState"]>>;
+
+/**
+ * cookies-only 读：Playwright 的 `storageState` 若保留 `origins[].localStorage`，
+ * Notion 前端会在启动瞬间 rehydrate 大量 block / queryCache / block cache 到 JS 堆，
+ * 导致每个 renderer 启动即 1~2GB。cookies 已足够维持 Notion 登录态，localStorage
+ * 丢弃后 Notion 会按需重建（不会退登）。
+ *
+ * 读取落盘 JSON，仅返回 cookies 部分；文件不存在 / JSON 损坏时返回 undefined，
+ * 由调用方按「无登录态」处理（走 60s 手动登录路径）。
+ */
+async function loadStorageStateCookiesOnly(path: string): Promise<CookiesOnlyState | undefined> {
+  if (!existsSync(path)) return undefined;
+  try {
+    const raw = await readFile(path, "utf-8");
+    const data = JSON.parse(raw) as { cookies?: unknown };
+    const cookies = Array.isArray(data.cookies) ? (data.cookies as CookiesOnlyState["cookies"]) : [];
+    return { cookies, origins: [] };
+  } catch (e) {
+    logger.warn(`读取登录态失败（将按无登录态启动）：${path}`, e);
+    return undefined;
+  }
+}
+
+/**
+ * cookies-only 写：先从 context 取完整 state 再**裁掉** origins，
+ * 确保文件不会在每次退出时被 Playwright 自动重新写胖。
+ * 写入走 tmp + rename 原子替换，避免写到一半被进程信号打断留下半截 JSON。
+ */
+async function saveStorageStateCookiesOnly(
+  context: BrowserContext,
+  path: string,
+): Promise<void> {
+  const state = await context.storageState();
+  const trimmed: CookiesOnlyState = { cookies: state.cookies ?? [], origins: [] };
+  const tmp = `${path}.${process.pid}.tmp`;
+  await writeFile(tmp, JSON.stringify(trimmed), "utf-8");
+  await rename(tmp, path);
+}
 
 /** 等待 Notion AI 头像可见的超时（毫秒）；打开页面/切换行业/队列任务后等 AI 入口出现 */
 const AI_FACE_VISIBLE_TIMEOUT_MS = 60_000;
@@ -160,6 +234,63 @@ async function softWaitAfterPreShutdownStop(result: PreShutdownStopResult): Prom
   }
 }
 
+/** 浏览器 recycle 默认触发条件（schedule 未配置时使用） */
+const BROWSER_RECYCLE_DEFAULT_RUNS = 100;
+const BROWSER_RECYCLE_DEFAULT_HOURS = 6;
+
+/** Step 4 使用：recycle 后返回的新 context/page，主循环据此替换本地引用 */
+interface RecycledBrowser {
+  context: BrowserContext;
+  page: Page;
+}
+
+/**
+ * 仅在任务边界调用：关闭当前 Chromium，按相同 launch args / storageState 重新起一份。
+ * 目的：释放长时间运行累积的 renderer 堆碎片、已关闭的 page 残留、Blink 内部 cache。
+ * 调度层计数（chainRunsInSlot / sessionRuns / currentN / currentM）**不在此函数内改动**，
+ * 由调用方自行保留，确保 recycle 对任务链语义透明。
+ */
+async function relaunchBrowser(
+  schedule: Schedule,
+  industry: ScheduleIndustry,
+  storagePath: string,
+  headless: boolean,
+): Promise<RecycledBrowser> {
+  logger.info("定时 recycle 浏览器：开始关闭旧 Chromium…");
+  if (currentBrowser) {
+    try {
+      await Promise.race([
+        currentBrowser.close(),
+        new Promise<never>((_, reject) => {
+          setTimeout(() => reject(new Error("browser.close 超时")), BROWSER_CLOSE_TIMEOUT_MS);
+        }),
+      ]);
+    } catch (e) {
+      logger.warn("recycle 关闭旧浏览器失败（忽略，继续 relaunch）", e);
+    }
+    currentBrowser = null;
+    currentPage = null;
+  }
+  currentBrowser = await chromium.launch({
+    headless,
+    args: buildChromiumArgs(schedule.chromiumExtraArgs),
+  });
+  const storageState = await loadStorageStateCookiesOnly(storagePath);
+  const context = await currentBrowser.newContext(storageState ? { storageState } : {});
+  const page = await context.newPage();
+  currentPage = page;
+  page.setDefaultTimeout(30_000);
+  if (industry.notionUrl?.trim()) {
+    await page.goto(industry.notionUrl, { waitUntil: "domcontentloaded" });
+  }
+  // recycle 后 cookies 足以维持登录态；留一点点时间给 Notion SPA 初始化后再进入下一步操作。
+  await sleep(1000);
+  await openNotionAI(page, industry.notionUrl, schedule.maxRetries);
+  await clickNewAIChat(page, schedule.maxRetries);
+  logger.info("定时 recycle 浏览器：已重启并回到行业 Portal 的 New Chat");
+  return { context, page };
+}
+
 /**
  * 关闭当前浏览器后退出进程；用于 process.exit 会跳过 finally 的路径（恢复重启、SIGTERM）。
  * 带超时避免 close 卡死导致进程无法退出。
@@ -243,11 +374,208 @@ function drawSessionM(industry: ScheduleIndustry): number {
   return randomIntInclusive(industry.modelSwitchIntervalMin, industry.modelSwitchIntervalMax);
 }
 
+/**
+ * 主循环间隔 sleep：可被「已分配给本账号的插队任务」提前结束，以便尽快回到循环顶消费队列。
+ */
+/** 睡眠切片（毫秒）；插队队列检查间隔更大以降低锁竞争 */
+const INTERRUPTIBLE_SLEEP_SLICE_MS = 500;
+const ADHOC_QUEUE_CHECK_INTERVAL_MS = 2500;
+
+async function interruptibleSleep(totalMs: number, accountId: string | null): Promise<void> {
+  let elapsed = 0;
+  /** 置满间隔使进入循环后立刻检查一次，短于 CHECK 间隔的 sleep 也能发现插队 */
+  let sinceQueueCheck = ADHOC_QUEUE_CHECK_INTERVAL_MS;
+  while (elapsed < totalMs) {
+    if (accountId && sinceQueueCheck >= ADHOC_QUEUE_CHECK_INTERVAL_MS) {
+      sinceQueueCheck = 0;
+      try {
+        if (await hasPendingAssignedAdhoc(accountId)) return;
+      } catch (e) {
+        logger.warn("检查插队队列失败（忽略）", e);
+      }
+    }
+    const step = Math.min(INTERRUPTIBLE_SLEEP_SLICE_MS, totalMs - elapsed);
+    await sleep(step);
+    elapsed += step;
+    sinceQueueCheck += step;
+  }
+}
+
+/**
+ * 消费**一条**分配给当前账号的插队任务（running 子进程内）。
+ * 为避免连续消费多条导致 renderer 内存飙升，每次主循环最多处理 1 条，下轮循环再进入。
+ * 返回成功发送条数（0 或 1），供主循环累加到 recycle 计数。
+ */
+async function drainAdhocForRunningAccount(
+  page: Page,
+  schedule: Schedule,
+  currentIndustry: ScheduleIndustry,
+  accountId: string,
+): Promise<number> {
+  const modelSwitchOpts = { blacklist: schedule.modelBlacklist ?? [] };
+  const job = await takeAssignedAdhocJob(accountId);
+  if (!job) return 0;
+  let sent = 0;
+  logger.info(`插队任务 ${job.id}：执行中…`);
+  try {
+    await page.goto(job.url, { waitUntil: "domcontentloaded", timeout: job.timeoutGotoMs });
+    await sleep(500);
+    await waitForNotionAIEntryAndClick(page);
+    await dismissPersonalizeDialogIfPresent(page);
+    const model = job.model?.trim();
+    if (model) {
+      await switchModel(page, model, modelSwitchOpts, job.timeoutSendMs);
+    }
+    const llmModel = await readLlmModelLabel(page);
+    const capture: RunLogSendCapture = { startedAtMs: null, notionUrlAtSend: null };
+    const ok = await tryTypeAndSend(
+      page,
+      job.prompt,
+      schedule.maxRetries,
+      schedule.autoClickDuringOutputWait ?? [],
+      job.timeoutSendMs,
+      modelSwitchOpts,
+      capture,
+    );
+    if (!ok) await clickStopInferenceIfVisible(page);
+    await flushRunLogToNotion(
+      page,
+      capture,
+      job.prompt,
+      ok,
+      llmModel,
+      schedule.runLogScreenshotOnSuccess === true,
+    );
+    if (ok) {
+      await markAdhocJobDone(job.id);
+      sent = 1;
+    } else {
+      await markAdhocJobFailed(job.id, "tryTypeAndSend 失败");
+    }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    logger.warn(`插队任务 ${job.id} 执行异常`, e);
+    await markAdhocJobFailed(job.id, msg);
+  }
+  try {
+    if (currentIndustry.notionUrl?.trim()) {
+      await page.goto(currentIndustry.notionUrl, { waitUntil: "domcontentloaded" });
+      await sleep(500);
+      await waitForNotionAIEntryAndClick(page);
+      await dismissPersonalizeDialogIfPresent(page);
+      await clickNewAIChat(page, schedule.maxRetries);
+    }
+  } catch (e) {
+    logger.warn("插队完成后恢复行业首页失败", e);
+  }
+  return sent;
+}
+
+/** Webhook 触发的「一次性」子进程：只执行一条插队任务后退出（不进入主循环）。 */
+async function runAdhocSingleJobMode(params: {
+  configPath: string;
+  storagePath?: string;
+  adhocJobId: string;
+  adhocAccountId?: string;
+}): Promise<void> {
+  const schedule = await loadSchedule(params.configPath);
+  if (params.storagePath != null) schedule.storagePath = params.storagePath;
+  if (schedule.timeSlots.length === 0) {
+    throw new Error("配置中时间区间列表为空，无法运行");
+  }
+  const accountId =
+    (params.adhocAccountId && params.adhocAccountId.trim()) ||
+    deriveAccountIdFromConfigPath(params.configPath) ||
+    null;
+  if (!accountId) {
+    throw new Error("adhoc 需要账号 id：请使用 --adhoc-account-id 或 accounts/<id>/schedule.json");
+  }
+  const job = await claimAdhocJobForOneShot(params.adhocJobId, accountId);
+  if (!job) {
+    throw new Error("插队任务不存在、已执行或分配给其他账号");
+  }
+  const storagePath = schedule.storagePath;
+  const finalHeadless = process.env.NOTION_AUTO_HEADLESS === "1" || (schedule.headless ?? false);
+  taskExecutionStarted = false;
+  currentBrowser = await chromium.launch({
+    headless: finalHeadless,
+    args: buildChromiumArgs(schedule.chromiumExtraArgs),
+  });
+  const storageState = await loadStorageStateCookiesOnly(storagePath);
+  const context = await currentBrowser.newContext(storageState ? { storageState } : {});
+  const page = await context.newPage();
+  currentPage = page;
+  page.setDefaultTimeout(30_000);
+  taskExecutionStarted = true;
+  const modelSwitchOpts = { blacklist: schedule.modelBlacklist ?? [] };
+  try {
+    await page.goto(job.url, { waitUntil: "domcontentloaded", timeout: job.timeoutGotoMs });
+    await sleep(500);
+    await waitForNotionAIEntryAndClick(page);
+    await dismissPersonalizeDialogIfPresent(page);
+    const model = job.model?.trim();
+    if (model) {
+      await switchModel(page, model, modelSwitchOpts, job.timeoutSendMs);
+    }
+    const llmModel = await readLlmModelLabel(page);
+    const capture: RunLogSendCapture = { startedAtMs: null, notionUrlAtSend: null };
+    const ok = await tryTypeAndSend(
+      page,
+      job.prompt,
+      schedule.maxRetries,
+      schedule.autoClickDuringOutputWait ?? [],
+      job.timeoutSendMs,
+      modelSwitchOpts,
+      capture,
+    );
+    if (!ok) await clickStopInferenceIfVisible(page);
+    await flushRunLogToNotion(
+      page,
+      capture,
+      job.prompt,
+      ok,
+      llmModel,
+      schedule.runLogScreenshotOnSuccess === true,
+    );
+    if (ok) await markAdhocJobDone(job.id);
+    else await markAdhocJobFailed(job.id, "tryTypeAndSend 失败");
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    logger.warn("adhoc 一次性任务失败", e);
+    await markAdhocJobFailed(job.id, msg);
+  } finally {
+    try {
+      await saveStorageStateCookiesOnly(context, storagePath);
+    } catch (e) {
+      logger.warn("保存登录态失败", e);
+    }
+    if (currentBrowser) {
+      try {
+        await currentBrowser.close();
+      } catch (e) {
+        logger.warn("关闭浏览器失败", e);
+      }
+      currentBrowser = null;
+      currentPage = null;
+    }
+  }
+}
+
 /** 运行入口：解析 --config、--storage，加载 schedule、等待落入区间后启动浏览器并进入主循环 */
 async function main(): Promise<void> {
+  const { configPath, storagePath: overrideStorage, adhocJobId, adhocAccountId } = getConfigPathFromArgs();
+  if (adhocJobId) {
+    await runAdhocSingleJobMode({
+      configPath,
+      storagePath: overrideStorage,
+      adhocJobId,
+      adhocAccountId: adhocAccountId ?? process.env.NOTION_AUTO_ACCOUNT_ID?.trim(),
+    });
+    process.exit(0);
+  }
+
   taskExecutionStarted = false;
   const mainStartTime = Date.now();
-  const { configPath, storagePath: overrideStorage } = getConfigPathFromArgs();
   const schedule = await loadSchedule(configPath);
   if (overrideStorage != null) schedule.storagePath = overrideStorage;
 
@@ -266,11 +594,16 @@ async function main(): Promise<void> {
 
   const isGlobalHeadless = process.env.NOTION_AUTO_HEADLESS === "1";
   const finalHeadless = isGlobalHeadless || (schedule.headless ?? false);
-  currentBrowser = await chromium.launch({ headless: finalHeadless });
+  currentBrowser = await chromium.launch({
+    headless: finalHeadless,
+    args: buildChromiumArgs(schedule.chromiumExtraArgs),
+  });
   const storagePath = schedule.storagePath;
-  const contextOptions = existsSync(storagePath) ? { storageState: storagePath } : {};
-  const context = await currentBrowser.newContext(contextOptions);
-  const page = await context.newPage();
+  // cookies-only 读：避免 Notion 启动瞬间 rehydrate localStorage cache 把 renderer 撑到 1~2GB
+  const storageState = await loadStorageStateCookiesOnly(storagePath);
+  // Step 4 的 recycle 需要能够重新赋值 context/page，这里用 let。
+  let context = await currentBrowser.newContext(storageState ? { storageState } : {});
+  let page = await context.newPage();
   currentPage = page;
   page.setDefaultTimeout(30_000);
 
@@ -279,7 +612,7 @@ async function main(): Promise<void> {
   }
   logger.info("正在打开 Notion…");
   await page.goto(currentIndustry.notionUrl, { waitUntil: "domcontentloaded" });
-  const hasSavedAuth = Boolean(contextOptions.storageState);
+  const hasSavedAuth = Boolean(storageState);
 
   try {
     if (hasSavedAuth) {
@@ -292,7 +625,7 @@ async function main(): Promise<void> {
 
     await openNotionAI(page, currentIndustry.notionUrl, schedule.maxRetries);
     try {
-      await context.storageState({ path: storagePath });
+      await saveStorageStateCookiesOnly(context, storagePath);
       logger.info("登录成功，已保存登录态");
     } catch (e) {
       logger.warn("保存登录态失败", e);
@@ -313,16 +646,57 @@ async function main(): Promise<void> {
     /** 发送后等待可发送状态的超时（毫秒），来自 schedule，默认 30 分钟；换模型前等待也使用此时长 */
     const waitSubmitReadyMs = schedule.waitSubmitReadyMs ?? 1_800_000;
     const modelSwitchOpts = { blacklist: schedule.modelBlacklist ?? [] };
+    const accountIdForAdhoc = deriveAccountIdFromConfigPath(configPath);
+
+    // ── 定时 recycle 浏览器（只在任务边界触发，不中断进行中任务）──────────────────
+    /** 自上次 recycle（或启动）以来的成功发送数；任务链 / 队列 / adhoc 成功都计入 */
+    let sendSinceRecycle = 0;
+    /** 上次 recycle（或启动）的时间戳 */
+    let recycleSince = Date.now();
+    const recycleEveryRuns = schedule.browserRecycle?.everyRunsMax ?? BROWSER_RECYCLE_DEFAULT_RUNS;
+    const recycleEveryMs =
+      (schedule.browserRecycle?.everyHours ?? BROWSER_RECYCLE_DEFAULT_HOURS) * 3_600_000;
+
+    /**
+     * 在任务边界检查并 recycle；必须只在 3 处循环顶调用：
+     * 主 for(;;)、Notion 队列内层 for(;;)、`for (task of tasks)`。
+     * recycle 会重新赋值本地 `context` / `page`，并**不改动**调度层计数。
+     */
+    const maybeRecycle = async (): Promise<void> => {
+      const runsTriggered = recycleEveryRuns > 0 && sendSinceRecycle >= recycleEveryRuns;
+      const timeTriggered = recycleEveryMs > 0 && Date.now() - recycleSince >= recycleEveryMs;
+      if (!runsTriggered && !timeTriggered) return;
+      // 窗口空档：若当前未处在任何行业（已离开时段且未进入新时段），延迟 recycle 到下一次进入行业时再触发。
+      if (!currentIndustry) return;
+      logger.info(
+        `触发浏览器 recycle：sendSinceRecycle=${sendSinceRecycle}, 距上次已 ${Math.round((Date.now() - recycleSince) / 60_000)} 分钟`,
+      );
+      const fresh = await relaunchBrowser(schedule, currentIndustry, storagePath, finalHeadless);
+      context = fresh.context;
+      page = fresh.page;
+      sendSinceRecycle = 0;
+      recycleSince = Date.now();
+    };
 
     // 标记主任务循环即将进入；此后的失败属于运行时故障，不再触发 serviceFailed 截图
     taskExecutionStarted = true;
 
     for (;;) {
+      // 任务边界 recycle 检查点①：主外层循环顶（不会中断任何进行中任务）
+      await maybeRecycle();
+      if (accountIdForAdhoc) {
+        sendSinceRecycle += await drainAdhocForRunningAccount(
+          page,
+          schedule,
+          currentIndustry,
+          accountIdForAdhoc,
+        );
+      }
       // 每轮任务链开始前：检查是否跨时间区间需切换行业
       const industryNow = getIndustryForNow(schedule);
       if (industryNow == null) {
         logger.info("当前时间未落入任何区间，等待中…");
-        await sleep(60_000);
+        await interruptibleSleep(60_000, accountIdForAdhoc);
         continue;
       }
       if (industryNow.id !== currentIndustry.id) {
@@ -357,6 +731,16 @@ async function main(): Promise<void> {
         /** 空队列起始时间戳（毫秒）；取到任务时清空，用于判断是否达到 Conductor 触发阈值 */
         let emptyQueueSince: number | null = null;
         for (;;) {
+          // 任务边界 recycle 检查点②：Notion 队列内层循环顶
+          await maybeRecycle();
+          if (accountIdForAdhoc) {
+            sendSinceRecycle += await drainAdhocForRunningAccount(
+              page,
+              schedule,
+              currentIndustry,
+              accountIdForAdhoc,
+            );
+          }
           const industryNow = getIndustryForNow(schedule);
           if (industryNow == null || industryNow.id !== currentIndustry.id) {
             logger.info("队列模式：已到点/已离开当前时段或行业已切换，停止拉取新任务");
@@ -430,11 +814,11 @@ async function main(): Promise<void> {
               }
               emptyQueueSince = null;
               logger.info("等待 5 分钟后继续抓取队列…");
-              await sleep(CONDUCTOR_POST_WAIT_MS);
+              await interruptibleSleep(CONDUCTOR_POST_WAIT_MS, accountIdForAdhoc);
               continue;
             }
             logger.info("队列暂无待执行任务，60 秒后重试…");
-            await sleep(60_000);
+            await interruptibleSleep(60_000, accountIdForAdhoc);
             continue;
           }
           emptyQueueSince = null;
@@ -452,7 +836,15 @@ async function main(): Promise<void> {
               logger.warn("标记任务失败状态时出错", err);
             }
             const intervalMs = randomIntInclusive(schedule.intervalMinMs, schedule.intervalMaxMs);
-            await sleep(intervalMs);
+            await interruptibleSleep(intervalMs, accountIdForAdhoc);
+            if (accountIdForAdhoc) {
+              sendSinceRecycle += await drainAdhocForRunningAccount(
+                page,
+                schedule,
+                currentIndustry,
+                accountIdForAdhoc,
+              );
+            }
             continue;
           }
           const queueModel = task.model?.trim();
@@ -477,6 +869,7 @@ async function main(): Promise<void> {
             if (ok) {
               await markTaskDone(queueConfig, task.pageId);
               sessionRuns++;
+              sendSinceRecycle++;
             } else {
               await clickStopInferenceIfVisible(page);
               await markTaskFailed(queueConfig, task.pageId);
@@ -494,7 +887,15 @@ async function main(): Promise<void> {
           );
           const intervalMs = randomIntInclusive(schedule.intervalMinMs, schedule.intervalMaxMs);
           logger.info(`等待 ${intervalMs / 1000} 秒后取下一条…`);
-          await sleep(intervalMs);
+          await interruptibleSleep(intervalMs, accountIdForAdhoc);
+          if (accountIdForAdhoc) {
+            sendSinceRecycle += await drainAdhocForRunningAccount(
+              page,
+              schedule,
+              currentIndustry,
+              accountIdForAdhoc,
+            );
+          }
           const afterNow = getIndustryForNow(schedule);
           if (afterNow == null || afterNow.id !== currentIndustry.id) {
             logger.info("队列模式：本任务完成后已离开当前时段，停止取新任务");
@@ -506,6 +907,16 @@ async function main(): Promise<void> {
 
       // 执行一轮任务链
       for (const task of currentIndustry.tasks) {
+        // 任务边界 recycle 检查点③：任务链内层循环顶
+        await maybeRecycle();
+        if (accountIdForAdhoc) {
+          sendSinceRecycle += await drainAdhocForRunningAccount(
+            page,
+            schedule,
+            currentIndustry,
+            accountIdForAdhoc,
+          );
+        }
         for (let k = 0; k < task.runCount; k++) {
           if (currentN > 0 && sessionRuns > 0 && sessionRuns % currentN === 0) {
             await clickNewAIChat(page, schedule.maxRetries);
@@ -586,6 +997,7 @@ async function main(): Promise<void> {
 
           runCount++;
           sessionRuns++;
+          sendSinceRecycle++;
           await saveProgress({ totalDone: runCount, conversationRuns: 0, completed: false });
           await flushRunLogToNotion(
             page,
@@ -599,7 +1011,15 @@ async function main(): Promise<void> {
 
           const intervalMs = randomIntInclusive(schedule.intervalMinMs, schedule.intervalMaxMs);
           logger.info(`等待 ${intervalMs / 1000} 秒后继续...`);
-          await sleep(intervalMs);
+          await interruptibleSleep(intervalMs, accountIdForAdhoc);
+          if (accountIdForAdhoc) {
+            sendSinceRecycle += await drainAdhocForRunningAccount(
+              page,
+              schedule,
+              currentIndustry,
+              accountIdForAdhoc,
+            );
+          }
         }
       }
       // 任务链完整跑完一轮后才计数；若本时段已跑满 chainRunsPerSlot 则等待离开当前时段
@@ -609,7 +1029,15 @@ async function main(): Promise<void> {
         logger.info(`本时段已跑满 ${chainRunsInSlot} 轮任务链（上限 ${limit}），等待离开当前时段…`);
         let waitMinutes = 0;
         for (;;) {
-          await sleep(60_000);
+          await interruptibleSleep(60_000, accountIdForAdhoc);
+          if (accountIdForAdhoc) {
+            sendSinceRecycle += await drainAdhocForRunningAccount(
+              page,
+              schedule,
+              currentIndustry,
+              accountIdForAdhoc,
+            );
+          }
           waitMinutes++;
           const next = getIndustryForNow(schedule);
           if (next == null || next.id !== currentIndustry.id) {
@@ -632,7 +1060,7 @@ async function main(): Promise<void> {
     throw startupErr;
   } finally {
     try {
-      await context.storageState({ path: storagePath });
+      await saveStorageStateCookiesOnly(context, storagePath);
     } catch (e) {
       logger.warn("保存登录态失败", e);
     }
@@ -647,34 +1075,54 @@ async function main(): Promise<void> {
   }
 }
 
-/** 从 argv 解析 --config、--storage；--config 默认 getSchedulePath() */
-function getConfigPathFromArgs(): { configPath: string; storagePath?: string } {
+/** 从 argv 解析 --config、--storage、--adhoc-job；--config 默认 getSchedulePath() */
+function getConfigPathFromArgs(): {
+  configPath: string;
+  storagePath?: string;
+  adhocJobId?: string;
+  adhocAccountId?: string;
+} {
   const args = process.argv.slice(2);
   let configPath = getSchedulePath();
   let storagePath: string | undefined;
+  let adhocJobId: string | undefined;
+  let adhocAccountId: string | undefined;
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--config" && args[i + 1] != null) {
       configPath = args[++i];
     } else if (args[i] === "--storage" && args[i + 1] != null) {
       storagePath = args[++i];
+    } else if (args[i] === "--adhoc-job" && args[i + 1] != null) {
+      adhocJobId = args[++i];
+    } else if (args[i] === "--adhoc-account-id" && args[i + 1] != null) {
+      adhocAccountId = args[++i];
     } else if (args[i] === "--help" || args[i] === "-h") {
       printHelp();
       process.exit(0);
     }
   }
-  return { configPath, storagePath };
+  if (!adhocJobId && process.env.NOTION_AUTO_ADHOC_JOB?.trim()) {
+    adhocJobId = process.env.NOTION_AUTO_ADHOC_JOB.trim();
+  }
+  if (!adhocAccountId && process.env.NOTION_AUTO_ACCOUNT_ID?.trim()) {
+    adhocAccountId = process.env.NOTION_AUTO_ACCOUNT_ID.trim();
+  }
+  return { configPath, storagePath, adhocJobId, adhocAccountId };
 }
 
 function printHelp(): void {
   process.stdout.write(`
 notion-auto — 时间区间 + 行业任务链（7×24 运行）
 
-用法: npm run run -- [--config <path>] [--storage <path>]
+用法: npm run run -- [--config <path>] [--storage <path>] [--adhoc-job <uuid>] [--adhoc-account-id <id>]
   --config <path>  配置文件路径（默认 schedule.json）
   --storage <path> 登录态保存路径（默认见 schedule 内 storagePath）
+  --adhoc-job <id>  仅执行一条 Webhook 插队任务后退出（由 Dashboard 启动，勿与主循环同账号并发）
+  --adhoc-account-id <id>  插队所属账号（也可用环境变量）
 
 环境变量:
   NOTION_AUTO_RESUME=1  由 Dashboard 恢复重启时设置，从当前时间对应行业任务 1 开始
+  NOTION_AUTO_ADHOC_JOB / NOTION_AUTO_ACCOUNT_ID  与 --adhoc-job / --adhoc-account-id 等价
 `);
 }
 

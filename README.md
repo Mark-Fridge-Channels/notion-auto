@@ -39,6 +39,23 @@ npx playwright install chromium
 - **数据库**：Notion 数据库需包含至少三列（类型与列名与配置一致）：Action Name（Text）、File URL（URL）、Status（Select，如 Queued/Done/Failed）。数据库需分享给该 Integration。
 - **到点停止**：使用 Notion 队列时，**时间一到（离开当前时间区间）只跑完当前正在执行的那条任务即停**，不再从队列取新任务；与手动任务链「跑满 N 轮再等离开时段」不同。
 
+## Webhook 插队任务（可选）
+
+与 **Notion 任务队列**无关：单独 HTTP 入队，持久化在 **`data/adhoc-queue.json`**（锁文件 `data/adhoc-queue.lock`）。每条任务字段：`url`（`page.goto` 目标）、`prompt`、`timeoutGotoMs`、`timeoutSendMs`、可选 `model`（仅当提供时才切换模型，不触发行业「每 M 次换模型」）。
+
+- **鉴权**：环境变量 **`NOTION_AUTO_WEBHOOK_TOKEN`**。请求头 **`Authorization: Bearer <token>`** 或 **`X-Webhook-Token: <token>`**。
+- **接口**：`POST /api/webhook/adhoc`，JSON body 见上；**202** 响应 `{ "accepted": true, "jobId": "<uuid>" }`（仅表示已入队/接受，不等待 Playwright 完成）。
+- **分配**：在 Dashboard 已加载的账号间 **idle 优先**，其次 **running**（主循环在间隔 sleep 中可被唤醒）；同档内轮询；每账号同时仅一条「已分配/执行中」插队。
+- **idle 账号**：Dashboard 为该账号启动 **一次性子进程**（`--adhoc-job`），跑完即退出，**不会**接着跑原 schedule 主循环。
+- **running 账号**：由现有子进程在安全点与可中断 sleep 中消费插队；完成后尝试回到当前行业 Portal 并 New chat，再继续原任务链/队列。
+- **积压**：无可用账号时任务保持 `queued`；Dashboard 进程内 **约每 8 秒** 尝试再次分配，插队终态后也会触发分配；单次分配轮询有上限，大量积压会分多轮消化。
+- **限制**：请求体约 **512KB** 上限；`url` / `prompt` / `model` 长度在服务端有上限（与磁盘恢复校验一致），避免过大 JSON 撑爆队列文件。
+
+curl -sS -X POST http://127.0.0.1:9000/api/webhook/adhoc \
+  -H "Authorization: Bearer 1234567890" \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://www.notion.so/34a9166fd9fd80ec8d04c37260db78ed?source=copy_link","prompt":"@生成一段开心的话 ","timeoutGotoMs":60000,"timeoutSendMs":120000}'
+
 ## 运行命令
 
 ```bash
@@ -77,6 +94,37 @@ npm run run -- --help
 **自动恢复**：脚本异常退出时 Dashboard 会自动重启；脚本按当前时间对应行业从任务 1 开始（不恢复任务进度）。连续自动重启超过 5 次时会发一封告警邮件（需配置 SMTP 环境变量，见下）。
 
 **告警邮件（可选）**：需在环境中配置以下变量后，连续自动重启 >5 次时才会发信（只发一封）：`NOTION_SMTP_HOST`、`NOTION_SMTP_PORT`（可选，默认 465）、`NOTION_SMTP_USER`、`NOTION_SMTP_PASS`、`NOTION_ALERT_TO`（收件人）。未配置则仅打日志不发信。
+
+## 内存优化（多账号 / 长时间运行）
+
+多账号同时启动 Chromium（尤其在 EC2 等低内存机器上）时，一段时间后内存会被打满。原因是：
+
+1. Playwright 的 `storageState` 默认把 Notion 前端的 **localStorage 缓存**（block / queryCache / AI 会话元数据）一起落盘，单账号 auth 文件可涨到 1MB+；每次新 context 会把这些数据注入 Chromium，Notion SPA 启动瞬间 rehydrate 出大量 JS 堆。
+2. 长时间运行的单个 Chromium 进程会累积 renderer 堆碎片、已关闭的 page 残留、Blink 内部 cache。
+
+本仓库已内置以下优化：
+
+- **只持久化 cookies**：`loadStorageStateCookiesOnly` / `saveStorageStateCookiesOnly` 读写时过滤掉 `origins`，登录态不丢；localStorage 由 Notion 按需重建。
+- **Chromium 降内存 launch args**：`--disable-dev-shm-usage`、`--disable-gpu`、`--disable-software-rasterizer`、`--disable-extensions`、关键 features 关闭、`--js-flags=--max-old-space-size=512`。schedule.json 可追加 `chromiumExtraArgs?: string[]` 微调。
+- **定时 recycle 浏览器**：默认每 **100 次成功发送**或**超过 6 小时**，在**任务边界**关闭并重新 launch Chromium（cookies 热加载，继续跑）。可通过 schedule.json 的 `browserRecycle?: { everyRunsMax?: number; everyHours?: number }` 调整；任一字段填 `0` 即关闭该维度。
+- **任务不中断**：recycle 检查点仅放在 3 处循环顶（主循环 / Notion 队列内层 / 任务链内层），绝不在 `tryTypeAndSend` / `page.goto` / 状态回写之间触发。已完成的发送与状态更新不会丢，只会「换一个干净的浏览器继续下一条」。
+- **Webhook 插队并发上限**：env `NOTION_AUTO_ADHOC_ONESHOT_MAX`（默认 3）限制同时最多启动的一次性子进程个数；超限时任务保持 `queued`，空位释放后继续分配。running 账号走进程内消费，每轮主循环最多 1 条，避免连续发多条导致 renderer 暴涨。
+
+### 一次性清洗历史 auth 文件
+
+升级到当前版本后，**仓库里老的 `.notion-auth.json` 可能仍包含大量 localStorage**（观察到过单账号 1.28MB、3900+ 条）。执行一次性瘦身：
+
+```bash
+npm run trim-auth
+```
+
+脚本会：
+
+1. 扫描 `./accounts/*/` 与根目录的 `.notion-auth.json`；
+2. 为每个文件生成 `.bak-<yyyyMMddHHmmss>` 备份；
+3. 原地写为 `{ cookies, origins: [] }`，打印前后 cookies / lsItems / 文件大小对照。
+
+登录态不受影响（cookies 全保留）。如需回滚，把备份文件改回原名即可。
 
 ## 仅本地使用
 

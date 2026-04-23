@@ -113,6 +113,21 @@ export interface Schedule {
    * 全局模型黑名单：与弹窗内选项展示名在 normalize 后整行相等则不参与轮换与指定匹配（须自行保证仍有可用模型）。
    */
   modelBlacklist?: string[];
+  /**
+   * 额外追加给 Chromium 的启动参数（可选）；会拼在内置降内存 args 之后。
+   * 仅用于特殊场景微调，日常不需要设置。
+   */
+  chromiumExtraArgs?: string[];
+  /**
+   * 浏览器定时 recycle：任一维度达到阈值即在任务边界处重启 Chromium 以释放 renderer 内存与碎片。
+   * - everyRunsMax：每累计 N 次成功发送后触发（含 adhoc / 队列 / 任务链），<=0 表示该维度关闭。
+   * - everyHours：距上次启动超过 H 小时后触发，<=0 表示该维度关闭。
+   * 任一字段缺省使用默认值（100 / 6）。
+   */
+  browserRecycle?: {
+    everyRunsMax?: number;
+    everyHours?: number;
+  };
 }
 
 const DEFAULT_STORAGE_PATH = ".notion-auth.json";
@@ -289,6 +304,22 @@ export function validateSchedule(s: Schedule): void {
     s.modelBlacklist.forEach((line, i) => {
       if (typeof line !== "string") throw new Error(`modelBlacklist[${i}] 必须为字符串`);
     });
+  }
+  if (s.chromiumExtraArgs !== undefined) {
+    if (!Array.isArray(s.chromiumExtraArgs)) throw new Error("chromiumExtraArgs 必须为字符串数组");
+    s.chromiumExtraArgs.forEach((line, i) => {
+      if (typeof line !== "string" || line.trim() === "")
+        throw new Error(`chromiumExtraArgs[${i}] 必须为非空字符串`);
+    });
+  }
+  if (s.browserRecycle !== undefined) {
+    if (s.browserRecycle == null || typeof s.browserRecycle !== "object")
+      throw new Error("browserRecycle 必须为对象");
+    const br = s.browserRecycle;
+    if (br.everyRunsMax !== undefined && (!Number.isFinite(br.everyRunsMax) || br.everyRunsMax < 0))
+      throw new Error("browserRecycle.everyRunsMax 必须为非负数（0 表示关闭该维度）");
+    if (br.everyHours !== undefined && (!Number.isFinite(br.everyHours) || br.everyHours < 0))
+      throw new Error("browserRecycle.everyHours 必须为非负数（0 表示关闭该维度）");
   }
 }
 

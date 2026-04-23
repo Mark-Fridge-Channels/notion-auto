@@ -1,6 +1,6 @@
 node_modules/
 dist/
-.notion-auth.json
+# .notion-auth.json
 params.json
 progress.json
 *.log
@@ -11,3 +11,5 @@ schedule.json
 
 notion-auto-backendworking.xml
 serviceFailed/*
+data/adhoc-queue.json
+data/adhoc-queue.lock
