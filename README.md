@@ -106,9 +106,11 @@ npm run run -- --help
 
 - **只持久化 cookies**：`loadStorageStateCookiesOnly` / `saveStorageStateCookiesOnly` 读写时过滤掉 `origins`，登录态不丢；localStorage 由 Notion 按需重建。
 - **Chromium 降内存 launch args**：`--disable-dev-shm-usage`、`--disable-gpu`、`--disable-software-rasterizer`、`--disable-extensions`、关键 features 关闭、`--js-flags=--max-old-space-size=512`。schedule.json 可追加 `chromiumExtraArgs?: string[]` 微调。
-- **定时 recycle 浏览器**：默认每 **100 次成功发送**或**超过 6 小时**，在**任务边界**关闭并重新 launch Chromium（cookies 热加载，继续跑）。可通过 schedule.json 的 `browserRecycle?: { everyRunsMax?: number; everyHours?: number }` 调整；任一字段填 `0` 即关闭该维度。
+- **定时 recycle 浏览器**：默认每 **50 次成功发送**或**超过 6 小时**，在**任务边界**关闭并重新 launch Chromium（cookies 热加载，继续跑）。可通过 schedule.json 的 `browserRecycle?: { everyRunsMax?: number; everyHours?: number }` 调整；任一字段填 `0` 即关闭该维度。
 - **任务不中断**：recycle 检查点仅放在 3 处循环顶（主循环 / Notion 队列内层 / 任务链内层），绝不在 `tryTypeAndSend` / `page.goto` / 状态回写之间触发。已完成的发送与状态更新不会丢，只会「换一个干净的浏览器继续下一条」。
 - **Webhook 插队并发上限**：env `NOTION_AUTO_ADHOC_ONESHOT_MAX`（默认 3）限制同时最多启动的一次性子进程个数；超限时任务保持 `queued`，空位释放后继续分配。running 账号走进程内消费，每轮主循环最多 1 条，避免连续发多条导致 renderer 暴涨。
+- **Dashboard「全部启动」错峰**：env `NOTION_AUTO_STARTUP_STAGGER_MS`（默认 25000ms）控制相邻账号的启动间隔，避免同一秒 N 个 Chromium 一起抢带宽 / CPU / swap，引发 Notion SPA 初刷互相拖累、`page.goto` 30s 超时。设为 `0` 回到旧行为（同时启动）。
+- **`page.goto` 超时兜底**：Notion 首页 / recycle 后的初次 `page.goto` 超时放宽到 **90s**，并在 `openNotionAI` 里做 URL 去重——如果当前 `page.url()` 已经指向目标页（origin+pathname 相同），不再 goto 第二次，直接等 AI 入口。避免「同 URL 双导航」在 renderer 忙时 timeout 30s。
 
 ### 一次性清洗历史 auth 文件
 

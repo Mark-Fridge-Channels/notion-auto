@@ -234,11 +234,37 @@ export function stopAccount(id: string): void {
   inst.runner.stop();
 }
 
+/**
+ * 错峰启动间隔（毫秒）：避免 6 个 Chromium 在同一秒抢带宽 / CPU / swap，
+ * 导致 Notion SPA 初刷互相拖累、`page.goto` 30s 超时。
+ *
+ * - env `NOTION_AUTO_STARTUP_STAGGER_MS` 覆盖（整数，>=0）
+ * - 默认 25_000ms（6 个账号约 2.5 分钟全部到位，可接受）
+ * - 设为 0 等同旧行为：同时 spawn
+ */
+const STARTUP_STAGGER_MS = (() => {
+  const raw = Number(process.env.NOTION_AUTO_STARTUP_STAGGER_MS);
+  if (!Number.isFinite(raw) || raw < 0) return 25_000;
+  return Math.floor(raw);
+})();
+
+/**
+ * 全部启动：按 `STARTUP_STAGGER_MS` 间隔逐个 spawn，非阻塞返回。
+ * 已 running 的账号自动跳过。后续新添加的账号不会被这次调用覆盖。
+ */
 export function startAll(opts?: { headlessOverride: boolean }): void {
+  const pending: AccountInstance[] = [];
   for (const [, inst] of instances) {
-    if (inst.runner.getRunStatus() === "idle") {
-      inst.runner.start(opts);
-    }
+    if (inst.runner.getRunStatus() === "idle") pending.push(inst);
+  }
+  if (pending.length === 0) return;
+  // 首账号立刻启动，后续按间隔排 setTimeout；中途有账号被手动起跑则跳过，避免重复 start。
+  pending[0]!.runner.start(opts);
+  for (let i = 1; i < pending.length; i++) {
+    const inst = pending[i]!;
+    setTimeout(() => {
+      if (inst.runner.getRunStatus() === "idle") inst.runner.start(opts);
+    }, i * STARTUP_STAGGER_MS);
   }
 }
 

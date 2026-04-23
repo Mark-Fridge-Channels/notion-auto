@@ -234,8 +234,12 @@ async function softWaitAfterPreShutdownStop(result: PreShutdownStopResult): Prom
   }
 }
 
-/** 浏览器 recycle 默认触发条件（schedule 未配置时使用） */
-const BROWSER_RECYCLE_DEFAULT_RUNS = 100;
+/**
+ * 浏览器 recycle 默认触发条件（schedule 未配置时使用）。
+ * 从 100 调到 50：多账号并发 + swap 命中的机器上，单 renderer 越「胖」越容易拖慢 page.goto，
+ * 较激进的回收能有效把每个 Chromium 的 RSS 压在一个合理区间。
+ */
+const BROWSER_RECYCLE_DEFAULT_RUNS = 50;
 const BROWSER_RECYCLE_DEFAULT_HOURS = 6;
 
 /** Step 4 使用：recycle 后返回的新 context/page，主循环据此替换本地引用 */
@@ -281,7 +285,8 @@ async function relaunchBrowser(
   currentPage = page;
   page.setDefaultTimeout(30_000);
   if (industry.notionUrl?.trim()) {
-    await page.goto(industry.notionUrl, { waitUntil: "domcontentloaded" });
+    // 带宽/CPU 争用 + swap 场景下 30s 默认超时偏紧，放 90s 兜底。
+    await page.goto(industry.notionUrl, { waitUntil: "domcontentloaded", timeout: 90_000 });
   }
   // recycle 后 cookies 足以维持登录态；留一点点时间给 Notion SPA 初始化后再进入下一步操作。
   await sleep(1000);
@@ -611,7 +616,8 @@ async function main(): Promise<void> {
     throw new Error(`行业 "${currentIndustry.id}" 的 Notion Portal URL 未配置，请在 Dashboard 中填写`);
   }
   logger.info("正在打开 Notion…");
-  await page.goto(currentIndustry.notionUrl, { waitUntil: "domcontentloaded" });
+  // 6 个账号并发启动时，出口带宽 + renderer CPU 都有争用，30s 默认超时会偶发命中；放 90s 兜底。
+  await page.goto(currentIndustry.notionUrl, { waitUntil: "domcontentloaded", timeout: 90_000 });
   const hasSavedAuth = Boolean(storageState);
 
   try {
@@ -1173,14 +1179,37 @@ async function waitForNotionAIEntryAndClick(page: import("playwright").Page): Pr
   await sleep(MODAL_WAIT_MS);
 }
 
-/** 打开 Notion 并点击 AI 入口；使用指定 notionUrl */
+/** 比较两个 URL 是否指向「同一张 Notion 页」：只看 origin+pathname，忽略 query/hash。解析失败原样返回。 */
+function samePageUrl(a: string, b: string): boolean {
+  try {
+    const ua = new URL(a);
+    const ub = new URL(b);
+    return ua.origin + ua.pathname === ub.origin + ub.pathname;
+  } catch {
+    return a === b;
+  }
+}
+
+/**
+ * 打开 Notion 并点击 AI 入口；使用指定 notionUrl。
+ *
+ * 关键细节（踩过坑）：
+ * - 调用方（main / relaunchBrowser）在进入本函数前通常**已经**做过一次 `page.goto(notionUrl)`，
+ *   本函数若无条件再 goto 一次，等于「同 URL 双导航」：第 2 次 goto 要 Chromium 把旧页 unload 再
+ *   commit 新页，而 Notion SPA 首刷阶段 renderer 主线程还在忙（bundle 解析 + React bootstrap +
+ *   workspace/user/block API），**多账号并发 + swap 偶有命中**时 30s timeout 很常见。
+ * - 这里先比较 origin+pathname：**已在目标页则不再 goto**，直接走 waitForNotionAIEntryAndClick；
+ *   页面真的跑偏再 goto，且把 timeout 放到 90s 兜底带宽 / CPU 争用。
+ */
 async function openNotionAI(
   page: import("playwright").Page,
   notionUrl: string,
   maxRetries: number,
 ): Promise<void> {
   await runWithRetry(maxRetries, async () => {
-    await page.goto(notionUrl, { waitUntil: "domcontentloaded" });
+    if (!samePageUrl(page.url(), notionUrl)) {
+      await page.goto(notionUrl, { waitUntil: "domcontentloaded", timeout: 90_000 });
+    }
     await waitForNotionAIEntryAndClick(page);
   });
   await dismissPersonalizeDialogIfPresent(page);
