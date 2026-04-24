@@ -1226,8 +1226,13 @@ function escapeRegex(s: string): string {
 }
 
 /**
- * 在总超时内轮询：先查发送按钮可见则结束；否则按配置顺序查「role=button、name 精确匹配」的按钮，可见则点击后继续轮询。
+ * 在总超时内轮询：发送按钮可见「且」停止按钮不可见时才判定完成；
+ * 否则按配置顺序查「role=button、name 精确匹配」的按钮，可见则点击后继续轮询。
  * 不重置总超时；点击失败仅打日志。
+ *
+ * 仅凭「send 可见」判完成会误杀：Notion AI 在推理分段、工具调用、交互弹窗等过渡期会瞬间把按钮切回 send 状态，
+ * 造成任务仍在生成但被判完成、随后被下一轮 typeAndSend / clickStopInferenceIfVisible 打断。
+ * 增加「stop 不可见」硬条件，即可过滤掉 stop↔send 瞬态切换，避免误判。
  */
 async function waitForSendButtonWithAutoClick(
   page: import("playwright").Page,
@@ -1237,7 +1242,12 @@ async function waitForSendButtonWithAutoClick(
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const sendBtn = page.locator(SEND_BUTTON).first();
-    if (await sendBtn.isVisible().catch(() => false)) return;
+    const stopBtn = page.locator(STOP_INFERENCE_BUTTON).first();
+    const sendVisible = await sendBtn.isVisible().catch(() => false);
+    const stopVisible = sendVisible
+      ? await stopBtn.isVisible().catch(() => false)
+      : true;
+    if (sendVisible && !stopVisible) return;
     for (const name of buttonNames) {
       const loc = page.getByRole("button", { name: new RegExp("^" + escapeRegex(name) + "$") }).first();
       if (await loc.isVisible().catch(() => false)) {

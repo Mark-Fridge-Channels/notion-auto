@@ -239,12 +239,12 @@ export function stopAccount(id: string): void {
  * 导致 Notion SPA 初刷互相拖累、`page.goto` 30s 超时。
  *
  * - env `NOTION_AUTO_STARTUP_STAGGER_MS` 覆盖（整数，>=0）
- * - 默认 25_000ms（6 个账号约 2.5 分钟全部到位，可接受）
+ * - 默认 5_000ms（相邻账号间隔 5 秒；仍可用 env 调大以减轻同机多 Chromium 争抢）
  * - 设为 0 等同旧行为：同时 spawn
  */
 const STARTUP_STAGGER_MS = (() => {
   const raw = Number(process.env.NOTION_AUTO_STARTUP_STAGGER_MS);
-  if (!Number.isFinite(raw) || raw < 0) return 25_000;
+  if (!Number.isFinite(raw) || raw < 0) return 5_000;
   return Math.floor(raw);
 })();
 
