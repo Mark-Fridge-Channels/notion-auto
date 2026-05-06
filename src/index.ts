@@ -60,6 +60,7 @@ import {
   markAdhocJobDone,
   markAdhocJobFailed,
 } from "./adhoc-queue.js";
+import { generateTaskContent } from "./task-content-generator.js";
 
 /** 当前已启动的浏览器实例，供退出前关闭及 SIGTERM 处理使用；launch 后赋值，close 后置空 */
 let currentBrowser: Browser | null = null;
@@ -924,6 +925,8 @@ async function main(): Promise<void> {
           );
         }
         for (let k = 0; k < task.runCount; k++) {
+          // 任务链每次执行都实时生成新文案，避免重复使用配置中的固定 task.content。
+          const generatedTaskContent = generateTaskContent();
           if (currentN > 0 && sessionRuns > 0 && sessionRuns % currentN === 0) {
             await clickNewAIChat(page, schedule.maxRetries);
             sessionRuns = 0;
@@ -941,7 +944,7 @@ async function main(): Promise<void> {
           const chainCapture: RunLogSendCapture = { startedAtMs: null, notionUrlAtSend: null };
           let ok = await tryTypeAndSend(
             page,
-            task.content,
+            generatedTaskContent,
             schedule.maxRetries,
             schedule.autoClickDuringOutputWait ?? [],
             waitSubmitReadyMs,
@@ -955,7 +958,7 @@ async function main(): Promise<void> {
               llmModel = await readLlmModelLabel(page);
               ok = await tryTypeAndSend(
                 page,
-                task.content,
+                generatedTaskContent,
                 schedule.maxRetries,
                 schedule.autoClickDuringOutputWait ?? [],
                 waitSubmitReadyMs,
@@ -974,7 +977,7 @@ async function main(): Promise<void> {
                 llmModel = await readLlmModelLabel(page);
                 ok = await tryTypeAndSend(
                   page,
-                  task.content,
+                  generatedTaskContent,
                   schedule.maxRetries,
                   schedule.autoClickDuringOutputWait ?? [],
                   waitSubmitReadyMs,
@@ -991,7 +994,7 @@ async function main(): Promise<void> {
             await flushRunLogToNotion(
               page,
               chainCapture,
-              task.content,
+              generatedTaskContent,
               false,
               llmModel,
               schedule.runLogScreenshotOnSuccess === true,
@@ -1008,12 +1011,12 @@ async function main(): Promise<void> {
           await flushRunLogToNotion(
             page,
             chainCapture,
-            task.content,
+            generatedTaskContent,
             true,
             llmModel,
             schedule.runLogScreenshotOnSuccess === true,
           );
-          logger.info(`行业 ${currentIndustry.id} 已执行 ${runCount} 次（任务 "${task.content.slice(0, 30)}…"）`);
+          logger.info(`行业 ${currentIndustry.id} 已执行 ${runCount} 次（任务 "${generatedTaskContent.slice(0, 30)}…"）`);
 
           const intervalMs = randomIntInclusive(schedule.intervalMinMs, schedule.intervalMaxMs);
           logger.info(`等待 ${intervalMs / 1000} 秒后继续...`);
