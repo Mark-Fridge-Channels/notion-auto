@@ -170,15 +170,15 @@ const evaluationTaskList = [
   "the run is in great shape, proceed to next actions",
 ] as const;
 
-// 评价文案穿插频率：每 1～3 次生成中，命中 1 次评价文案（且评价文案不带 @）
-let roundsUntilEvaluation = randomIntInclusive(1, 3);
+// 评价文案穿插频率：先生成 1～3 条正常任务，再插入 1 条评价文案（评价文案不带 @）
+let normalTasksBeforeNextEvaluation = randomIntInclusive(1, 3);
 
 function shouldEmitEvaluationTask(): boolean {
-  roundsUntilEvaluation -= 1;
-  if (roundsUntilEvaluation <= 0) {
-    roundsUntilEvaluation = randomIntInclusive(1, 3);
+  if (normalTasksBeforeNextEvaluation <= 0) {
+    normalTasksBeforeNextEvaluation = randomIntInclusive(1, 3);
     return true;
   }
+  normalTasksBeforeNextEvaluation -= 1;
   return false;
 }
 
