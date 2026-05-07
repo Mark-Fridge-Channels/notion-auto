@@ -117,31 +117,36 @@ function runNpmInstall(cwd: string): Promise<{ exitCode: number; stdout: string;
  *   - 无 running 可用的情况下直接跳过本 tick，任务继续保持 queued，等待下一 tick 或空位。
  */
 async function tryDrainQueuedAssignments(): Promise<void> {
-  for (let n = 0; n < ADHOC_MAX_ASSIGN_PER_TICK; n++) {
-    const inFlightOneShot = accountManager.countAdhocOnceInFlight();
-    const canSpawnMore =
-      ADHOC_ONESHOT_MAX_CONCURRENCY <= 0 || inFlightOneShot < ADHOC_ONESHOT_MAX_CONCURRENCY;
-    const rawAccounts = accountManager.listAccounts().map((a) => ({
-      id: a.id,
-      runStatus: a.status,
-    }));
-    // 达到一次性子进程并发上限时，本 tick 内不让 assign 选中 idle 账号
-    const accounts = canSpawnMore
-      ? rawAccounts
-      : rawAccounts.filter((a) => a.runStatus === "running");
-    if (accounts.length === 0) break;
-    const r = await assignOneQueuedJob(accounts);
-    if (!r.assigned || !r.jobId || !r.accountId) break;
-    if (r.targetWasIdle) {
-      try {
-        accountManager.startAdhocOnce(r.accountId, r.jobId);
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        logger.warn(`为账号 ${r.accountId} 启动插队子进程失败: ${msg}`);
-        await markAdhocJobFailedIfActive(r.jobId, `启动子进程失败: ${msg}`);
+  try {
+    for (let n = 0; n < ADHOC_MAX_ASSIGN_PER_TICK; n++) {
+      const inFlightOneShot = accountManager.countAdhocOnceInFlight();
+      const canSpawnMore =
+        ADHOC_ONESHOT_MAX_CONCURRENCY <= 0 || inFlightOneShot < ADHOC_ONESHOT_MAX_CONCURRENCY;
+      const rawAccounts = accountManager.listAccounts().map((a) => ({
+        id: a.id,
+        runStatus: a.status,
+      }));
+      // 达到一次性子进程并发上限时，本 tick 内不让 assign 选中 idle 账号
+      const accounts = canSpawnMore
+        ? rawAccounts
+        : rawAccounts.filter((a) => a.runStatus === "running");
+      if (accounts.length === 0) break;
+      const r = await assignOneQueuedJob(accounts);
+      if (!r.assigned || !r.jobId || !r.accountId) break;
+      if (r.targetWasIdle) {
+        try {
+          accountManager.startAdhocOnce(r.accountId, r.jobId);
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          logger.warn(`为账号 ${r.accountId} 启动插队子进程失败: ${msg}`);
+          await markAdhocJobFailedIfActive(r.jobId, `启动子进程失败: ${msg}`);
+        }
       }
+      await new Promise<void>((resolve) => setImmediate(resolve));
     }
-    await new Promise<void>((resolve) => setImmediate(resolve));
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    logger.warn(`尝试分配 adhoc 队列失败（本 tick 已跳过）: ${msg}`, e);
   }
 }
 

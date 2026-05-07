@@ -39,6 +39,8 @@ type TextRichTextItem = { type: "text"; text: { content: string } };
 export interface RunLogSendCapture {
   startedAtMs: number | null;
   notionUrlAtSend: string | null;
+  /** 运行期间是否出现 "This action is not currently available..." 节点 */
+  hitActionUnavailable?: boolean;
 }
 
 /** 需同时配置 NOTION_API_KEY 与 NOTION_RUN_LOG_DATABASE_URL（Integration 能访问该日志库） */
@@ -110,6 +112,8 @@ export interface AppendRunLogParams {
   llmModel: string;
   /** 本地截图文件路径；无截图时为空 */
   failureScreenshotPath?: string;
+  /** 可选：显式覆盖日志状态，不填时按 success 推导 */
+  statusOverride?: "success" | "failed";
 }
 
 /**
@@ -129,6 +133,7 @@ export async function appendRunLogEntry(params: AppendRunLogParams): Promise<voi
     extractedBody,
     llmModel,
     failureScreenshotPath,
+    statusOverride,
   } = params;
   const databaseId = extractDatabaseId(dbUrl);
   if (!databaseId) {
@@ -137,6 +142,9 @@ export async function appendRunLogEntry(params: AppendRunLogParams): Promise<voi
 
   const client = new Client({ auth: key });
   const title = buildLogPageTitle(finishedAtMs);
+
+  const finalStatus =
+    statusOverride ?? (success ? STATUS_SUCCESS : STATUS_FAILED);
 
   const props: Record<string, unknown> = {
     [COL_TITLE]: {
@@ -153,7 +161,7 @@ export async function appendRunLogEntry(params: AppendRunLogParams): Promise<voi
     },
     [COL_STATUS]: {
       select: {
-        name: success ? STATUS_SUCCESS : STATUS_FAILED,
+        name: finalStatus,
       },
     },
     [COL_LLM_MODEL]: {

@@ -14,6 +14,8 @@ const QUEUE_FILE = "adhoc-queue.json";
 const LOCK_FILE = "adhoc-queue.lock";
 /** 超过该时间未更新的 lock 视为陈旧（仅防崩溃遗留）；正常持锁可能达数分钟，不宜过短 */
 const LOCK_STALE_MS = 900_000;
+/** 0 字节锁文件仅在存在一小段时间后才视为遗留，避免误删「刚独占创建尚未写入 PID」的文件 */
+const LOCK_EMPTY_ABANDON_MS = 2_500;
 const LOCK_RETRY_MS = 50;
 const MAX_URL_LEN = 4096;
 const MAX_PROMPT_LEN = 100_000;
@@ -168,7 +170,48 @@ async function writeStoreUnlocked(store: AdhocQueueStore): Promise<void> {
   await rename(tmp, p);
 }
 
-/** 排他锁：跨平台用独占创建 lock 文件；陈旧锁可抢占（防止崩溃遗留） */
+function isLikelyPidDead(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return true;
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+/** 尝试摘除明显无主的 lock：崩溃常留下 0 字节文件或持有者进程已不存在 */
+async function tryRemoveAbandonedLock(lp: string): Promise<boolean> {
+  let st;
+  try {
+    st = await stat(lp);
+  } catch {
+    return false;
+  }
+  const age = Date.now() - st.mtimeMs;
+  if (age > LOCK_STALE_MS) {
+    await unlink(lp).catch(() => {});
+    return true;
+  }
+  if (st.size === 0 && age > LOCK_EMPTY_ABANDON_MS) {
+    await unlink(lp).catch(() => {});
+    return true;
+  }
+  try {
+    const raw = (await readFile(lp, "utf-8")).trim();
+    const data = JSON.parse(raw) as { pid?: unknown };
+    const pid = typeof data.pid === "number" ? data.pid : NaN;
+    if (Number.isFinite(pid) && isLikelyPidDead(pid)) {
+      await unlink(lp).catch(() => {});
+      return true;
+    }
+  } catch {
+    /* 非 JSON（旧格式空文件已由 size===0 处理）则仅依赖陈旧时间 */
+  }
+  return false;
+}
+
+/** 排他锁：跨平台用独占创建 lock 文件；陈旧锁或可判定为孤儿锁时抢占（防止崩溃遗留） */
 async function withQueueLock<T>(fn: () => Promise<T>): Promise<T> {
   await ensureDataDir();
   const lp = lockPath();
@@ -176,19 +219,20 @@ async function withQueueLock<T>(fn: () => Promise<T>): Promise<T> {
   let lockFd: import("node:fs/promises").FileHandle | null = null;
   while (Date.now() < deadline) {
     try {
-      lockFd = await open(lp, "wx");
-      break;
-    } catch {
+      const fd = await open(lp, "wx");
       try {
-        const { mtimeMs } = await stat(lp);
-        if (Date.now() - mtimeMs > LOCK_STALE_MS) {
-          await unlink(lp).catch(() => {});
-          continue;
-        }
+        await fd.writeFile(`${JSON.stringify({ pid: process.pid, at: Date.now() })}\n`, "utf-8");
+        lockFd = fd;
+        break;
       } catch {
-        // stat 失败则继续重试 open
+        await fd.close().catch(() => {});
+        await unlink(lp).catch(() => {});
       }
-      await sleep(LOCK_RETRY_MS);
+    } catch {
+      const removed = await tryRemoveAbandonedLock(lp);
+      if (!removed) {
+        await sleep(LOCK_RETRY_MS);
+      }
     }
   }
   if (!lockFd) {

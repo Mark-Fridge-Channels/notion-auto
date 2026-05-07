@@ -68,6 +68,65 @@ const humanFillers = [
 
 const connectors = ["，", "，然后", "，接着", "，最后", "，顺便", " ", " and ", " then "] as const;
 
+const actionCoreList = [
+  "请继续执行后续流程",
+  "请把剩余步骤完整跑完",
+  "请按顺序推进当前任务链",
+  "请执行当前这段核心逻辑",
+  "请完成本轮剩余任务并继续推进",
+  "请继续处理后面的关键步骤",
+  "please continue executing the next steps",
+  "please run the remaining workflow steps",
+  "please proceed with the core execution flow",
+  "please complete the remaining actions in order",
+] as const;
+
+const outputRequirementList = [
+  "并输出本轮执行结果摘要",
+  "并返回关键完成项与下一步建议",
+  "并给出已完成步骤与待处理项",
+  "并汇总主要结果和风险点",
+  "并反馈本轮任务的关键结论",
+  "and return a concise execution summary",
+  "and report completed steps and pending items",
+  "and provide key outcomes with next actions",
+] as const;
+
+const softTailList = [
+  "按现在节奏就可以",
+  "保持当前做法即可",
+  "先不用额外调整",
+  "简单确认关键点就行",
+  "不用做复杂修改",
+  "no extra adjustments needed for now",
+  "keep the current approach",
+] as const;
+
+function joinClause(a: string, b: string): string {
+  if (!a) return b;
+  if (!b) return a;
+  return `${a}${pick(connectors)}${b}`;
+}
+
+function buildActionTemplateSentence(): string {
+  const context = maybe(contextList, 0.85);
+  const tone = maybe(toneList, 0.75);
+  const core = pick(actionCoreList);
+  const output = pick(outputRequirementList);
+  const tail = maybe(softTailList, 0.55);
+
+  let sentence = "";
+  sentence = joinClause(sentence, context);
+  sentence = joinClause(sentence, tone);
+  sentence = joinClause(sentence, `${core}，${output}`);
+  sentence = joinClause(sentence, tail);
+
+  if (Math.random() < 0.45) {
+    sentence = pick(humanFillers) + sentence;
+  }
+  return cleanSpacing(sentence).replace(/[，,\s]+$/, "") + " @";
+}
+
 function buildSentence(): string {
   const parts = [
     maybe(contextList, 0.9),
@@ -228,9 +287,5 @@ export function generateTaskContent(): string {
   if (shouldEmitEvaluationTask()) {
     return pick(evaluationTaskList);
   }
-  let base = buildSentence();
-  if (Math.random() < 0.8) {
-    base = rewrite(base);
-  }
-  return base;
+  return buildActionTemplateSentence();
 }

@@ -1228,6 +1228,83 @@ function escapeRegex(s: string): string {
   return s.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
 }
 
+function readMsFromEnv(name: string, fallback: number): number {
+  const raw = process.env[name]?.trim();
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) return fallback;
+  return Math.floor(parsed);
+}
+
+/**
+ * send-ready 后若本轮曾出现过自动按钮，则持续监控直到「静默窗口」结束：
+ * - idle：最近一次命中目标按钮后，连续多久未再命中才允许退出；
+ * - max：send-ready 后最多额外监控多久，避免极端页面无限等待。
+ */
+const AUTO_CLICK_POST_SEND_IDLE_MS = readMsFromEnv("NOTION_AUTO_POST_SEND_IDLE_MS", 120_000);
+const AUTO_CLICK_POST_SEND_MAX_MS = readMsFromEnv("NOTION_AUTO_POST_SEND_MAX_MS", 600_000);
+
+type AutoClickScanState = {
+  clicked: boolean;
+  matched: boolean;
+  visible: boolean;
+};
+
+async function tryAutoClickConfiguredButtons(
+  page: import("playwright").Page,
+  buttonNames: string[],
+  phase: "wait" | "sweep",
+  tick: number,
+): Promise<AutoClickScanState> {
+  let matched = false;
+  let visible = false;
+  for (const name of buttonNames) {
+    const exact = page.getByRole("button", { name: new RegExp("^" + escapeRegex(name) + "$") });
+    const matchCount = await exact.count().catch(() => -1);
+    if (matchCount > 0) matched = true;
+    const loc = exact.first();
+    const firstVisible = await loc.isVisible().catch(() => false);
+    if (firstVisible) visible = true;
+    // logger.info(
+    //   `[auto-click][${phase}] tick=${tick} name="${name}" matchCount=${matchCount} firstVisible=${firstVisible}`,
+    // );
+    if (!firstVisible) continue;
+    try {
+      await loc.click();
+      // logger.info(`自动点击按钮成功（Playwright） phase=${phase} name=${name}`);
+      return { clicked: true, matched: true, visible: true };
+    } catch (e) {
+      logger.warn(`自动点击按钮失败（将降级 DOM 点击） phase=${phase} name=${name}`, e);
+      try {
+        await loc.evaluate((el) => {
+          const node = el as HTMLElement;
+          node.click();
+          const rect = node.getBoundingClientRect();
+          const x = rect.left + rect.width / 2;
+          const y = rect.top + rect.height / 2;
+          const target = document.elementFromPoint(x, y) ?? node;
+          const opts = {
+            bubbles: true,
+            cancelable: true,
+            clientX: x,
+            clientY: y,
+            view: window,
+          };
+          target.dispatchEvent(new MouseEvent("pointerdown", opts));
+          target.dispatchEvent(new MouseEvent("mousedown", opts));
+          target.dispatchEvent(new MouseEvent("mouseup", opts));
+          target.dispatchEvent(new MouseEvent("click", opts));
+        });
+        logger.info(`自动点击按钮成功（DOM fallback） phase=${phase} name=${name}`);
+        return { clicked: true, matched: true, visible: true };
+      } catch (fallbackErr) {
+        logger.warn(`自动点击按钮失败（DOM fallback） phase=${phase} name=${name}`, fallbackErr);
+      }
+    }
+  }
+  return { clicked: false, matched, visible };
+}
+
 /**
  * 在总超时内轮询：发送按钮可见「且」停止按钮不可见时才判定完成；
  * 否则按配置顺序查「role=button、name 精确匹配」的按钮，可见则点击后继续轮询。
@@ -1243,34 +1320,60 @@ async function waitForSendButtonWithAutoClick(
   timeoutMs: number,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
+  let tick = 0;
+  let sawConfiguredButton = false;
+  let lastConfiguredButtonActivityAt: number | null = null;
+  let sendReadySince: number | null = null;
+  // logger.info(`[auto-click][wait] start buttonNames=${JSON.stringify(buttonNames)} timeoutMs=${timeoutMs}`);
   while (Date.now() < deadline) {
+    tick++;
     const sendBtn = page.locator(SEND_BUTTON).first();
     const stopBtn = page.locator(STOP_INFERENCE_BUTTON).first();
+    // 先扫一遍可自动点击按钮：避免 send/stop 状态已满足时提前 return，漏点同轮后续弹出的 Continue 等按钮。
+    const scan = await tryAutoClickConfiguredButtons(page, buttonNames, "wait", tick);
+    if (scan.matched || scan.visible || scan.clicked) {
+      sawConfiguredButton = true;
+      lastConfiguredButtonActivityAt = Date.now();
+    }
     const sendVisible = await sendBtn.isVisible().catch(() => false);
     const stopVisible = sendVisible
       ? await stopBtn.isVisible().catch(() => false)
       : true;
-    if (sendVisible && !stopVisible) return;
-    for (const name of buttonNames) {
-      const loc = page.getByRole("button", { name: new RegExp("^" + escapeRegex(name) + "$") }).first();
-      if (await loc.isVisible().catch(() => false)) {
-        try {
-          await loc.click();
-        } catch (e) {
-          logger.warn(`等待输出期间自动点击按钮失败 name=${name}`, e);
-        }
-        break;
+    // logger.info(
+    //   `[auto-click][wait] tick=${tick} sendVisible=${sendVisible} stopVisible=${stopVisible} remainingMs=${Math.max(0, deadline - Date.now())}`,
+    // );
+    if (sendVisible && !stopVisible) {
+      if (sendReadySince == null) sendReadySince = Date.now();
+      if (!sawConfiguredButton) {
+        logger.info(`[auto-click][wait] done tick=${tick} reason=send_visible_and_stop_hidden_no_button_activity`);
+        return;
+      }
+      const now = Date.now();
+      const idleMs =
+        lastConfiguredButtonActivityAt == null ? Number.MAX_SAFE_INTEGER : now - lastConfiguredButtonActivityAt;
+      const postSendElapsed = now - sendReadySince;
+      // logger.info(
+      //   `[auto-click][wait] post-send-monitor tick=${tick} idleMs=${idleMs} idleTargetMs=${AUTO_CLICK_POST_SEND_IDLE_MS} elapsedMs=${postSendElapsed} elapsedMaxMs=${AUTO_CLICK_POST_SEND_MAX_MS}`,
+      // );
+      if (idleMs >= AUTO_CLICK_POST_SEND_IDLE_MS) {
+        logger.info(`[auto-click][wait] done tick=${tick} reason=post_send_idle_reached`);
+        return;
+      }
+      if (postSendElapsed >= AUTO_CLICK_POST_SEND_MAX_MS) {
+        logger.info(`[auto-click][wait] done tick=${tick} reason=post_send_monitor_max_reached`);
+        return;
       }
     }
     const remaining = deadline - Date.now();
     if (remaining <= 0) break;
     await sleep(Math.min(AUTO_CLICK_POLL_MS, remaining));
   }
+  logger.warn("[auto-click][wait] timeout while waiting send-ready");
   throw new WaitAfterSendTimeoutError(new Error("timeout"));
 }
 
-/** 事后清扫时长（毫秒）：等待结束后再扫这段时间，覆盖「对话已结束、按钮稍后才弹出」的情况 */
-const SWEEP_DURATION_MS = 5000;
+/** 事后清扫时长（毫秒）：默认 60 秒，可用环境变量 NOTION_AUTO_SWEEP_DURATION_MS 覆盖 */
+const SWEEP_DURATION_MS = readMsFromEnv("NOTION_AUTO_SWEEP_DURATION_MS", 60_000);
 /** 事后清扫轮询间隔（毫秒） */
 const SWEEP_INTERVAL_MS = 1000;
 
@@ -1283,22 +1386,16 @@ async function sweepAutoClickButtons(
   buttonNames: string[],
 ): Promise<void> {
   const deadline = Date.now() + SWEEP_DURATION_MS;
+  let tick = 0;
+  logger.info(`[auto-click][sweep] start buttonNames=${JSON.stringify(buttonNames)} durationMs=${SWEEP_DURATION_MS}`);
   while (Date.now() < deadline) {
-    for (const name of buttonNames) {
-      const loc = page.getByRole("button", { name: new RegExp("^" + escapeRegex(name) + "$") }).first();
-      if (await loc.isVisible().catch(() => false)) {
-        try {
-          await loc.click();
-        } catch (e) {
-          logger.warn(`事后清扫自动点击按钮失败 name=${name}`, e);
-        }
-        break;
-      }
-    }
+    tick++;
+    await tryAutoClickConfiguredButtons(page, buttonNames, "sweep", tick);
     const remaining = deadline - Date.now();
     if (remaining <= 0) break;
     await sleep(Math.min(SWEEP_INTERVAL_MS, remaining));
   }
+  // logger.info("[auto-click][sweep] done");
 }
 
 /**
@@ -1501,9 +1598,19 @@ class SendButtonUnavailableError extends Error {
   }
 }
 
+const ACTION_UNAVAILABLE_KEYWORD = "this action is not currently available";
+
 async function findUnavailableErrorText(page: Page): Promise<string | null> {
   return page.evaluate(() => {
-    const icon = document.querySelector("svg.exclamationMarkTriangleFill");
+    const actionUnavailableText = "this action is not currently available";
+    const allDivs = Array.from(document.querySelectorAll("div"));
+    for (const div of allDivs) {
+      const t = (div as HTMLElement).innerText?.trim().toLowerCase();
+      if (t && t.includes(actionUnavailableText)) {
+        return (div as HTMLElement).innerText.trim();
+      }
+    }
+    const icon = document.querySelector("svg.exclamationMarkTriangleFill, svg.exclamationMarkCircleSmall");
     if (!icon) return null;
     let box: Element | null = icon;
     for (let i = 0; i < 8 && box; i++) {
@@ -1516,6 +1623,10 @@ async function findUnavailableErrorText(page: Page): Promise<string | null> {
     }
     return null;
   });
+}
+
+function isActionUnavailableMessage(detail: string): boolean {
+  return detail.toLowerCase().includes(ACTION_UNAVAILABLE_KEYWORD);
 }
 
 /**
@@ -1551,6 +1662,7 @@ async function flushRunLogToNotion(
       extractedBody,
       llmModel,
       failureScreenshotPath,
+      statusOverride: capture.hitActionUnavailable ? "failed" : undefined,
     });
   } catch (e) {
     logger.warn("运行日志：写入 Notion 失败", e);
@@ -1631,6 +1743,9 @@ async function tryTypeAndSend(
       return true;
     } catch (e) {
       if (e instanceof SendButtonUnavailableError) {
+        if (sendCapture && isActionUnavailableMessage(e.detail)) {
+          sendCapture.hitActionUnavailable = true;
+        }
         logger.warn(`发送按钮不可用，准备切换下一个可用模型并重试：${e.detail}`);
         await switchModel(page, undefined, modelSwitchOpts, timeoutMs);
         continue;
