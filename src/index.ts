@@ -1329,6 +1329,15 @@ async function waitForSendButtonWithAutoClick(
     tick++;
     const sendBtn = page.locator(SEND_BUTTON).first();
     const stopBtn = page.locator(STOP_INFERENCE_BUTTON).first();
+    // 等待期间 Notion AI 可能弹出调查（如「下一步执行哪个工作流？」），此时输入区被替换，
+    // SEND_BUTTON / STOP_INFERENCE_BUTTON 都无法命中，必须先把调查处理掉再继续轮询。
+    if (await page.locator(SURVEY_LISTBOX).first().isVisible().catch(() => false)) {
+      const handled = await handleSurveyIfPresent(page);
+      if (handled) {
+        // 调查回答后输入区会重新渲染并触发新一轮生成，等一小会儿让 stop/send 复位。
+        await sleep(500);
+      }
+    }
     // 先扫一遍可自动点击按钮：避免 send/stop 状态已满足时提前 return，漏点同轮后续弹出的 Continue 等按钮。
     const scan = await tryAutoClickConfiguredButtons(page, buttonNames, "wait", tick);
     if (scan.matched || scan.visible || scan.clicked) {
@@ -1399,7 +1408,8 @@ async function sweepAutoClickButtons(
 }
 
 /**
- * 检测并处理 Notion AI 弹出的「What do you want to do next?」调查选项：
+ * 检测并处理 Notion AI 弹出的调查选项（如「What do you want to do next?」、
+ * 「下一步执行哪个工作流？」等，对应 survey-option-intent-* / survey-option-next_path-* 等）：
  * 找到 Other 输入框 → 点击 → 输入 "Run Now" → 点击发送/Next 按钮。
  * 若调查不可见则立即返回 false；已处理返回 true。
  */
