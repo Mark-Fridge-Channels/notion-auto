@@ -125,6 +125,32 @@ async function loadStorageStateCookiesOnly(path: string): Promise<CookiesOnlySta
   }
 }
 
+/** Notion Sentry 分布式追踪 header；在 Chromium 网络层剔除，避免自动化请求携带浏览器 trace 指纹 */
+const STRIPPED_TRACE_HEADERS = new Set(["sentry-trace", "baggage", "traceparent", "tracestate"]);
+
+function removeStrippedTraceHeaders(headers: Record<string, string>): void {
+  for (const key of Object.keys(headers)) {
+    if (STRIPPED_TRACE_HEADERS.has(key.toLowerCase())) delete headers[key];
+  }
+}
+
+async function installStripSentryTraceRoute(context: BrowserContext): Promise<void> {
+  await context.route("**/*", async (route) => {
+    const headers = { ...route.request().headers() };
+    removeStrippedTraceHeaders(headers);
+    await route.continue({ headers });
+  });
+}
+
+async function createNotionBrowserContext(
+  browser: Browser,
+  storageState: CookiesOnlyState | undefined,
+): Promise<BrowserContext> {
+  const context = await browser.newContext(storageState ? { storageState } : {});
+  await installStripSentryTraceRoute(context);
+  return context;
+}
+
 /**
  * cookies-only 写：先从 context 取完整 state 再**裁掉** origins，
  * 确保文件不会在每次退出时被 Playwright 自动重新写胖。
@@ -281,7 +307,7 @@ async function relaunchBrowser(
     args: buildChromiumArgs(schedule.chromiumExtraArgs),
   });
   const storageState = await loadStorageStateCookiesOnly(storagePath);
-  const context = await currentBrowser.newContext(storageState ? { storageState } : {});
+  const context = await createNotionBrowserContext(currentBrowser, storageState);
   const page = await context.newPage();
   currentPage = page;
   page.setDefaultTimeout(30_000);
@@ -508,7 +534,7 @@ async function runAdhocSingleJobMode(params: {
     args: buildChromiumArgs(schedule.chromiumExtraArgs),
   });
   const storageState = await loadStorageStateCookiesOnly(storagePath);
-  const context = await currentBrowser.newContext(storageState ? { storageState } : {});
+  const context = await createNotionBrowserContext(currentBrowser, storageState);
   const page = await context.newPage();
   currentPage = page;
   page.setDefaultTimeout(30_000);
@@ -608,7 +634,7 @@ async function main(): Promise<void> {
   // cookies-only 读：避免 Notion 启动瞬间 rehydrate localStorage cache 把 renderer 撑到 1~2GB
   const storageState = await loadStorageStateCookiesOnly(storagePath);
   // Step 4 的 recycle 需要能够重新赋值 context/page，这里用 let。
-  let context = await currentBrowser.newContext(storageState ? { storageState } : {});
+  let context = await createNotionBrowserContext(currentBrowser, storageState);
   let page = await context.newPage();
   currentPage = page;
   page.setDefaultTimeout(30_000);
