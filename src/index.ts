@@ -89,7 +89,7 @@ const CHROMIUM_LOW_MEM_ARGS: readonly string[] = [
   "--disable-dev-shm-usage",
   "--disable-gpu",
   "--disable-software-rasterizer",
-  "--disable-extensions",
+  // "--disable-extensions",
   "--disable-features=Translate,MediaRouter,OptimizationHints",
   "--js-flags=--max-old-space-size=2048",
 ];
